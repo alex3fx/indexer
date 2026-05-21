@@ -5,3 +5,4 @@ zigtest2/src/*.bak
 gotest/loader/loader
 gotest/writetest/*.bin
 *.json
+zigtest2/.git_bak/
