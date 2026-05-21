@@ -1,0 +1,7 @@
+zigtest2/zig-cache/
+zigtest2/zig-out/
+zigtest2/*.bak
+zigtest2/src/*.bak
+gotest/loader/loader
+gotest/writetest/*.bin
+*.json
