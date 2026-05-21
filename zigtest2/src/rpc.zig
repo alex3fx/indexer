@@ -853,6 +853,22 @@ pub fn fetchBatchFlat(
     return fbdr_ms;
 }
 
+/// Fetch a single block (block + receipts + traces) with 3 parallel HTTP requests.
+/// Convenience wrapper around fetchBatchFlat for the realtime single-block path.
+/// method_arenas[0/1/2] receive raw response buffers — caller deinits after save.
+pub fn fetchBlock(
+    io: Io,
+    gpa: std.mem.Allocator,
+    method_arenas: *[3]std.heap.ArenaAllocator,
+    url: []const u8,
+    block_num: u64,
+    result: *BlockData,
+) f64 {
+    const nums = [1]u64{block_num};
+    const results = @as(*[1]BlockData, result);
+    return fetchBatchFlat(io, gpa, method_arenas, url, &nums, results);
+}
+
 // ─── Deep copy helpers (all allocations go into dc_alloc — caller uses ArenaAllocator) ───
 
 fn deepCopyBlock(dc: std.mem.Allocator, src: RpcBlock) !RpcBlock {

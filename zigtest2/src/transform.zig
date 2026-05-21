@@ -164,192 +164,200 @@ inline fn liOpt(s: ?[]const u8) []const u8 {
 
 // ─── Transform ────────────────────────────────────────────────────────────────
 
-/// Transform a batch of blocks into DB entities.
-/// arena: used for all allocations — caller owns the arena and frees it after save.
-/// All entity strings point into arena memory; no individual frees needed.
+pub fn initEntities() Entities {
+    return .{
+        .blocks            = .empty,
+        .txs               = .empty,
+        .logs              = .empty,
+        .internal_txs      = .empty,
+        .contracts         = .empty,
+        .contracts_by_addr = .empty,
+        .last_block        = 0,
+    };
+}
+
+/// Transform one block and append its rows to ent.
+/// arena: caller-owned arena; all string slices point into it.
+/// Returns without modifying ent if the block data is incomplete.
+pub fn transformBlock(
+    arena: std.mem.Allocator,
+    bd: rpc.BlockData,
+    chunk_size: u64,
+    remap_mod: u64,
+    ent: *Entities,
+) !void {
+    if (bd.err or bd.block == null or bd.receipts == null) return;
+
+    const block    = bd.block.?;
+    const receipts = bd.receipts.?;
+    const traces   = bd.traces orelse &.{};
+
+    const number       = hexToI64(block.number);
+    const timestamp_s  = hexToI64(block.timestamp);
+    const timestamp_ms: i64 = if (block.milliTimestamp) |m| hexToI64(m) else timestamp_s * 1000;
+    const chunk = if (remap_mod > 0)
+        @as(i32, @intCast(@mod(number, @as(i64, @intCast(remap_mod)))))
+    else
+        @as(i32, @intCast(@divFloor(number, @as(i64, @intCast(chunk_size)))));
+
+    try ent.blocks.append(arena, .{
+        .chunk       = chunk,
+        .number      = number,
+        .timestamp_s = timestamp_s,
+        .timestamp_ms = timestamp_ms,
+        .miner       = li(block.miner),
+    });
+
+    // tx hash → index map (HashMap backed by arena — fast bump alloc)
+    var tx_by_hash = std.StringHashMap(usize).init(arena);
+
+    const max_k = @min(block.transactions.len, receipts.len);
+    for (0..max_k) |k| {
+        const tx   = &block.transactions[k];
+        const rcpt = &receipts[k];
+
+        const hash      = li(tx.hash);
+        const from_addr = li(tx.from);
+        const to_addr   = liOpt(tx.to);
+        const value     = li(tx.value);
+        const input     = li(tx.input);
+        const method_id = methodIdSlice(input);
+
+        const tx_row = TxRow{
+            .chunk                = chunk,
+            .block_number         = number,
+            .transaction_index    = hexToI32(tx.transactionIndex),
+            .hash                 = hash,
+            .block_timestamp_s    = timestamp_s,
+            .block_timestamp_ms   = timestamp_ms,
+            .method_id            = method_id,
+            .input                = input,
+            .from_address         = from_addr,
+            .to_address           = to_addr,
+            .value                = value,
+            .gas_limit            = hexToI64(tx.gas),
+            .gas_price            = hexToI64(tx.gasPrice),
+            .gas_used             = hexToI64(rcpt.gasUsed),
+            .max_priority_fee     = if (tx.maxPriorityFeePerGas) |v| hexToI64(v) else 0,
+            .max_fee              = if (tx.maxFeePerGas) |v| hexToI64(v) else 0,
+            .cumulative_gas_used  = hexToI64(rcpt.cumulativeGasUsed),
+            .effective_gas_price  = if (rcpt.effectiveGasPrice) |v| hexToI64(v) else 0,
+            .contract_address     = liOpt(rcpt.contractAddress),
+            .status               = hexToI8(rcpt.status),
+            .tx_type              = hexToI8(tx.@"type"),
+        };
+
+        const tx_idx = ent.txs.items.len;
+        try ent.txs.append(arena, tx_row);
+        try tx_by_hash.put(hash, tx_idx);
+
+        for (rcpt.logs) |log| {
+            const rest_count = if (log.topics.len > 4) log.topics.len - 4 else 0;
+            const rest_topics = try arena.alloc([]const u8, rest_count);
+            for (0..rest_count) |ti| rest_topics[ti] = li(log.topics[4 + ti]);
+            try ent.logs.append(arena, .{
+                .chunk               = chunk,
+                .block_number        = number,
+                .transaction_index   = hexToI32(log.transactionIndex),
+                .log_index           = hexToI32(log.logIndex),
+                .block_timestamp_s   = timestamp_s,
+                .block_timestamp_ms  = timestamp_ms,
+                .address             = li(log.address),
+                .data                = li(log.data),
+                .topic_zeroth        = if (log.topics.len > 0) li(log.topics[0]) else "",
+                .topic_first         = if (log.topics.len > 1) li(log.topics[1]) else "",
+                .topic_second        = if (log.topics.len > 2) li(log.topics[2]) else "",
+                .topic_third         = if (log.topics.len > 3) li(log.topics[3]) else "",
+                .rest_topics         = rest_topics,
+                .transaction_hash    = li(log.transactionHash),
+                .removed             = log.removed,
+            });
+        }
+    }
+
+    for (traces, 0..) |trace, trace_idx| {
+        const tx_idx_opt: ?usize = if (trace.transactionPosition) |pos|
+            if (pos >= 0 and pos < @as(i32, @intCast(ent.txs.items.len))) @intCast(pos) else null
+        else blk: {
+            const raw_hash = trace.transactionHash orelse break :blk null;
+            if (raw_hash.len == 0) break :blk null;
+            break :blk tx_by_hash.get(li(raw_hash));
+        };
+        const tx_idx = tx_idx_opt orelse continue;
+        const tx_row = &ent.txs.items[tx_idx];
+
+        const from_addr = li(trace.action.from);
+        const to_addr   = liOpt(trace.action.to);
+
+        if (from_addr.len > 0 and to_addr.len > 0 and trace.action.value != null) {
+            try ent.internal_txs.append(arena, .{
+                .chunk             = chunk,
+                .block_number      = number,
+                .block_timestamp_s = timestamp_s,
+                .block_timestamp_ms = timestamp_ms,
+                .transaction_index = tx_row.transaction_index,
+                .transaction_hash  = tx_row.hash,
+                .trace_index       = @intCast(trace_idx),
+                .from_address      = from_addr,
+                .to_address        = to_addr,
+                .value             = li(trace.action.value.?),
+            });
+        }
+
+        if (trace.result) |res| {
+            if (res.address) |contract_addr| {
+                const addr_lower  = li(contract_addr);
+                const creator     = tx_row.from_address;
+                const factory     = if (std.mem.eql(u8, creator, from_addr)) "" else from_addr;
+                const raw_bc      = if (trace.action.init) |i| i else if (trace.action.input) |i| i else "0x";
+                const creation_bc = if (raw_bc.len == 0) "0x" else raw_bc;
+                const deployed_bc = if (res.code) |c| c else "0x";
+
+                try ent.contracts.append(arena, .{
+                    .chunk              = chunk,
+                    .block_number       = number,
+                    .transaction_index  = tx_row.transaction_index,
+                    .transaction_hash   = tx_row.hash,
+                    .trace_index        = @intCast(trace_idx),
+                    .block_timestamp_s  = timestamp_s,
+                    .block_timestamp_ms = timestamp_ms,
+                    .address            = addr_lower,
+                    .creation_method    = creationMethodI8(trace.action.creationMethod),
+                    .creator_address    = creator,
+                    .contract_factory   = factory,
+                    .creation_bytecode  = creation_bc,
+                    .deployed_bytecode  = deployed_bc,
+                });
+                try ent.contracts_by_addr.append(arena, .{
+                    .address           = addr_lower,
+                    .creator           = creator,
+                    .tx_hash           = tx_row.hash,
+                    .block_number      = number,
+                    .timestamp         = timestamp_s,
+                    .contract_factory  = factory,
+                    .creation_bytecode = creation_bc,
+                    .deployed_bytecode = deployed_bc,
+                });
+            }
+        }
+    }
+
+    if (@as(u64, @intCast(number)) > ent.last_block) {
+        ent.last_block = @intCast(number);
+    }
+}
+
+/// Transform a batch of blocks.
+/// Equivalent to initEntities() + transformBlock() for each block.
 pub fn transformBatch(
     arena: std.mem.Allocator,
     blocks: []const rpc.BlockData,
     chunk_size: u64,
     remap_mod: u64,
 ) !Entities {
-    var ent = Entities{
-        .blocks = .empty,
-        .txs = .empty,
-        .logs = .empty,
-        .internal_txs = .empty,
-        .contracts = .empty,
-        .contracts_by_addr = .empty,
-        .last_block = 0,
-    };
-
+    var ent = initEntities();
     for (blocks) |bd| {
-        if (bd.err or bd.block == null or bd.receipts == null) continue;
-
-        const block = bd.block.?;
-        const receipts = bd.receipts.?;
-        const traces = bd.traces orelse &.{};
-
-        const number = hexToI64(block.number);
-        const timestamp_s = hexToI64(block.timestamp);
-        const timestamp_ms: i64 = if (block.milliTimestamp) |m| hexToI64(m) else timestamp_s * 1000;
-        const chunk = if (remap_mod > 0)
-            @as(i32, @intCast(@mod(number, @as(i64, @intCast(remap_mod)))))
-        else
-            @as(i32, @intCast(@divFloor(number, @as(i64, @intCast(chunk_size)))));
-
-        try ent.blocks.append(arena, .{
-            .chunk = chunk,
-            .number = number,
-            .timestamp_s = timestamp_s,
-            .timestamp_ms = timestamp_ms,
-            .miner = li(block.miner), // in-place lowercase, no alloc
-        });
-
-        // tx hash → index map (HashMap backed by arena — fast bump alloc)
-        var tx_by_hash = std.StringHashMap(usize).init(arena);
-
-        const max_k = @min(block.transactions.len, receipts.len);
-        for (0..max_k) |k| {
-            const tx = &block.transactions[k];
-            const rcpt = &receipts[k];
-
-            // lowerInPlace: modifies arena string in-place, returns same pointer
-            const hash       = li(tx.hash);
-            const from_addr  = li(tx.from);
-            const to_addr    = liOpt(tx.to);
-            const value      = li(tx.value);
-            const input      = li(tx.input); // hex data already lowercase, no-op
-            const method_id  = methodIdSlice(input); // slice of input, no alloc
-
-            const tx_row = TxRow{
-                .chunk = chunk,
-                .block_number = number,
-                .transaction_index = hexToI32(tx.transactionIndex),
-                .hash = hash,
-                .block_timestamp_s = timestamp_s,
-                .block_timestamp_ms = timestamp_ms,
-                .method_id = method_id,
-                .input = input,
-                .from_address = from_addr,
-                .to_address = to_addr,
-                .value = value,
-                .gas_limit = hexToI64(tx.gas),
-                .gas_price = hexToI64(tx.gasPrice),
-                .gas_used = hexToI64(rcpt.gasUsed),
-                .max_priority_fee = if (tx.maxPriorityFeePerGas) |v| hexToI64(v) else 0,
-                .max_fee = if (tx.maxFeePerGas) |v| hexToI64(v) else 0,
-                .cumulative_gas_used = hexToI64(rcpt.cumulativeGasUsed),
-                .effective_gas_price = if (rcpt.effectiveGasPrice) |v| hexToI64(v) else 0,
-                .contract_address = liOpt(rcpt.contractAddress),
-                .status = hexToI8(rcpt.status),
-                .tx_type = hexToI8(tx.@"type"),
-            };
-
-            const tx_idx = ent.txs.items.len;
-            try ent.txs.append(arena, tx_row);
-            try tx_by_hash.put(hash, tx_idx);
-
-            for (rcpt.logs) |log| {
-                const rest_count = if (log.topics.len > 4) log.topics.len - 4 else 0;
-                // Alloc the rest_topics slice in arena (small, usually 0)
-                const rest_topics = try arena.alloc([]const u8, rest_count);
-                for (0..rest_count) |ti| {
-                    rest_topics[ti] = li(log.topics[4 + ti]);
-                }
-                try ent.logs.append(arena, .{
-                    .chunk = chunk,
-                    .block_number = number,
-                    .transaction_index = hexToI32(log.transactionIndex),
-                    .log_index = hexToI32(log.logIndex),
-                    .block_timestamp_s = timestamp_s,
-                    .block_timestamp_ms = timestamp_ms,
-                    .address = li(log.address),
-                    .data = li(log.data),
-                    .topic_zeroth = if (log.topics.len > 0) li(log.topics[0]) else "",
-                    .topic_first  = if (log.topics.len > 1) li(log.topics[1]) else "",
-                    .topic_second = if (log.topics.len > 2) li(log.topics[2]) else "",
-                    .topic_third  = if (log.topics.len > 3) li(log.topics[3]) else "",
-                    .rest_topics = rest_topics,
-                    .transaction_hash = li(log.transactionHash),
-                    .removed = log.removed,
-                });
-            }
-        }
-
-        for (traces, 0..) |trace, trace_idx| {
-            // Fast path: transactionPosition is always present for call/create traces.
-            // Fallback to hashmap only when field is absent (reward/uncle traces).
-            const tx_idx_opt: ?usize = if (trace.transactionPosition) |pos|
-                if (pos >= 0 and pos < @as(i32, @intCast(ent.txs.items.len))) @intCast(pos) else null
-            else blk: {
-                const raw_hash = trace.transactionHash orelse break :blk null;
-                if (raw_hash.len == 0) break :blk null;
-                break :blk tx_by_hash.get(li(raw_hash));
-            };
-            const tx_idx = tx_idx_opt orelse continue;
-            const tx_row = &ent.txs.items[tx_idx];
-
-            const from_addr = li(trace.action.from);
-            const to_addr   = liOpt(trace.action.to);
-
-            if (from_addr.len > 0 and to_addr.len > 0 and trace.action.value != null) {
-                try ent.internal_txs.append(arena, .{
-                    .chunk = chunk,
-                    .block_number = number,
-                    .block_timestamp_s = timestamp_s,
-                    .block_timestamp_ms = timestamp_ms,
-                    .transaction_index = tx_row.transaction_index,
-                    .transaction_hash = tx_row.hash, // already in arena, no copy
-                    .trace_index = @intCast(trace_idx),
-                    .from_address = from_addr,
-                    .to_address = to_addr,
-                    .value = li(trace.action.value.?),
-                });
-            }
-
-            if (trace.result) |res| {
-                if (res.address) |contract_addr| {
-                    const addr_lower  = li(contract_addr);
-                    const creator     = tx_row.from_address; // already lowercase, in arena
-                    const factory     = if (std.mem.eql(u8, creator, from_addr)) "" else from_addr;
-                    const raw_bc      = if (trace.action.init) |i| i else if (trace.action.input) |i| i else "0x";
-                    const creation_bc = if (raw_bc.len == 0) "0x" else raw_bc;
-                    const deployed_bc = if (res.code) |c| c else "0x";
-
-                    try ent.contracts.append(arena, .{
-                        .chunk = chunk,
-                        .block_number = number,
-                        .transaction_index = tx_row.transaction_index,
-                        .transaction_hash = tx_row.hash,
-                        .trace_index = @intCast(trace_idx),
-                        .block_timestamp_s = timestamp_s,
-                        .block_timestamp_ms = timestamp_ms,
-                        .address = addr_lower,
-                        .creation_method = creationMethodI8(trace.action.creationMethod),
-                        .creator_address = creator,
-                        .contract_factory = factory,
-                        .creation_bytecode = creation_bc,
-                        .deployed_bytecode = deployed_bc,
-                    });
-                    try ent.contracts_by_addr.append(arena, .{
-                        .address = addr_lower,
-                        .creator = creator,
-                        .tx_hash = tx_row.hash,
-                        .block_number = number,
-                        .timestamp = timestamp_s,
-                        .contract_factory = factory,
-                        .creation_bytecode = creation_bc,
-                        .deployed_bytecode = deployed_bc,
-                    });
-                }
-            }
-        }
-
-        if (@as(u64, @intCast(number)) > ent.last_block) {
-            ent.last_block = @intCast(number);
-        }
+        try transformBlock(arena, bd, chunk_size, remap_mod, &ent);
     }
-
     return ent;
 }
