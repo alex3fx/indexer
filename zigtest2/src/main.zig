@@ -31,6 +31,7 @@ const Config = struct {
     chunk_size: u64,
     remap_mod: u64,
     to_block: u64,
+    pipeline: usize,
     batch_size: usize,
     redis_host: []const u8,
     redis_port: u16,
@@ -117,6 +118,7 @@ fn parseConfig(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map
         .chain_id = getEnvInt(u64, env, "CHAIN_ID", 1),
         .chunk_size = getEnvInt(u64, env, "RAW_CHUNK_SIZE", 1000),
         .remap_mod  = getEnvInt(u64, env, "REMAP_MOD", 0),
+        .pipeline   = @max(1, getEnvInt(usize, env, "PIPELINE", 1)),
         .to_block = getEnvInt(u64, env, "TO_BLOCK", 25_079_196),
         .batch_size = getEnvInt(usize, env, "BATCH_SIZE", 10),
         .redis_host = redis_host,
@@ -279,6 +281,7 @@ const BatchState = struct {
     method_arenas: [3]std.heap.ArenaAllocator,
     batch_arena:   std.heap.ArenaAllocator,
     block_results: []rpc.BlockData,
+    block_nums:    []u64,           // owned; freed in deinit
     ent:           transform.Entities,
     batch_start:   u64,
     batch_end:     u64,
@@ -297,6 +300,7 @@ const BatchState = struct {
         for (&self.method_arenas) |*a| a.deinit();
         self.batch_arena.deinit();
         self.gpa.free(self.block_results);
+        self.gpa.free(self.block_nums);
     }
 };
 
@@ -318,6 +322,27 @@ fn doSave(state: *BatchState) void {
             .result_ms = &state.save_ms,
         });
     }
+}
+
+// ─── Fetch+transform worker (for parallel pipeline) ──────────────────────────
+// Runs fetch + transform in a background thread so multiple batches can be
+// fetched simultaneously. Each worker owns its BatchState exclusively.
+
+const FetchArgs = struct { io: std.Io, gpa: std.mem.Allocator, cfg: *const Config, state: *BatchState };
+
+fn fetchWorker(args: *FetchArgs) void {
+    const s = args.state;
+    const cfg = args.cfg;
+    const t0 = nowNs();
+    s.fbdr_ms = if (cfg.fetch_mode == 0)
+        rpc.fetchBatchFlat(args.io, args.gpa, &s.method_arenas, cfg.rpc_url, s.block_nums, s.block_results)
+    else
+        cfg.fetch_fn(args.io, args.gpa, s.batch_arena.allocator(), cfg.rpc_url, s.block_nums, s.block_results);
+    const t1 = nowNs();
+    s.ent = transform.transformBatch(s.batch_arena.allocator(), s.block_results, cfg.chunk_size, cfg.remap_mod) catch return;
+    const t2 = nowNs();
+    s.transform_ms = @as(f64, @floatFromInt(t2 - t1)) / 1e6;
+    s.tpt_ms       = @as(f64, @floatFromInt(t2 - t0)) / 1e6;
 }
 
 // ─── Batch pipelining ─────────────────────────────────────────────────────────
@@ -392,29 +417,36 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── Dump mode or ScyllaDB ─────────────────────────────────────────────────
+    // PIPELINE=N: N CQL pools, N fetch workers running in parallel per round.
+    // Each pool has POOL_SIZE connections; saves use their own pool → no contention.
+    const P = cfg.pipeline;
     const dump_mode = cfg.dump_file.len > 0;
     var dump_file_opt: ?std.Io.File = null;
-    var cql_pool: db.CqlPool = undefined;
-    var prep_ids: db.PreparedIds = undefined;
+    const pools    = try gpa.alloc(db.CqlPool, P);
+    const prep_ids = try gpa.alloc(db.PreparedIds, P);
+    defer gpa.free(pools);
+    defer gpa.free(prep_ids);
 
     if (dump_mode) {
         std.debug.print("DUMP MODE: writing to {s}\n", .{cfg.dump_file});
         dump_file_opt = try db.dumpOpen(io, cfg.dump_file);
-        // Initialize dummy pool/prep_ids so BatchState fields are valid
-        cql_pool = .{};
-        prep_ids = .{ .blocks=&.{}, .transactions=&.{}, .logs=&.{}, .internal_txs=&.{}, .contracts=&.{}, .contracts_by_addr=&.{} };
+        for (0..P) |p| {
+            pools[p]    = .{};
+            prep_ids[p] = .{ .blocks=&.{}, .transactions=&.{}, .logs=&.{}, .internal_txs=&.{}, .contracts=&.{}, .contracts_by_addr=&.{} };
+        }
     } else {
-        std.debug.print("ScyllaDB: {s}:{d}  pool={d}  pipeline={d}  split={}+{}+{}+{}+{}+{}\n",
-            .{ cfg.scylla_host, cfg.scylla_port,
-               db.POOL_SIZE, db.PIPELINE,
+        std.debug.print("ScyllaDB: {s}:{d}  pool={d}  workers={d}  split={}+{}+{}+{}+{}+{}\n",
+            .{ cfg.scylla_host, cfg.scylla_port, db.POOL_SIZE, P,
                db.SPLIT[0], db.SPLIT[1], db.SPLIT[2],
                db.SPLIT[3], db.SPLIT[4], db.SPLIT[5] });
-        std.debug.print("Connecting to ScyllaDB...\n", .{});
-        cql_pool = try db.CqlPool.init(io, gpa, cfg.scylla_host, cfg.scylla_port,
-            cfg.scylla_keyspace, cfg.scylla_user, cfg.scylla_pass);
-        prep_ids = try db.prepareAll(cql_pool.conns[0]);
+        std.debug.print("Connecting to ScyllaDB ({d} pool(s))...\n", .{P});
+        for (0..P) |p| {
+            pools[p]    = try db.CqlPool.init(io, gpa, cfg.scylla_host, cfg.scylla_port,
+                              cfg.scylla_keyspace, cfg.scylla_user, cfg.scylla_pass);
+            prep_ids[p] = try db.prepareAll(pools[p].conns[0]);
+        }
     }
-    defer if (!dump_mode) cql_pool.deinit();
+    defer if (!dump_mode) { for (0..P) |p| pools[p].deinit(); };
 
     var metrics: Metrics = .{};
     defer metrics.deinit(gpa);
@@ -423,108 +455,123 @@ pub fn main(init: std.process.Init) !void {
 
     const t_run_start = nowNs();
     var i: u64 = from;
-    var prev: ?PrevBatch = null;
     var batch_counter: u32 = 0;
 
+    // Ring of P save slots: save for round N overlaps with fetch for round N+1.
+    const prev_saves  = try gpa.alloc(?PrevBatch, P);
+    defer gpa.free(prev_saves);
+    @memset(prev_saves, null);
+
+    // Scratch slices reused each round (alloc once outside loop).
+    const round_states  = try gpa.alloc(?*BatchState, P);
+    const fetch_threads = try gpa.alloc(?std.Thread, P);
+    const fetch_args    = try gpa.alloc(?*FetchArgs, P);
+    defer gpa.free(round_states);
+    defer gpa.free(fetch_threads);
+    defer gpa.free(fetch_args);
+
     while (i <= cfg.to_block) {
-        const batch_start = i;
-        const batch_end   = @min(i + cfg.batch_size - 1, cfg.to_block);
-        const batch_count = batch_end - batch_start + 1;
+        @memset(round_states, null);
+        @memset(fetch_threads, null);
+        @memset(fetch_args, null);
 
-        const block_nums = try gpa.alloc(u64, batch_count);
-        defer gpa.free(block_nums);
-        for (0..batch_count) |k| block_nums[k] = batch_start + k;
+        // ── Launch P fetch+transform workers in parallel ───────────────────
+        for (0..P) |p| {
+            if (i > cfg.to_block) break;
+            const batch_start = i;
+            const batch_end   = @min(i + cfg.batch_size - 1, cfg.to_block);
+            const batch_count = batch_end - batch_start + 1;
 
-        // Per-batch state lives on the heap: stays alive until the save thread
-        // is joined in the next iteration (or after the loop for the last batch).
-        const state = try gpa.create(BatchState);
-        state.* = .{
-            .method_arenas = .{
-                std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            },
-            .batch_arena   = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .block_results = try gpa.alloc(rpc.BlockData, batch_count),
-            .ent           = undefined, // set after transformBatch
-            .batch_start   = batch_start,
-            .batch_end     = batch_end,
-            .fbdr_ms       = 0,
-            .transform_ms  = 0,
-            .tpt_ms        = 0,
-            .save_ms       = 0,
-            .cql_pool      = &cql_pool,
-            .prep_ids      = &prep_ids,
-            .gpa           = gpa,
-            .dump_file     = dump_file_opt,
-            .dump_io       = io,
-            .batch_id      = batch_counter,
-        };
-        batch_counter += 1;
+            const state = try gpa.create(BatchState);
+            const block_nums = try gpa.alloc(u64, batch_count);
+            for (0..batch_count) |k| block_nums[k] = batch_start + k;
 
-        const t0 = nowNs();
+            state.* = .{
+                .method_arenas = .{
+                    std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                    std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                    std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                },
+                .batch_arena   = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                .block_results = try gpa.alloc(rpc.BlockData, batch_count),
+                .block_nums    = block_nums,
+                .ent           = undefined,
+                .batch_start   = batch_start,
+                .batch_end     = batch_end,
+                .fbdr_ms       = 0,
+                .transform_ms  = 0,
+                .tpt_ms        = 0,
+                .save_ms       = 0,
+                .cql_pool      = &pools[p],
+                .prep_ids      = &prep_ids[p],
+                .gpa           = gpa,
+                .dump_file     = dump_file_opt,
+                .dump_io       = io,
+                .batch_id      = batch_counter,
+            };
+            batch_counter += 1;
+            round_states[p] = state;
 
-        // ── Fetch ─────────────────────────────────────────────────────────
-        state.fbdr_ms = if (cfg.fetch_mode == 0)
-            rpc.fetchBatchFlat(io, gpa, &state.method_arenas, cfg.rpc_url, block_nums, state.block_results)
-        else
-            cfg.fetch_fn(io, gpa, state.batch_arena.allocator(), cfg.rpc_url, block_nums, state.block_results);
+            const fargs = try gpa.create(FetchArgs);
+            fargs.* = .{ .io = io, .gpa = gpa, .cfg = &cfg, .state = state };
+            fetch_args[p]    = fargs;
+            fetch_threads[p] = try std.Thread.spawn(.{}, fetchWorker, .{fargs});
 
-        const t1 = nowNs();
-
-        // ── Transform ─────────────────────────────────────────────────────
-        state.ent = try transform.transformBatch(
-            state.batch_arena.allocator(), state.block_results, cfg.chunk_size, cfg.remap_mod);
-
-        const t2 = nowNs();
-        state.transform_ms = @as(f64, @floatFromInt(t2 - t1)) / 1e6;
-        state.tpt_ms       = @as(f64, @floatFromInt(t2 - t0)) / 1e6;
-
-        // ── Join previous save (it ran during our fetch+transform) ─────────
-        // Overlap: fetch (~13ms) + transform (~7ms) = ~20ms of save hidden per batch.
-        if (prev) |*p| {
-            try finishPrev(p, gpa, &redis, &metrics.batches);
-            prev = null;
+            i = batch_end + 1;
         }
 
-        // ── Record metrics (save_ms filled by finishPrev next iteration) ───
-        for (state.block_results) |bd| {
-            if (!bd.err and bd.block != null) {
-                try metrics.blocks.append(gpa, .{
-                    .block_num     = bd.block_num,
-                    .fbdr_ms       = state.fbdr_ms,
-                    .http_block_ms = bd.http_block_ms,
-                    .http_rcpt_ms  = bd.http_rcpt_ms,
-                    .http_trc_ms   = bd.http_trc_ms,
-                });
+        // ── Join previous round's saves (overlap: ran while we were fetching) ─
+        for (prev_saves) |*slot| {
+            if (slot.*) |*ps| {
+                try finishPrev(ps, gpa, &redis, &metrics.batches);
+                slot.* = null;
             }
         }
-        const metric_idx = metrics.batches.items.len;
-        try metrics.batches.append(gpa, .{
-            .from_block   = batch_start,
-            .to_block     = batch_end,
-            .fbdr_ms      = state.fbdr_ms,
-            .transform_ms = state.transform_ms,
-            .tpt_ms       = state.tpt_ms,
-            .save_ms      = 0,
-            .total_ms     = 0,
-            .blocks       = state.ent.blocks.items.len,
-            .txs          = state.ent.txs.items.len,
-            .logs         = state.ent.logs.items.len,
-            .internal_txs = state.ent.internal_txs.items.len,
-            .contracts    = state.ent.contracts.items.len,
-        });
 
-        // ── Spawn save in background ───────────────────────────────────────
-        const save_thread = try std.Thread.spawn(.{}, doSave, .{state});
-        prev = .{ .thread = save_thread, .state = state, .metric_idx = metric_idx };
+        // ── Wait for this round's fetches; record metrics; spawn saves ─────
+        for (0..P) |p| {
+            if (fetch_threads[p]) |t| t.join();
+            if (fetch_args[p]) |fa| { gpa.destroy(fa); fetch_args[p] = null; }
+            const state = round_states[p] orelse continue;
 
-        i = batch_end + 1;
+            for (state.block_results) |bd| {
+                if (!bd.err and bd.block != null) {
+                    try metrics.blocks.append(gpa, .{
+                        .block_num     = bd.block_num,
+                        .fbdr_ms       = state.fbdr_ms,
+                        .http_block_ms = bd.http_block_ms,
+                        .http_rcpt_ms  = bd.http_rcpt_ms,
+                        .http_trc_ms   = bd.http_trc_ms,
+                    });
+                }
+            }
+            const metric_idx = metrics.batches.items.len;
+            try metrics.batches.append(gpa, .{
+                .from_block   = state.batch_start,
+                .to_block     = state.batch_end,
+                .fbdr_ms      = state.fbdr_ms,
+                .transform_ms = state.transform_ms,
+                .tpt_ms       = state.tpt_ms,
+                .save_ms      = 0,
+                .total_ms     = 0,
+                .blocks       = state.ent.blocks.items.len,
+                .txs          = state.ent.txs.items.len,
+                .logs         = state.ent.logs.items.len,
+                .internal_txs = state.ent.internal_txs.items.len,
+                .contracts    = state.ent.contracts.items.len,
+            });
+
+            const save_thread = try std.Thread.spawn(.{}, doSave, .{state});
+            prev_saves[p] = .{ .thread = save_thread, .state = state, .metric_idx = metric_idx };
+        }
     }
 
     // ── Final join ────────────────────────────────────────────────────────
-    if (prev) |*p| {
-        try finishPrev(p, gpa, &redis, &metrics.batches);
+    for (prev_saves) |*slot| {
+        if (slot.*) |*ps| {
+            try finishPrev(ps, gpa, &redis, &metrics.batches);
+            slot.* = null;
+        }
     }
 
     const elapsed_ms = @as(f64, @floatFromInt(nowNs() - t_run_start)) / 1e6;
