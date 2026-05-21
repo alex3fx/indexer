@@ -177,18 +177,70 @@ Save total снизился с 15s до 8.5s. FBDR вырос с 13ms до 16ms 
 
 ---
 
+## Часть 7: PIPELINE — пул fetch-воркеров
+
+### Архитектура
+
+`PIPELINE=N` env var: N fetch+transform воркеров запускаются параллельно,
+каждый с собственным CQL пулом → N параллельных saves.
+
+```
+PIPELINE=1 (старое поведение):
+  Round: [fetch(N)] → [save(N)] || [fetch(N+1)] → ...
+  1 save в полёте, save перекрывается с 1 fetch
+
+PIPELINE=2 (новое):
+  Round: [fetch(N) || fetch(N+1)] → [save(N) || save(N+1)] || [fetch(N+2) || fetch(N+3)]
+  2 saves параллельно (разные CQL пулы), перекрываются с 2 fetches
+```
+
+Реализация: `src/main.zig` — `FetchArgs + fetchWorker`, кольцевой буфер `prev_saves[P]`.
+Env vars: `PIPELINE=N`, `REMAP_MOD=N`, `BATCH_SIZE=N`.
+
+### Результаты (smp=16, 5G, tmpfs, REMAP=16, warm Scylla)
+
+| Конфиг | ms/block | FBDR avg | Save total | Save/batch |
+|--------|---------|---------|-----------|-----------|
+| PIPELINE=1, BATCH=16 | 7.63ms | 50ms | 7185ms | 114ms |
+| **PIPELINE=2, BATCH=16** | **5.80ms** | 98ms | 11035ms | 175ms |
+| PIPELINE=2, BATCH=8 | 6.55ms | 48ms | 12518ms | 198ms |
+
+Улучшение PIPELINE=2 vs PIPELINE=1: **~18-24%** (cold run) / **~7%** (warm run).
+
+### Анализ узких мест
+
+**gonode bottleneck**: 2 параллельных воркера удваивают HTTP нагрузку на ноду.
+FBDR растёт с 50ms до 98ms при PIPELINE=2 + BATCH=16.
+При PIPELINE=2 + BATCH=8: FBDR=48ms (норм) но save занимает больше → итог хуже.
+
+**Scylla contention**: 2 параллельных save → каждый шард получает 2×нагрузку.
+Каждый save замедляется: 114ms → 175ms. Scylla не масштабируется линейно при 2× нагрузке.
+
+**Тем не менее**: перекрытие fetch+save даёт выигрыш даже при замедлении обоих.
+Effective round time: 2 batches / max(fetch_round, save_round) = 2×32 / 187ms = ~10.7 batches/s
+vs PIPELINE=1: 1×32 / 114ms = ~8.8 batches/s → +22% throughput.
+
+### На реальной ноде (не localhost)
+
+С RTT 50-200ms fetch займёт 200+ms. PIPELINE=2 даст ~2× fetch throughput
+при той же save latency → ожидаемое ускорение 40-60%.
+
+---
+
 ## Итоговая сводка лучших результатов
 
-| Инструмент | Конфиг | sharding | ms/block |
+| Инструмент | Конфиг | Sharding | ms/block |
 |-----------|--------|---------|---------|
-| **loader firehose** | smp=16, 5G, tmpfs | **remap-mod=16** | **5.27ms** |
-| **loader firehose** | smp=8, 10G, tmpfs | **remap-mod=8** | **5.36ms** |
+| loader firehose | smp=16, 5G, tmpfs | remap-mod=16 | **5.27ms** |
+| loader firehose | smp=8, 10G, tmpfs | remap-mod=8 | **5.36ms** |
 | loader saveBatch | smp=8/16, tmpfs | remap-mod=8/16, 16 блоков | ~5.6ms |
-| loader firehose | smp=8, 10G, tmpfs | chunk_size=10 (101 chunks) | 8.44ms |
-| **zigtest2 parser** | smp=8, 10G, tmpfs | **REMAP_MOD=8** | **8.75ms** |
-| zigtest2 parser | smp=8, 10G, tmpfs | chunk_size=1000 (2 chunks) | 13.8ms |
+| loader firehose | smp=8, 10G, tmpfs | chunk_size=10 | 8.44ms |
+| **parser PIPELINE=2** | smp=16, 5G, tmpfs | **REMAP_MOD=16, BATCH=16** | **5.80ms** |
+| parser PIPELINE=1 | smp=16, 5G, tmpfs | REMAP_MOD=16, BATCH=16 | 6.25ms |
+| parser PIPELINE=1 | smp=8, 10G, tmpfs | REMAP_MOD=8, BATCH=8 | 8.75ms |
+| parser (baseline) | smp=8, 10G, tmpfs | chunk_size=1000 | 13.8ms |
 | loader firehose | smp=8, 10G, tmpfs | chunk_size=1000 | 14.5ms |
-| loader старый (pipelined EXECUTE) | smp=8, 10G | chunk_size=1000 | 24.8ms |
+| loader старый (EXECUTE) | smp=8, 10G | chunk_size=1000 | 24.8ms |
 
 ---
 
