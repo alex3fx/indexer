@@ -431,7 +431,95 @@ cassandra-driver делает `Promise.allSettled` на каждые 100 стр�
 
 ---
 
-## 7. Валидация данных
+## 7. loader2 — минимальная latency записи 1 блока
+
+loader2 измеряет время записи ровно одного блока в ScyllaDB:  
+6 таблиц × UNLOGGED BATCH, все параллельно, 1 блок каждые 100ms.
+
+### 7.1 Создание dump (1 блок/батч)
+
+```bash
+cd /home/alex/lotos/task1/zigtest2
+
+# Сброс курсора на начало 100-блочного датасета
+docker exec temp_dragonfly redis-cli -a mockpass \
+  SET LATEST_PROCESSED_BLOCK_NUMBER 25079096
+
+# Создать dump (100 блоков × 1 блок/батч, REMAP_MOD=16)
+CM_CONNECTION_URL="redis://:mockpass@127.0.0.1:6379/0" \
+SCYLLA_DB_CONTACT_POINTS='["172.31.208.104:9142"]' \
+SCYLLA_DB_KEYSPACE=eth RPC_URL=http://127.0.0.1:8545 CHAIN_ID=1 \
+TO_BLOCK=25079196 BATCH_SIZE=1 REMAP_MOD=16 \
+DUMP_FILE=/home/alex/lotos/task1/gotest/loader2/dump_100_b1.bin \
+./zig-out/bin/zigparser2
+# → gotest/loader2/dump_100_b1.bin (~124MB, 100 батчей × 1 блок)
+```
+
+### 7.2 Сборка loader2
+
+```bash
+cd /home/alex/lotos/task1/gotest/loader2
+/usr/local/go/bin/go build -o loader2 .
+```
+
+### 7.3 Запуск теста
+
+```bash
+cd /home/alex/lotos/task1/gotest/loader2
+
+# Оптимальный split (как в zigparser2, pool_size=32):
+cqlsh 172.31.208.104 9142 << 'EOF'
+USE eth;
+TRUNCATE blocks; TRUNCATE transactions; TRUNCATE logs;
+TRUNCATE internal_transactions; TRUNCATE contracts; TRUNCATE contracts_by_addresses;
+EOF
+sleep 5
+
+./loader2 -dump=dump_100_b1.bin -interval=100 -split="1,3,6,20,1,1"
+
+# Uniform pool (для сравнения):
+./loader2 -dump=dump_100_b1.bin -interval=100 -conns=4
+```
+
+### 7.4 Результаты (100 блоков, interval=100ms, smp=16 tmpfs)
+
+**Sweep split/conns:**
+
+| Конфигурация | total conns | save avg | p50 | p95 |
+|-------------|------------|---------|-----|-----|
+| uniform=1 (`-conns=1`) | 6 | 21.2ms | 17.8ms | 48.8ms |
+| uniform=4 (`-conns=4`) | 24 | 13.8ms | 11.1ms | 33.2ms |
+| **`-split=1,3,6,20,1,1`** | **32** | **9.5ms** | **8.1ms** | **23.9ms** |
+
+**Разбивка по таблицам при split=1,3,6,20,1,1:**
+
+| Таблица | conns | avg | Строк/блок |
+|---------|-------|-----|-----------|
+| itxs | 20 | 9.1ms | ~1900 |
+| logs | 6 | 9.3ms | ~600 |
+| txs | 3 | 8.1ms | ~270 |
+| blocks | 1 | 2.4ms | 1 |
+| contracts | 1 | 1.9ms | ~20 |
+| cba | 1 | 2.5ms | ~20 |
+
+**Почему split=1,3,6,20,1,1 оптимален:**  
+Каждому соединению достаётся ~100 строк = 1 BATCH фрейм.  
+При 32+ соединениях на itxs: contention на одном шарде → деградация.
+
+### 7.5 Флаги loader2
+
+| Флаг | По умолчанию | Описание |
+|------|-------------|---------|
+| `-dump` | `dump_100_b1.bin` | dump-файл (1 блок/батч) |
+| `-interval` | `100` | ms между блоками |
+| `-split` | `1,3,6,20,1,1` | соединений на таблицу |
+| `-conns` | `0` | uniform pool (переопределяет -split) |
+| `-batch` | `100` | строк в UNLOGGED BATCH фрейме |
+| `-truncate` | false | TRUNCATE перед тестом |
+
+---
+
+## 8. Валидация данных
 
 После записи — сверить с prod CSV:
 
@@ -441,7 +529,7 @@ python3 /mnt/c/Users/Public/zig20260521/validate_db.py
 
 ---
 
-## 8. Типичные проблемы
+## 9. Типичные проблемы
 
 | Симптом | Причина | Решение |
 |---------|---------|---------|
