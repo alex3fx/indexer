@@ -87,6 +87,9 @@ pub fn main(init: std.process.Init) !void {
 
     // ── Realtime mode ─────────────────────────────────────────────────────────
     if (cfg.realtime and !dump_mode) {
+        if (cfg.ws_url.len > 0) {
+            return rt.runRealtimeWs(io, gpa, &cfg, &pools[0], &prep_ids[0], &redis);
+        }
         return rt.runRealtime(io, gpa, &cfg, &pools[0], &prep_ids[0], &redis);
     }
 
