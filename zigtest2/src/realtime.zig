@@ -9,7 +9,6 @@ const transform = @import("transform");
 const db        = @import("db");
 const config    = @import("config");
 const ws        = @import("ws");
-
 const Config = config.Config;
 
 fn nowNs() i64 {
@@ -193,6 +192,55 @@ fn parseWsUrl(url: []const u8) struct { host: []const u8, port: u16, path: []con
     return .{ .host = host_port, .port = 8545, .path = path };
 }
 
+// ─── Block channel: WS listener → processor via pipe ─────────────────────────
+// Single-producer / single-consumer: uses OS pipe for blocking recv with zero spin.
+// WS goroutine writes 8-byte block numbers; processor reads (blocks until data).
+// Closing the write end causes read to return 0 bytes → signals done.
+
+const BlockChannel = struct {
+    rd: i32,  // read end
+    wr: i32,  // write end
+
+    fn init() !BlockChannel {
+        const lnx = std.os.linux;
+        var fds: [2]i32 = undefined;
+        const rc = lnx.pipe2(&fds, lnx.O{});
+        if (rc != 0) return error.PipeFailed;
+        return .{ .rd = fds[0], .wr = fds[1] };
+    }
+
+    fn send(self: *const BlockChannel, n: u64) void {
+        var val = n;
+        _ = std.os.linux.write(self.wr, @ptrCast(&val), 8);
+    }
+
+    // Returns null when write end is closed (done signal).
+    fn recv(self: *const BlockChannel) ?u64 {
+        var val: u64 = 0;
+        const n = std.os.linux.read(self.rd, @ptrCast(&val), 8);
+        if (n != 8) return null;
+        return val;
+    }
+
+    fn closeWrite(self: *const BlockChannel) void { _ = std.os.linux.close(self.wr); }
+    fn closeRead(self: *const BlockChannel)  void { _ = std.os.linux.close(self.rd); }
+};
+
+const WsListenerArg = struct {
+    conn:    *ws.WsConn,
+    ch:      *const BlockChannel,
+    to_block: u64,
+};
+
+fn wsListenerThread(arg: WsListenerArg) void {
+    while (true) {
+        const block_num = arg.conn.nextBlockNum() catch break;
+        arg.ch.send(block_num);
+        if (block_num >= arg.to_block) break;
+    }
+    arg.ch.closeWrite(); // signals EOF to reader
+}
+
 pub fn runRealtimeWs(
     io:       std.Io,
     gpa:      std.mem.Allocator,
@@ -213,7 +261,16 @@ pub fn runRealtimeWs(
     defer conn.deinit();
 
     const sub_id = try conn.subscribeNewHeads();
-    std.debug.print("Subscribed: {s}\n\n", .{sub_id});
+    std.debug.print("Subscribed: {s}  (WS listener in separate thread)\n\n", .{sub_id});
+
+    // WS listener runs in a separate thread — receives block numbers independently.
+    // Uses OS pipe: listener writes 8-byte block_num, processor reads (blocks until ready).
+    // This decouples WS protocol overhead from the fetch→transform→save critical path.
+    const ch = try BlockChannel.init();
+    defer ch.closeRead();
+    const listener_arg = WsListenerArg{ .conn = &conn, .ch = &ch, .to_block = cfg.to_block };
+    const ws_thread = try std.Thread.spawn(.{}, wsListenerThread, .{listener_arg});
+    defer ws_thread.join();
 
     var method_arenas = [3]std.heap.ArenaAllocator{
         std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -229,67 +286,58 @@ pub fn runRealtimeWs(
     var sum_fetch: f64 = 0;  var min_fetch: f64 = std.math.floatMax(f64);  var max_fetch: f64 = 0;
     var sum_save:  f64 = 0;  var min_save:  f64 = std.math.floatMax(f64);  var max_save:  f64 = 0;
 
-    // Get cursor from Redis (skip already-processed blocks)
     var cursor: u64 = 0;
     if (try redis.get("LATEST_PROCESSED_BLOCK_NUMBER")) |val| {
         defer gpa.free(val);
         cursor = std.fmt.parseInt(u64, val, 10) catch 0;
     }
 
-    while (true) {
-        const block_num = conn.nextBlockNum() catch |err| {
-            std.debug.print("WS error: {}\n", .{err});
-            break;
-        };
-
-        // Skip already-processed blocks (WS may replay on reconnect)
+    while (ch.recv()) |block_num| {
         if (block_num <= cursor) continue;
         if (block_num > cfg.to_block) break;
 
-        const t_ws = nowNs(); // t=0: WS notification received
-
+        // t0 starts HERE — WS notification already received by listener goroutine.
+        // total_ms = pure processing latency: fetch + transform + save.
         const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
                                     &method_arenas, &block_arena);
 
-        if (br == null) {
-            // Block not available yet via HTTP (race: WS arrived before HTTP cache)
-            // Retry once after a brief wait
+        const r = br orelse {
             sleepMs(5);
             const br2 = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
                                          &method_arenas, &block_arena);
             if (br2 == null) {
-                std.debug.print("⚠ [{d}] block not available after WS notification\n", .{block_num});
+                std.debug.print("⚠ [{d}] block not available\n", .{block_num});
                 continue;
             }
-            const r = br2.?;
-            const ws_to_db_ms = @as(f64, @floatFromInt(nowNs() - t_ws)) / 1e6;
-            std.debug.print("  ws→db={d:.0}ms\n", .{ws_to_db_ms});
-            sum_total += r.total_ms; sum_fetch += r.fetch_ms; sum_save += r.save_ms; n += 1;
-            if (r.total_ms < min_total) min_total = r.total_ms;
-            if (r.total_ms > max_total) max_total = r.total_ms;
-            if (r.fetch_ms < min_fetch) min_fetch = r.fetch_ms;
-            if (r.fetch_ms > max_fetch) max_fetch = r.fetch_ms;
-            if (r.save_ms  < min_save)  min_save  = r.save_ms;
-            if (r.save_ms  > max_save)  max_save  = r.save_ms;
-        } else {
-            const r = br.?;
-            const ws_to_db_ms = @as(f64, @floatFromInt(nowNs() - t_ws)) / 1e6;
-            _ = ws_to_db_ms;
-            sum_total += r.total_ms; sum_fetch += r.fetch_ms; sum_save += r.save_ms; n += 1;
-            if (r.total_ms < min_total) min_total = r.total_ms;
-            if (r.total_ms > max_total) max_total = r.total_ms;
-            if (r.fetch_ms < min_fetch) min_fetch = r.fetch_ms;
-            if (r.fetch_ms > max_fetch) max_fetch = r.fetch_ms;
-            if (r.save_ms  < min_save)  min_save  = r.save_ms;
-            if (r.save_ms  > max_save)  max_save  = r.save_ms;
-        }
+            const r2 = br2.?;
+            sum_total += r2.total_ms; sum_fetch += r2.fetch_ms; sum_save += r2.save_ms; n += 1;
+            if (r2.total_ms < min_total) min_total = r2.total_ms;
+            if (r2.total_ms > max_total) max_total = r2.total_ms;
+            if (r2.fetch_ms < min_fetch) min_fetch = r2.fetch_ms;
+            if (r2.fetch_ms > max_fetch) max_fetch = r2.fetch_ms;
+            if (r2.save_ms  < min_save)  min_save  = r2.save_ms;
+            if (r2.save_ms  > max_save)  max_save  = r2.save_ms;
+            cursor = block_num;
+            const s2 = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
+            defer gpa.free(s2);
+            try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s2);
+            continue;
+        };
+
+        sum_total += r.total_ms; sum_fetch += r.fetch_ms; sum_save += r.save_ms; n += 1;
+        if (r.total_ms < min_total) min_total = r.total_ms;
+        if (r.total_ms > max_total) max_total = r.total_ms;
+        if (r.fetch_ms < min_fetch) min_fetch = r.fetch_ms;
+        if (r.fetch_ms > max_fetch) max_fetch = r.fetch_ms;
+        if (r.save_ms  < min_save)  min_save  = r.save_ms;
+        if (r.save_ms  > max_save)  max_save  = r.save_ms;
 
         cursor = block_num;
         const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
         defer gpa.free(s);
         try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
 
-        if (block_num >= cfg.to_block) break; // done
+        if (block_num >= cfg.to_block) break;
     }
 
     if (n > 0) {

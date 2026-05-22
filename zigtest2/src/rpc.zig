@@ -853,9 +853,9 @@ pub fn fetchBatchFlat(
     return fbdr_ms;
 }
 
-/// Fetch a single block (block + receipts + traces) with 3 parallel HTTP requests.
-/// Convenience wrapper around fetchBatchFlat for the realtime single-block path.
-/// method_arenas[0/1/2] receive raw response buffers — caller deinits after save.
+/// Fetch a single block with 3 parallel HTTP requests — zero heap allocation.
+/// Uses stack buffers for all scaffolding (avoids 6 mmap syscalls vs fetchBatchFlat).
+/// t_start is set before any work so fetch_ms is the true wall-clock time.
 pub fn fetchBlock(
     io: Io,
     gpa: std.mem.Allocator,
@@ -864,9 +864,102 @@ pub fn fetchBlock(
     block_num: u64,
     result: *BlockData,
 ) f64 {
-    const nums = [1]u64{block_num};
-    const results = @as(*[1]BlockData, result);
-    return fetchBatchFlat(io, gpa, method_arenas, url, &nums, results);
+    const BODY_SLOT = 128;
+
+    // Stack-allocated scaffolding — no mmap, no defer free
+    var body_pool:  [3 * BODY_SLOT]u8           = undefined;
+    var outs:       [3]RawOut                   = .{ .{}, .{}, .{} };
+    var args:       [3]FlatFetchArg             = undefined;
+    var threads:    [3]std.Thread               = undefined;
+    var bodies:     [3][]u8                     = .{ &.{}, &.{}, &.{} };
+    var body_ok:    [3]bool                     = .{ false, false, false };
+
+    const t_start = nowNs(); // timer before any work (no allocations precede this)
+
+    var hex_buf: [32]u8 = undefined;
+    const hex_num = std.fmt.bufPrint(&hex_buf, "0x{x}", .{block_num}) catch return 0;
+
+    bodies[0] = std.fmt.bufPrint(body_pool[0 * BODY_SLOT ..][0..BODY_SLOT],
+        \\{{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["{s}",true]}}
+    , .{hex_num}) catch return 0;
+    bodies[1] = std.fmt.bufPrint(body_pool[1 * BODY_SLOT ..][0..BODY_SLOT],
+        \\{{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":["{s}"]}}
+    , .{hex_num}) catch return 0;
+    bodies[2] = std.fmt.bufPrint(body_pool[2 * BODY_SLOT ..][0..BODY_SLOT],
+        \\{{"jsonrpc":"2.0","id":1,"method":"trace_block","params":["{s}"]}}
+    , .{hex_num}) catch return 0;
+    body_ok[0] = true; body_ok[1] = true; body_ok[2] = true;
+
+    var locked: [3]LockedArena = .{
+        .{ .arena = &method_arenas[0] },
+        .{ .arena = &method_arenas[1] },
+        .{ .arena = &method_arenas[2] },
+    };
+
+    var spawned: usize = 0;
+    for (0..3) |i| {
+        args[i] = .{
+            .io           = io,
+            .gpa          = gpa,
+            .url          = url,
+            .body         = bodies[i],
+            .out          = &outs[i],
+            .locked_arena = &locked[i],
+        };
+        if (std.Thread.spawn(.{}, flatFetch, .{args[i]})) |t| {
+            threads[spawned] = t;
+            spawned += 1;
+        } else |_| {
+            flatFetch(args[i]);
+        }
+    }
+    for (threads[0..spawned]) |t| t.join();
+
+    const fbdr_ms = @as(f64, @floatFromInt(nowNs() - t_start)) / 1e6;
+
+    result.* = BlockData{
+        .block_num     = block_num,
+        .block         = null, .receipts = null, .traces = null,
+        .http_block_ms = outs[0].http_ms, .json_block_ms = 0,
+        .http_rcpt_ms  = outs[1].http_ms, .json_rcpt_ms  = 0,
+        .http_trc_ms   = outs[2].http_ms, .json_trc_ms   = 0,
+        .fbdr_ms       = fbdr_ms,
+        .err           = outs[0].failed or outs[1].failed or outs[2].failed,
+    };
+
+    if (result.err) return fbdr_ms;
+
+    // Parse all 3 responses in parallel (same as fetchBatchFlat for n=1).
+    // Traces are the heaviest (~60% of parse time) — parallel saves ~0.7ms.
+    var results1 = [1]BlockData{result.*};
+    const parse_args = [3]ParseMethodArg{
+        .{ .outs = &outs, .results = &results1, .arena = &method_arenas[0], .method = 0, .n = 1 },
+        .{ .outs = &outs, .results = &results1, .arena = &method_arenas[1], .method = 1, .n = 1 },
+        .{ .outs = &outs, .results = &results1, .arena = &method_arenas[2], .method = 2, .n = 1 },
+    };
+    var parse_threads: [3]?std.Thread = .{ null, null, null };
+    for (0..3) |k| {
+        if (std.Thread.spawn(.{}, parseMethodThread, .{parse_args[k]})) |t| {
+            parse_threads[k] = t;
+        } else |_| {
+            parseMethodThread(parse_args[k]);
+        }
+    }
+    for (parse_threads) |mt| if (mt) |t| t.join();
+
+    result.block    = results1[0].block;
+    result.receipts = results1[0].receipts;
+    result.traces   = results1[0].traces;
+
+    if (result.block == null or result.receipts == null or result.traces == null)
+        result.err = true;
+
+    std.debug.print(
+        "[JSON breakdown] HTTP(parallel)={d:.0}ms | data: blk={d}KB rcpt={d}KB trc={d}KB\n",
+        .{ fbdr_ms, outs[0].bytes / 1024, outs[1].bytes / 1024, outs[2].bytes / 1024 },
+    );
+
+    return fbdr_ms;
 }
 
 // ─── Deep copy helpers (all allocations go into dc_alloc — caller uses ArenaAllocator) ───
