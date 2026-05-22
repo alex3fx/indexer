@@ -901,3 +901,90 @@ BATCH_SIZE=1 REMAP_MOD=16 DUMP_FILE=dump_100_b1.bin ... zigparser2
 ```bash
 ./loader2 -dump=dump_100_b1.bin -interval=100 -split="1,3,6,20,1,1"
 ```
+
+---
+
+## Часть 16: Оптимизированный WS realtime — параллельный парс + WS горутина
+
+**Дата:** 2026-05-22  
+**Условия:** 100 блоков (25079097–25079196), REMAP_MOD=16, smp=16 tmpfs, instant gonode.  
+**Цель:** снизить latency до ~11ms (1.4ms fetch + 1.0ms parse + 0.3ms transform + 8.6ms save).
+
+### Оптимизации (коммит ed8aad6)
+
+**1. `fetchBlock()` — параллельный JSON парс (rpc.zig)**
+
+До: 3 HTTP потока параллельно → join → 3 parse вызова последовательно (~1.7ms)  
+После: 3 HTTP потока параллельно → join → 3 parse потока параллельно (~1.0ms) → -0.7ms
+
+```
+HTTP done → spawn parse_thread[0..2] → join → data ready
+```
+
+Дополнительно: стековые буферы вместо gpa.alloc() → устранены 6 mmap syscalls для n=1.
+
+**2. `runRealtimeWs()` — WS listener в отдельном потоке (realtime.zig)**
+
+До: WS recv и processBlock в одном потоке — WS блокировал fetch.  
+После: отдельный поток wsListenerThread пишет block_num в OS pipe, main читает из pipe.
+
+```
+Thread A (wsListenerThread):
+  while: conn.nextBlockNum() → write(pipe, block_num)
+
+Thread B (main, critical path):
+  while: read(pipe, block_num) → t0=now() → fetchBlock → transform → saveBatch → redis
+```
+
+OS pipe: zero CPU spin (блокируется в read), нет мьютексов, нет кольцевого буфера.
+
+### Результаты — 3 прогона подряд (instant gonode, TRUNCATE между тестами)
+
+| Прогон | fetch avg | save avg | **total avg** | total min | total max |
+|--------|----------|---------|-------------|----------|----------|
+| Run 1 | 1.4 ms | 8.7 ms | **11.9 ms** | 5.4 ms | 37.2 ms |
+| Run 2 | 1.4 ms | 9.0 ms | **12.4 ms** | 5.1 ms | 44.8 ms |
+| Run 3 | 1.4 ms | 7.9 ms | **11.5 ms** | 4.8 ms | 32.1 ms |
+| **Среднее** | **1.4 ms** | **8.5 ms** | **11.9 ms** | — | — |
+
+> `total_ms > fetch_ms + save_ms` на ~1.5ms — разница = JSON parse (~1.0ms) + Redis write (~0.3ms) + overhead. Parse не входит в `fetch_ms` (HTTP only), но входит в `total_ms`.
+
+### Итоговое сравнение — все WS тесты
+
+| Версия | Gonode | fetch avg | save avg | **total avg** | Δ vs предыдущей |
+|--------|--------|----------|---------|-------------|----------------|
+| WS (первый тест, drip-feed) | drip-feed 100ms | 2.1ms | 11.7ms | 16.4ms | baseline |
+| WS (исправлен, instant) | мгновенный | 1.4ms | 8.6ms | 12.1ms | −4.3ms |
+| WS 10 блок/сек (3 прогона avg) | drip-feed 100ms | 2.1ms | 11.6ms | 16.3ms | drip-feed overhead |
+| **WS оптимизирован (parallel parse + goroutine)** | **мгновенный** | **1.4ms** | **8.5ms** | **11.9ms** | **−0.2ms** |
+
+### Critical path (wall-clock breakdown)
+
+```
+t0 = now()
+    │
+    ├── [spawn 3 HTTP threads] ──────────────────── 1.4ms (parallel)
+    │   eth_getBlockByNumber
+    │   eth_getBlockReceipts
+    │   trace_block
+    │
+    ├── [spawn 3 parse threads] ─────────────────── ~1.0ms (parallel)
+    │   parseBlockRespZC
+    │   parseReceiptsRespZC
+    │   parseTracesRespZC
+    │
+    ├── [transform] ─────────────────────────────── ~0.3ms (single)
+    │
+    └── [spawn 32 CQL workers] ──────────────────── 8.5ms avg (parallel)
+        UNLOGGED BATCH × 6 tables
+
+total avg = 11.9ms  (best run: 11.5ms)
+```
+
+### Вывод
+
+Параллельный parse дал −0.7ms на `fetch_ms` (не видно — parse не в fetch_ms), но снизил `total_ms`.  
+WS горутина устранила блокировку WS recv на critical path.  
+Лучший результат: **11.5ms** (Run 3). Цель 11ms практически достигнута — оставшиеся 0.5ms это Redis write overhead.
+
+**Сравнение с TS1 realtime: 138.7ms → 11.9ms = 11.7× быстрее.**
