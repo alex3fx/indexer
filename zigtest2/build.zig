@@ -62,6 +62,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "metrics",   .module = metrics_mod },
         },
     });
+    const ws_mod = b.createModule(.{
+        .root_source_file = b.path("src/ws.zig"),
+        .target = target, .optimize = optimize,
+    });
     const realtime_mod = b.createModule(.{
         .root_source_file = b.path("src/realtime.zig"),
         .target = target, .optimize = optimize,
@@ -70,6 +74,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transform", .module = transform_mod },
             .{ .name = "db",        .module = db_mod },
             .{ .name = "config",    .module = config_mod },
+            .{ .name = "ws",        .module = ws_mod },
         },
     });
 

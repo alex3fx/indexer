@@ -17,6 +17,7 @@ pub const fetch_mode_names = [3][]const u8{
 
 pub const Config = struct {
     rpc_url:        []const u8,
+    ws_url:         []const u8,  // WS_URL=ws://host:port/path — use newHeads instead of polling
     chain_id:       u64,
     chunk_size:     u64,
     remap_mod:      u64,   // 0 = use chunk_size; N = chunk = block_number % N
@@ -24,7 +25,7 @@ pub const Config = struct {
     batch_size:     usize,
     pipeline:       usize, // parallel fetch+save workers (1 = classic PrevBatch)
     realtime:       bool,  // REALTIME=1: single-block loop after history sync
-    poll_ms:        u64,   // polling interval when no new block available
+    poll_ms:        u64,   // polling interval when no new block available (ignored if ws_url set)
     redis_host:     []const u8,
     redis_port:     u16,
     redis_pass:     []const u8,
@@ -117,6 +118,7 @@ pub fn parseConfig(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ
 
     return Config{
         .rpc_url        = getEnv(env, "RPC_URL", "http://127.0.0.1:8545"),
+        .ws_url         = getEnv(env, "WS_URL", ""),
         .chain_id       = getEnvInt(u64, env, "CHAIN_ID", 1),
         .chunk_size     = getEnvInt(u64, env, "RAW_CHUNK_SIZE", 1000),
         .remap_mod      = getEnvInt(u64, env, "REMAP_MOD", 0),
