@@ -655,3 +655,65 @@ bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 BLOCK_INT
 REALTIME=1 POLL_MS=50 REMAP_MOD=16 TO_BLOCK=25079196 \
   zigtest2/zig-out/bin/zigparser2
 ```
+
+---
+
+## Часть 13: WebSocket newHeads в zigparser2 (runRealtimeWs)
+
+**Дата:** 2026-05-22  
+**Условия:** 100 блоков (25079097–25079196), REMAP_MOD=16, smp=16 tmpfs.  
+**Gonode:** BLOCK_INTERVAL_MS=100 — блок каждые 100ms, WS endpoint `/ws`.  
+**Zigparser2:** REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws.
+
+### Архитектура WS режима
+
+```
+gonode /ws (eth_subscribe newHeads)
+    │  push block header (number, hash, ...)
+    ▼
+ws.zig WsConn.nextBlockNum()  ← блокирует до события
+    │  block_num извлечён из JSON
+    ▼
+processBlock(block_num)       ← 3×HTTP parallel + transform + saveBatch
+    │
+    ▼
+Redis cursor update
+```
+
+- `ws.zig` — RFC 6455 клиент, 184 строки, raw Linux TCP, без внешних зависимостей
+- `WsConn.subscribeNewHeads()` → отправляет eth_subscribe, возвращает sub_id
+- `WsConn.nextBlockNum()` → блокирует на fdRead, возвращает block_num из eth_subscription event
+
+### Результаты (100 блоков, drip-feed 100ms)
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| Fetch (WS wakeup + 3×HTTP) | 2.1 ms | 0.9 ms | 9.7 ms |
+| Transform | ~0.3 ms | — | — |
+| Save (UNLOGGED BATCH) | 11.7 ms | 4.7 ms | 55.6 ms |
+| **TOTAL (WS event → DB)** | **16.4 ms** | 7.0 ms | 59.3 ms |
+
+### Сравнение WS vs polling (все тесты drip-feed, gonode localhost)
+
+| Режим | Gonode | POLL/interval | fetch avg | save avg | **total avg** |
+|-------|--------|--------------|----------|---------|-------------|
+| Polling | мгновенный | POLL_MS=500 | 1.4ms | 8.5ms | 11.8ms |
+| Polling | мгновенный | POLL_MS=250 | 1.4ms | 8.5ms | 11.8ms |
+| Polling | drip-feed 50ms | POLL_MS=50 | 2.2ms | 11.6ms | 16.5ms |
+| **WebSocket** | **drip-feed 100ms** | **n/a** | **2.1ms** | **11.7ms** | **16.4ms** |
+
+**Вывод:** на localhost результаты WS и polling практически идентичны.  
+Преимущество WS проявится на реальной ноде с сетевой задержкой:  
+polling добавляет POLL_MS/2 среднего ожидания (250ms poll → +125ms), WS — нет.
+
+### Запуск
+
+```bash
+# Gonode с WS и drip-feed:
+bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 \
+  BLOCK_INTERVAL_MS=100 mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+
+# Zigparser2 WS режим:
+REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws REMAP_MOD=16 TO_BLOCK=25079196 \
+  zigtest2/zig-out/bin/zigparser2
+```

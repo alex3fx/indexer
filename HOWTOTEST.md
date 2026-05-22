@@ -85,7 +85,29 @@ until nc -z 127.0.0.1 8545; do sleep 3; done && echo "gonode ready"
 
 **Диапазон блоков в данных:** 25078197–25079196 (1000 блоков).
 
-### 1.5 Bun (для TS1)
+### 1.5 Gonode: WebSocket newHeads (drip-feed)
+
+Gonode поддерживает `BLOCK_INTERVAL_MS=N` (drip-feed) и WebSocket endpoint `/ws`.
+
+```bash
+# Обычный режим (все блоки доступны сразу):
+bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 \
+  mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+
+# Drip-feed + WS (новый блок каждые N ms, таймер стартует с первого запроса):
+bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 \
+  BLOCK_INTERVAL_MS=50 mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+```
+
+WS endpoint: `ws://127.0.0.1:8545/ws`  
+Поддерживаемые методы: `eth_subscribe` (только `newHeads`), `eth_unsubscribe`.
+
+Пересборка gonode после изменений:
+```bash
+cd mocknode/gonode && /usr/local/go/bin/go build -o gonode .
+```
+
+### 1.6 Bun (для TS1)
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
@@ -260,11 +282,10 @@ save workers     : 12933 ms (cassandra-driver INSERT после historical.ts)
 
 ## 5. Realtime-тест (1 блок за раз)
 
-### 5.1 zigparser2 realtime
+### 5.1 zigparser2 realtime — режим polling
 
 ```bash
 cd /home/alex/lotos/task1/zigtest2
-# REALTIME=1 — обрабатывает по 1 блоку, цикл до TO_BLOCK
 CM_CONNECTION_URL="redis://:mockpass@127.0.0.1:6379/0" \
 SCYLLA_DB_CONTACT_POINTS='["172.31.208.104:9142"]' \
 SCYLLA_DB_KEYSPACE=eth RPC_URL=http://127.0.0.1:8545 CHAIN_ID=1 \
@@ -281,9 +302,49 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 POLL_MS=500 \
 | Save (UNLOGGED BATCH) | 8.5 ms | 3.4 ms | 40.2 ms |
 | **TOTAL (запрос → DB)** | **11.8 ms** | 4.9 ms | 45.2 ms |
 
-> POLL_MS не влияет на latency, когда блок уже готов — используется только при ожидании нового блока.
+> POLL_MS = sleep когда блок ещё не готов. Если блок всегда доступен — не влияет на latency.
 
-### 5.2 TS1 realtime (BATCH_SIZE=1)
+### 5.2 zigparser2 realtime — режим WebSocket newHeads
+
+Вместо polling: подписывается на `eth_subscribe newHeads`, обрабатывает блок немедленно при WS push.
+
+```bash
+# 1. Gonode с WS + drip-feed 100ms:
+bash -c 'MOCK_DATA_FILE=/home/alex/lotos/task1/packtest/data/blocks_fresh_100.json \
+  CHAIN_ID=1 BLOCK_INTERVAL_MS=100 \
+  /home/alex/lotos/task1/mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+until nc -z 127.0.0.1 8545; do sleep 1; done
+
+# 2. Zigparser2 WS режим (WS_URL активирует runRealtimeWs):
+CM_CONNECTION_URL="redis://:mockpass@127.0.0.1:6379/0" \
+SCYLLA_DB_CONTACT_POINTS='["172.31.208.104:9142"]' \
+SCYLLA_DB_KEYSPACE=eth RPC_URL=http://127.0.0.1:8545 CHAIN_ID=1 \
+TO_BLOCK=25079196 REMAP_MOD=16 \
+REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
+./zig-out/bin/zigparser2
+```
+
+Результаты (100 блоков, drip-feed 100ms, REMAP_MOD=16, smp=16 tmpfs):
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| Fetch (WS wakeup + 3×HTTP) | 2.1 ms | 0.9 ms | 9.7 ms |
+| Transform | 0.3 ms | — | — |
+| Save (UNLOGGED BATCH) | 11.7 ms | 4.7 ms | 55.6 ms |
+| **TOTAL (WS event → DB)** | **16.4 ms** | 7.0 ms | 59.3 ms |
+
+**WS vs polling сравнение:**
+
+| Режим | Gonode | total avg | Преимущество WS |
+|-------|--------|-----------|----------------|
+| Polling POLL_MS=500 | мгновенный | 11.8 ms | — |
+| Polling POLL_MS=50 | drip-feed 50ms | 16.5 ms | — |
+| **WebSocket** | **drip-feed 100ms** | **16.4 ms** | На localhost ≈ то же |
+
+На реальной ноде с RTT 50ms: polling (POLL_MS=500) добавляет **+250ms** среднего ожидания.  
+WebSocket: **+0ms** — уведомление приходит мгновенно при появлении блока.
+
+### 5.3 TS1 realtime (BATCH_SIZE=1)
 
 ```bash
 cd /home/alex/lotos/task1/mocknode
@@ -304,7 +365,7 @@ bash scripts/run_ts1_realtime.sh
 
 Wall-clock throughput: 25.5 ms/block (save перекрывается через BullMQ)
 
-### 5.3 Realtime: zigparser2 с drip-feed gonode (BLOCK_INTERVAL_MS=50)
+### 5.4 Realtime: zigparser2 с drip-feed polling (BLOCK_INTERVAL_MS=50)
 
 Для честного теста gonode выдаёт блоки по одному каждые 50ms (`BLOCK_INTERVAL_MS=50`, таймер с первого запроса). Парсер с `POLL_MS=50` опрашивает ноду каждые 50ms пока блок не готов.
 
@@ -325,7 +386,7 @@ REALTIME=1 POLL_MS=50 REMAP_MOD=16 TO_BLOCK=25079196 ./zig-out/bin/zigparser2
 
 При drip-feed: парсер видит null (блок ещё не готов), спит 50ms, повторяет — поэтому fetch avg 2.2ms вместо 1.4ms. Save avg 11.6ms (чуть выше обычного — Scylla под нагрузкой более длинного теста).
 
-### 5.4 Realtime: сравнение TS1 vs zigparser2
+### 5.5 Realtime: сравнение TS1 vs zigparser2
 
 | Метрика | TS1 (BATCH_SIZE=1) | zigparser2 (poll=500) | Разница |
 |---------|-------------------|----------------------|---------|
@@ -389,3 +450,5 @@ python3 /mnt/c/Users/Public/zig20260521/validate_db.py
 | После рестарта WSL schema пропала | tmpfs очищается | Пересоздать: `cqlsh -f schema.cql` |
 | PIPELINE=4 медленнее PIPELINE=2 | gonode перегружен на localhost | Нормально; на реальной ноде PIPELINE=4 лучше |
 | BullMQ Lua script error | DragonflyDB без `--cluster_mode=emulated` | Перезапустить с флагами из раздела 4.1 |
+| WS_URL задан, но парсер висит | gonode не поддерживал WS (старый бинарь) | Пересобрать: `cd mocknode/gonode && go build -o gonode .` |
+| Парсер зависает после to_block в WS режиме | Ожидает следующий WS event которого нет | Исправлено: `if block_num >= to_block: break` |
