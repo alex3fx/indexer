@@ -258,24 +258,96 @@ save workers     : 12933 ms (cassandra-driver INSERT после historical.ts)
 
 ---
 
-## 5. Итоговое сравнение парсеров
+## 5. Realtime-тест (1 блок за раз)
 
-Все измерения: 1000 блоков, gonode HTTP, native ScyllaDB smp=16 tmpfs, 2026-05-22.
+### 5.1 zigparser2 realtime
 
-| Парсер | Конфигурация | ms/block | Относительно TS1 |
-|--------|-------------|---------|-----------------|
-| TS1 | 5 workers, BullMQ, cassandra-driver | **27.85 ms** | 1.00× (baseline) |
-| zigparser2 | PIPELINE=1, REMAP=16, BATCH=16 | 6.06 ms | 4.6× быстрее |
-| zigparser2 | **PIPELINE=2, REMAP=16, BATCH=16** | **5.58 ms** | **5.0× быстрее** |
-| zigparser2 | PIPELINE=4, REMAP=16, BATCH=16 | 6.18 ms | 4.5× быстрее |
+```bash
+cd /home/alex/lotos/task1/zigtest2
+# REALTIME=1 — обрабатывает по 1 блоку, цикл до TO_BLOCK
+CM_CONNECTION_URL="redis://:mockpass@127.0.0.1:6379/0" \
+SCYLLA_DB_CONTACT_POINTS='["172.31.208.104:9142"]' \
+SCYLLA_DB_KEYSPACE=eth RPC_URL=http://127.0.0.1:8545 CHAIN_ID=1 \
+TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 POLL_MS=500 \
+./zig-out/bin/zigparser2
+```
 
-**Ключевое отличие CQL path:**
-- TS1: `cassandra-driver.execute()` на каждую строку (100 параллельных через `Promise.allSettled`)
-- zigparser2: нативный `UNLOGGED BATCH` (100 строк за 1 CQL-фрейм)
+Результаты (100 блоков, REMAP_MOD=16, smp=16 tmpfs, gonode localhost):
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| Fetch (3×HTTP parallel) | 1.4 ms | 0.6 ms | 7.6 ms |
+| Transform | 0.3 ms | — | — |
+| Save (UNLOGGED BATCH) | 8.5 ms | 3.4 ms | 40.2 ms |
+| **TOTAL (запрос → DB)** | **11.8 ms** | 4.9 ms | 45.2 ms |
+
+> POLL_MS не влияет на latency, когда блок уже готов — используется только при ожидании нового блока.
+
+### 5.2 TS1 realtime (BATCH_SIZE=1)
+
+```bash
+cd /home/alex/lotos/task1/mocknode
+# DragonflyDB с --cluster_mode=emulated --lock_on_hashtags обязателен для BullMQ
+bash scripts/run_ts1_realtime.sh
+```
+
+Результаты (100 блоков, BATCH_SIZE=1, 1 воркер, gonode localhost):
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| FBDR (3×HTTP + JSON parse) | 6.4 ms | 1.0 ms | 12.0 ms |
+| Transform (JS loop) | 4.2 ms | — | — |
+| BullMQ addJob | 6.7 ms | — | — |
+| **TPT** (fetch+transform+BullMQ) | **10.6 ms** | 3.0 ms | 20.0 ms |
+| Save (cassandra-driver EXECUTE) | 127.8 ms | 23.0 ms | 273.0 ms |
+| **TOTAL (запрос → DB)** | **138.7 ms** | 32.0 ms | 286.0 ms |
+
+Wall-clock throughput: 25.5 ms/block (save перекрывается через BullMQ)
+
+### 5.3 Realtime: сравнение
+
+| Метрика | TS1 (BATCH_SIZE=1) | zigparser2 | Разница |
+|---------|-------------------|------------|---------|
+| Fetch avg | 6.4 ms | 1.4 ms | 4.6× |
+| Transform avg | 4.2 ms | 0.3 ms | 14× |
+| Queue overhead | 6.7 ms (BullMQ) | 0 ms | — |
+| **Save avg** | **127.8 ms** | **8.5 ms** | **15×** |
+| **Per-block latency** | **138.7 ms** | **11.8 ms** | **11.7×** |
+| Wall-clock throughput | 25.5 ms/block | 11.8 ms/block | 2.2× |
+
+**Почему save в 15× медленнее у TS1:**  
+cassandra-driver делает `Promise.allSettled` на каждые 100 строк — это **28 sequential round-trips** для ~2800 строк одного блока. zigparser2 отправляет те же 28 UNLOGGED BATCH фреймов **параллельно** через pool=32.
 
 ---
 
-## 6. Валидация данных
+## 6. Итоговое сравнение парсеров
+
+Все измерения: gonode HTTP, native ScyllaDB smp=16 tmpfs, 2026-05-22.
+
+### Historical (1000 блоков)
+
+| Парсер | Конфигурация | ms/block | vs TS1 |
+|--------|-------------|---------|--------|
+| TS1 | 5 workers, BullMQ, cassandra-driver | **27.85 ms** | 1.0× |
+| zigparser2 PIPELINE=1 | REMAP=16, BATCH=16 | 6.06 ms | 4.6× |
+| **zigparser2 PIPELINE=2** | **REMAP=16, BATCH=16** | **5.58 ms** | **5.0×** |
+| zigparser2 PIPELINE=4 | REMAP=16, BATCH=16 | 6.18 ms | 4.5× |
+
+### Realtime (1 блок за раз, 100 блоков)
+
+| Парсер | Per-block latency | Wall-clock throughput |
+|--------|-----------------|----------------------|
+| TS1 (BATCH_SIZE=1, 1 worker) | 138.7 ms | 25.5 ms/block |
+| **zigparser2** (REALTIME=1) | **11.8 ms** | **11.8 ms/block** |
+| **Speedup** | **11.7×** | **2.2×** |
+
+**Ключевое отличие CQL path:**
+- TS1: `cassandra-driver.execute()` → 28 sequential `Promise.allSettled` × 100 строк
+- zigparser2: `UNLOGGED BATCH` → 28 параллельных фреймов через pool=32
+
+---
+
+## 7. Валидация данных
 
 После записи — сверить с prod CSV:
 
@@ -285,7 +357,7 @@ python3 /mnt/c/Users/Public/zig20260521/validate_db.py
 
 ---
 
-## 7. Типичные проблемы
+## 8. Типичные проблемы
 
 | Симптом | Причина | Решение |
 |---------|---------|---------|
