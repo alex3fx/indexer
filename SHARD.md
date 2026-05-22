@@ -554,3 +554,56 @@ REALTIME=1 POLL_MS=<N> REMAP_MOD=16 TO_BLOCK=25079196
 Для снижения save latency можно:
 1. Уменьшить SPLIT (больше соединений на logи/itxs — основной объём)
 2. Уменьшить pool connections на save (сейчас pool=32 для 1 блока = излишне)
+
+---
+
+## Часть 11: TS1 realtime — latency одного блока (BATCH_SIZE=1)
+
+**Дата:** 2026-05-22  
+**Условия:** 100 блоков (25079097–25079196), BATCH_SIZE=1, 1 воркер save.ts, gonode localhost, native Scylla smp=16 tmpfs.  
+**Метрика:** время от начала fetch до завершения записи в ScyllaDB (TPT + save_ms per block).
+
+### Разбивка TS1 per block (BATCH_SIZE=1)
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| FBDR (3×HTTP+JSON parse) | 6.4 ms | 1.0 ms | 12.0 ms |
+| Transform (JS loop) | 4.2 ms | — | — |
+| BullMQ addJob | 6.7 ms | — | — |
+| **TPT** (fetch+xform+BullMQ) | **10.6 ms** | 3.0 ms | 20.0 ms |
+| Save (cassandra-driver EXECUTE) | 127.8 ms | 23.0 ms | 273.0 ms |
+| **TOTAL (fetch → DB)** | **138.7 ms** | 32.0 ms | 286.0 ms |
+
+Wall-clock throughput: **2553ms / 100 blocks = 25.5ms/block**  
+(saves перекрываются с fetch следующих блоков через BullMQ, поэтому wall-clock < per-block latency)
+
+### Сравнение realtime: TS1 vs zigparser2
+
+| Метрика | TS1 (BATCH_SIZE=1) | zigparser2 | Разница |
+|---------|-------------------|------------|---------|
+| Fetch avg | 6.4 ms | 1.4 ms | 4.6× |
+| Transform avg | 4.2 ms | 0.3 ms | 14× |
+| Queue overhead | 6.7 ms (BullMQ) | 0 ms | — |
+| **Save avg** | **127.8 ms** (cassandra-driver) | **8.5 ms** (UNLOGGED BATCH) | **15× !** |
+| **Per-block latency** | **138.7 ms** | **11.8 ms** | **11.7×** |
+| Wall-clock throughput | 25.5 ms/block | 11.8 ms/block | 2.2× |
+
+### Почему save у TS1 в 15× медленнее
+
+TS1 использует `cassandra-driver.execute()` на каждую строку:
+- 1 блок ≈ 2800 строк (270 txs + 600 logs + 1900 itxs + ...)
+- `insertMany` бьёт на группы по 100 и ждёт `Promise.allSettled` последовательно
+- 2800 / 100 = 28 sequential round-trips для одного блока
+
+zigparser2 — нативный `UNLOGGED BATCH`:
+- 100 строк в одном CQL-фрейме → 1 round-trip per frame
+- 2800 / 100 = 28 frames, но отправляются параллельно через pool=32
+
+**Итог:** cassandra-driver имеет фундаментальный overhead sequential Promise.allSettled на каждые 100 строк. Это даёт 127ms на блок вместо 8.5ms у zigparser2.
+
+### Запуск теста
+
+```bash
+cd /home/alex/lotos/task1/mocknode
+bash scripts/run_ts1_realtime.sh
+```
