@@ -409,12 +409,97 @@ mem/shard ≈ 300MB–1.25GB — не критично при bypass-fsync на 
 
 ---
 
-## Путь к 5ms/block на текущей машине
+## Часть 8: PIPELINE sweep (zigparser2, smp=16 tmpfs)
 
-Loader с chunk_size=10 уже даёт 8.2ms/block. Для парсера (chunk_size=1000 в проде):
+**Дата:** 2026-05-22  
+**Условия:** 1000 блоков (25078197–25079196), REMAP_MOD=16, BATCH_SIZE=16, smp=16 5G tmpfs, gonode localhost:8545.
 
-| Вариант | Ожидаемый результат | Статус |
-|---------|--------------------|----|
-| loader firehose + chunk_size=10 | **8.2ms** ✓ | Готово |
-| Параллельная загрузка N disjoint chunk-диапазонов | N×ускорение | Реализуемо |
-| Production машина (smp=32, 128GB) | все 32 шарда активны при prod chunk_size | Прод среда |
+### Результаты
+
+| Конфиг | Total ms | ms/block | FBDR avg/block | Примечание |
+|--------|---------|---------|----------------|-----------|
+| PIPELINE=1 REMAP=16 BATCH=16 | 6062 ms | 6.06 ms | 40 ms | Baseline |
+| **PIPELINE=2 REMAP=16 BATCH=16** | **5580 ms** | **5.58 ms** | ~100 ms | Лучший |
+| PIPELINE=4 REMAP=16 BATCH=16 | 6177 ms | 6.18 ms | 244 ms | gonode bottleneck |
+
+### Анализ
+
+С PIPELINE=4 FBDR вырос до 244ms (vs 40ms у PIPELINE=1) — gonode-мок перегружен 4 параллельными потоками (4×48=192 одновременных HTTP запроса).
+
+**Оптимум для localhost: PIPELINE=2.** На реальной ноде с RTT 50–200ms PIPELINE=4 ожидаемо лучше.
+
+Сборка и запуск:
+```bash
+ZIG=/home/alex/lotos/zig-x86_64-linux-0.17.0-dev.263+0add2dfc4/zig
+cd zigtest2
+$ZIG build -Doptimize=ReleaseFast -Dpool_size=32 -Dsplit="1,3,6,20,1,1"
+
+CM_CONNECTION_URL="redis://:mockpass@127.0.0.1:6379/0" \
+SCYLLA_DB_CONTACT_POINTS='["172.31.208.104:9142"]' \
+SCYLLA_DB_KEYSPACE=eth RPC_URL=http://127.0.0.1:8545 CHAIN_ID=1 \
+TO_BLOCK=25079196 BATCH_SIZE=16 REMAP_MOD=16 PIPELINE=2 \
+./zig-out/bin/zigparser2
+```
+
+---
+
+## Часть 9: Сравнение zigparser2 vs TS1 (полный pipeline)
+
+**Дата:** 2026-05-22  
+**Условия:** 1000 блоков, gonode localhost:8545, native Scylla smp=16 5G tmpfs, одинаковые данные.
+
+### TS1 — полный тест с реальной ScyllaDB
+
+Архитектура: `historical.ts` (fetch+transform → BullMQ) + 5 × `save.ts` (BullMQ → cassandra-driver EXECUTE).  
+Запуск: `cd mocknode && bash scripts/run_ts1_bench.sh 5 1000`
+
+**ВАЖНО:** DragonflyDB должен быть запущен с `--cluster_mode=emulated --lock_on_hashtags`, иначе BullMQ Lua scripts падают с `ERR script tried accessing undeclared key`.
+
+```bash
+docker run --rm -d --name temp_dragonfly --network host \
+  docker.dragonflydb.io/dragonflydb/dragonfly:latest \
+  --bind=0.0.0.0 --port=6379 \
+  --lock_on_hashtags --cluster_mode=emulated --requirepass=mockpass
+```
+
+#### Разбивка TS1 (1000 блоков, 5 workers)
+
+| Фаза | Время |
+|------|-------|
+| FBDR avg/block (HTTP gonode) | 34.6 ms |
+| Transform avg/batch (10 блоков) | 52.0 ms |
+| BullMQ addJob avg/batch | 41.0 ms |
+| TPT (historical.ts) | 14915 ms / **10.6 ms/block** |
+| Save workers (после historical.ts) | ~12933 ms |
+| **Полный wall-clock** | **27848 ms / 27.85 ms/block** |
+
+### Итоговая таблица сравнения
+
+| Парсер | ms/block | vs TS1 | CQL path |
+|--------|---------|--------|---------|
+| **TS1** (5 workers, BullMQ) | **27.85 ms** | 1.0× | cassandra-driver EXECUTE per row |
+| zigparser2 PIPELINE=1 | 6.06 ms | 4.6× быстрее | UNLOGGED BATCH 100 rows/frame |
+| **zigparser2 PIPELINE=2** | **5.58 ms** | **5.0× быстрее** | UNLOGGED BATCH 100 rows/frame |
+| zigparser2 PIPELINE=4 | 6.18 ms | 4.5× быстрее | UNLOGGED BATCH 100 rows/frame |
+
+### Ключевые факторы преимущества zigparser2
+
+1. **UNLOGGED BATCH vs individual EXECUTE**: 100 строк за 1 CQL-фрейм вместо 100 отдельных запросов → меньше round-trips
+2. **Нет BullMQ overhead**: нет сериализации в Redis, нет шины очереди
+3. **PrevBatch overlap**: save N-1 перекрывается с fetch+transform N
+4. **REMAP_MOD=16**: все 16 шардов активны (vs 2 шарда при chunk_size=1000)
+
+---
+
+## Итоговая сводка всех оптимизаций парсера
+
+| Этап | Конфиг | ms/block | Ускорение от предыдущего |
+|------|--------|---------|------------------------|
+| Baseline (Docker smp=2, chunk=1000) | POOL=32, PIPE=256 | 21.6 ms | — |
+| Native Scylla smp=24 ext4 | POOL=32, PIPE=256 | 21.7 ms | ≈0% |
+| + tmpfs + remap-mod=8 | smp=8, BATCH=8 | 8.75 ms | 2.5× |
+| + UNLOGGED BATCH | smp=16, remap=16, BATCH=16 | 6.25 ms | 1.4× |
+| + PIPELINE=2 | smp=16, REMAP=16, BATCH=16 | **5.58 ms** | 1.12× |
+
+**Итог: 21.6ms → 5.58ms = 3.9× ускорение относительно baseline.**  
+**vs TS1 (27.85ms): 5.0× быстрее.**
