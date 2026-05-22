@@ -503,3 +503,54 @@ docker run --rm -d --name temp_dragonfly --network host \
 
 **Итог: 21.6ms → 5.58ms = 3.9× ускорение относительно baseline.**  
 **vs TS1 (27.85ms): 5.0× быстрее.**
+
+---
+
+## Часть 10: Realtime-режим — latency одного блока
+
+**Дата:** 2026-05-22  
+**Условия:** 100 блоков (25079097–25079196), REMAP_MOD=16, smp=16 5G tmpfs, gonode localhost.  
+**Метрика:** время от отправки первого HTTP запроса на ноду до завершения записи в ScyllaDB (wall-clock per block).
+
+### Конфигурация
+
+```bash
+REALTIME=1 POLL_MS=<N> REMAP_MOD=16 TO_BLOCK=25079196
+```
+
+### Результаты
+
+| POLL_MS | fetch avg | save avg | **total avg** | total min | total max |
+|---------|----------|---------|-------------|----------|----------|
+| 500 ms  | 1.4 ms   | 8.5 ms  | **11.8 ms** | 4.9 ms   | 45.2 ms  |
+| 250 ms  | 1.4 ms   | 8.5 ms  | **11.8 ms** | 4.9 ms   | 30.6 ms  |
+
+### Разбивка avg per block (POLL_MS=500)
+
+| Фаза | Время |
+|------|-------|
+| fetch (3 параллельных HTTP + JSON) | 1.4 ms |
+| transform | ~0.3 ms |
+| save (UNLOGGED BATCH → Scylla) | 8.5 ms |
+| **TOTAL (запрос → DB)** | **11.8 ms** |
+
+### Анализ
+
+- **POLL_MS не влияет на latency** — все блоки доступны сразу в gonode, ожидания нет.
+- **Fetch (1.4ms)** — gonode localhost, практически без задержки сети. На реальной ноде: +RTT.
+- **Save (8.5ms)** — основной компонент latency. Один блок = один `saveBatch` со всеми таблицами.
+- **Max (45ms)** — редкие outliers из-за Scylla compaction или OS scheduling.
+- **Сравнение с historical:** realtime avg 11.8ms vs historical 5.58ms/block — в 2× медленнее.
+  Разница: historical батчит 16 блоков в одном round-trip и перекрывает save с fetch (PIPELINE=2).
+  В realtime каждый блок — отдельный save, нет pipeline overlap.
+
+### Реальная нода (ожидаемые цифры)
+
+При RTT к ноде 50ms: total ≈ 1.4 + 50 + 0.3 + 8.5 ≈ **60ms** (fetch станет доминирующим).  
+При RTT 100ms: total ≈ **110ms**.
+
+### Потенциал оптимизации realtime
+
+Для снижения save latency можно:
+1. Уменьшить SPLIT (больше соединений на logи/itxs — основной объём)
+2. Уменьшить pool connections на save (сейчас pool=32 для 1 блока = излишне)

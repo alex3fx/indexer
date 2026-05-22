@@ -25,8 +25,15 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
+pub const BlockResult = struct {
+    fetch_ms:     f64,
+    transform_ms: f64,
+    save_ms:      f64,
+    total_ms:     f64,
+};
+
 /// Process a single block end-to-end: fetch → transform → save.
-/// Returns total elapsed ms, or null if the block is not yet available.
+/// Returns null if the block is not yet available.
 pub fn processBlock(
     io:        std.Io,
     gpa:       std.mem.Allocator,
@@ -36,7 +43,7 @@ pub fn processBlock(
     block_num: u64,
     method_arenas: *[3]std.heap.ArenaAllocator,
     block_arena:   *std.heap.ArenaAllocator,
-) !?f64 {
+) !?BlockResult {
     _ = block_arena.reset(.retain_capacity);
     for (method_arenas) |*a| _ = a.reset(.retain_capacity);
 
@@ -79,7 +86,8 @@ pub fn processBlock(
            ent.txs.items.len, ent.logs.items.len, ent.internal_txs.items.len },
     );
 
-    return total_ms;
+    return .{ .fetch_ms = fetch_ms, .transform_ms = transform_ms,
+               .save_ms = save_ms, .total_ms = total_ms };
 }
 
 /// Realtime loop: poll for new blocks, process each immediately.
@@ -91,8 +99,8 @@ pub fn runRealtime(
     prep_ids: *db.PreparedIds,
     redis:    *db.RedisConn,
 ) !void {
-    std.debug.print("Realtime mode: poll_ms={d}  chunk=block%{d}\n\n",
-        .{ cfg.poll_ms, if (cfg.remap_mod > 0) cfg.remap_mod else cfg.chunk_size });
+    std.debug.print("Realtime mode: poll_ms={d}  chunk=block%{d}  to={d}\n\n",
+        .{ cfg.poll_ms, if (cfg.remap_mod > 0) cfg.remap_mod else cfg.chunk_size, cfg.to_block });
 
     var method_arenas = [3]std.heap.ArenaAllocator{
         std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -113,22 +121,50 @@ pub fn runRealtime(
         return error.NoStartBlock;
     }
 
-    while (true) {
-        const result = try processBlock(
-            io, gpa, cfg, pool, prep_ids, block_num,
-            &method_arenas, &block_arena,
-        );
+    // Per-block stats
+    var n: u64 = 0;
+    var sum_total: f64 = 0;  var min_total: f64 = std.math.floatMax(f64);  var max_total: f64 = 0;
+    var sum_fetch: f64 = 0;  var min_fetch: f64 = std.math.floatMax(f64);  var max_fetch: f64 = 0;
+    var sum_save:  f64 = 0;  var min_save:  f64 = std.math.floatMax(f64);  var max_save:  f64 = 0;
 
-        if (result == null) {
-            // Block not yet produced — wait and retry
+    while (block_num <= cfg.to_block) {
+        const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
+                                    &method_arenas, &block_arena);
+
+        if (br == null) {
             sleepMs(cfg.poll_ms);
             continue;
         }
 
-        // Update cursor
+        const r = br.?;
+        sum_total += r.total_ms;
+        sum_fetch += r.fetch_ms;
+        sum_save  += r.save_ms;
+        if (r.total_ms < min_total) min_total = r.total_ms;
+        if (r.total_ms > max_total) max_total = r.total_ms;
+        if (r.fetch_ms < min_fetch) min_fetch = r.fetch_ms;
+        if (r.fetch_ms > max_fetch) max_fetch = r.fetch_ms;
+        if (r.save_ms  < min_save)  min_save  = r.save_ms;
+        if (r.save_ms  > max_save)  max_save  = r.save_ms;
+        n += 1;
+
         const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
         defer gpa.free(s);
         try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
         block_num += 1;
+    }
+
+    if (n > 0) {
+        const fn_ = @as(f64, @floatFromInt(n));
+        std.debug.print(
+            "\n⚡ Realtime summary ({d} blocks, poll_ms={d})\n" ++
+            "  fetch  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
+            "  save   avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
+            "  TOTAL  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n",
+            .{ n, cfg.poll_ms,
+               sum_fetch/fn_, min_fetch, max_fetch,
+               sum_save/fn_,  min_save,  max_save,
+               sum_total/fn_, min_total, max_total },
+        );
     }
 }
