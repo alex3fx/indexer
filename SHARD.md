@@ -717,3 +717,24 @@ bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 \
 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws REMAP_MOD=16 TO_BLOCK=25079196 \
   zigtest2/zig-out/bin/zigparser2
 ```
+
+### Исправление: WS с мгновенным gonode (честное сравнение с polling)
+
+Предыдущий WS тест использовал drip-feed 100ms — Scylla "остывала" между блоками.  
+Исправленный тест: instant gonode (все блоки сразу), те же условия что и polling 500/250ms.
+
+**Баги исправлены в gonode:**
+1. `minBlock` теперь всегда инициализируется при загрузке (не только при drip-feed)  
+2. Буфер WS канала 64 → 1024 (100+ блоков не дропаются)  
+3. `lastPushed` теперь per-subscriber (каждый клиент получает все блоки с начала подписки)
+
+| Режим | Gonode | fetch avg | save avg | **total avg** |
+|-------|--------|----------|---------|-------------|
+| Polling POLL_MS=500 | мгновенный | 1.4ms | 8.5ms | **11.8ms** |
+| Polling POLL_MS=250 | мгновенный | 1.4ms | 8.5ms | **11.8ms** |
+| **WebSocket (исправлен)** | **мгновенный** | **1.4ms** | **8.6ms** | **12.1ms** |
+| WS (drip-feed 100ms) | drip-feed | 2.1ms | 11.7ms | 16.4ms |
+
+**Вывод:** WS не даёт деградации относительно polling (12.1ms vs 11.8ms — в пределах погрешности).  
+Разница 0.3ms — это overhead одного WS frame read вместо HTTP null-ответа.  
+Предыдущая «деградация» 16ms была артефактом drip-feed (Scylla простаивала между блоками).

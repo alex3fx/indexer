@@ -324,25 +324,27 @@ REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 ./zig-out/bin/zigparser2
 ```
 
-Результаты (100 блоков, drip-feed 100ms, REMAP_MOD=16, smp=16 tmpfs):
+Результаты (100 блоков, instant gonode, REMAP_MOD=16, smp=16 tmpfs):
 
 | Фаза | avg | min | max |
 |------|-----|-----|-----|
-| Fetch (WS wakeup + 3×HTTP) | 2.1 ms | 0.9 ms | 9.7 ms |
+| Fetch (WS wakeup + 3×HTTP) | 1.4 ms | 0.7 ms | 11.0 ms |
 | Transform | 0.3 ms | — | — |
-| Save (UNLOGGED BATCH) | 11.7 ms | 4.7 ms | 55.6 ms |
-| **TOTAL (WS event → DB)** | **16.4 ms** | 7.0 ms | 59.3 ms |
+| Save (UNLOGGED BATCH) | 8.6 ms | 3.9 ms | 20.6 ms |
+| **TOTAL (WS event → DB)** | **12.1 ms** | 5.6 ms | 23.6 ms |
 
-**WS vs polling сравнение:**
+**WS vs polling (одинаковые условия — instant gonode):**
 
-| Режим | Gonode | total avg | Преимущество WS |
-|-------|--------|-----------|----------------|
-| Polling POLL_MS=500 | мгновенный | 11.8 ms | — |
-| Polling POLL_MS=50 | drip-feed 50ms | 16.5 ms | — |
-| **WebSocket** | **drip-feed 100ms** | **16.4 ms** | На localhost ≈ то же |
+| Режим | fetch avg | save avg | **total avg** |
+|-------|----------|---------|-------------|
+| Polling POLL_MS=500 | 1.4ms | 8.5ms | 11.8ms |
+| Polling POLL_MS=250 | 1.4ms | 8.5ms | 11.8ms |
+| **WebSocket** | **1.4ms** | **8.6ms** | **12.1ms** |
 
-На реальной ноде с RTT 50ms: polling (POLL_MS=500) добавляет **+250ms** среднего ожидания.  
-WebSocket: **+0ms** — уведомление приходит мгновенно при появлении блока.
+WS добавляет ~0.3ms overhead (один frame read) — в пределах погрешности. **Нет деградации.**
+
+> Если тест показывает 16ms — это артефакт drip-feed gonode (Scylla простаивает между блоками).  
+> На реальной ноде WS выгоднее polling за счёт мгновенного уведомления вместо периодического опроса.
 
 ### 5.3 TS1 realtime (BATCH_SIZE=1)
 
