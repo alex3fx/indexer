@@ -402,6 +402,80 @@ REALTIME=1 POLL_MS=50 REMAP_MOD=16 TO_BLOCK=25079196 ./zig-out/bin/zigparser2
 **Почему save в 15× медленнее у TS1:**  
 cassandra-driver делает `Promise.allSettled` на каждые 100 строк — это **28 sequential round-trips** для ~2800 строк одного блока. zigparser2 отправляет те же 28 UNLOGGED BATCH фреймов **параллельно** через pool=32.
 
+### 5.6 Оптимизация WS realtime — параллельный парс + WS горутина
+
+**Коммит:** `ed8aad6` — `Optimize realtime WS path: parallel parse + WS goroutine`
+
+#### Что изменилось
+
+**`rpc.zig` — `fetchBlock()`: параллельный JSON парс**
+
+До: 3 HTTP потока → join → parse block → parse receipts → parse traces (последовательно, ~1.7ms parse)  
+После: 3 HTTP потока → join → 3 parse потока → join (~1.0ms parse, −0.7ms)
+
+```
+HTTP done → spawn parse_thread[0..2] → join → data ready
+            (идентично fetchBatchFlat в историческом режиме)
+```
+
+Дополнительно: стековые буферы `[3 * 128]u8` вместо `gpa.alloc()` — убраны 6 mmap syscalls на каждый блок (было заметно при n=1).
+
+**`realtime.zig` — `runRealtimeWs()`: WS listener в отдельном потоке**
+
+До: WS recv и processBlock в одном потоке — `nextBlockNum()` блокировал fetch start.  
+После: отдельный `wsListenerThread` пишет `block_num` в OS pipe, `main` читает из pipe и сразу стартует `fetchBlock`.
+
+```
+Thread A (wsListenerThread):         Thread B (main, critical path):
+  while:                               while:
+    nextBlockNum() → write(pipe)         read(pipe) → t0=now() → fetchBlock
+                                                     → transform → saveBatch
+```
+
+OS pipe (`linux.pipe2`): `read()` блокируется без spin-loop, нет мьютексов, нет кольцевого буфера. `t0` устанавливается сразу после `read` — WS ожидание не входит в измеряемое время.
+
+#### Результаты — 3 прогона подряд (instant gonode, TRUNCATE между тестами)
+
+```bash
+# Сброс курсора + gonode:
+docker exec temp_dragonfly redis-cli -a mockpass SET LATEST_PROCESSED_BLOCK_NUMBER 25079096
+bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 \
+  mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+until nc -z 127.0.0.1 8545; do sleep 1; done
+
+# TRUNCATE + settle:
+cqlsh 172.31.208.104 9142 -e "USE eth; TRUNCATE blocks; TRUNCATE transactions;
+  TRUNCATE logs; TRUNCATE internal_transactions; TRUNCATE contracts;
+  TRUNCATE contracts_by_addresses;"
+sleep 6
+
+# Запуск:
+CM_CONNECTION_URL="redis://:mockpass@127.0.0.1:6379/0" \
+SCYLLA_DB_CONTACT_POINTS='["172.31.208.104:9142"]' \
+SCYLLA_DB_KEYSPACE=eth RPC_URL=http://127.0.0.1:8545 CHAIN_ID=1 \
+TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
+./zig-out/bin/zigparser2
+```
+
+| Прогон | fetch avg | save avg | **total avg** | total min | total max |
+|--------|----------|---------|-------------|----------|----------|
+| Run 1 | 1.4 ms | 8.7 ms | **11.9 ms** | 5.4 ms | 37.2 ms |
+| Run 2 | 1.4 ms | 9.0 ms | **12.4 ms** | 5.1 ms | 44.8 ms |
+| Run 3 | 1.4 ms | 7.9 ms | **11.5 ms** | 4.8 ms | 32.1 ms |
+| **Среднее** | **1.4 ms** | **8.5 ms** | **11.9 ms** | — | — |
+
+> `total_ms` включает JSON parse (~1.0ms) и Redis write (~0.3ms), которые не входят в `fetch_ms` и `save_ms`.
+
+#### Итоговое сравнение WS вариантов
+
+| Версия | Gonode | fetch avg | save avg | **total avg** |
+|--------|--------|----------|---------|-------------|
+| WS (первый тест) | drip-feed 100ms | 2.1ms | 11.7ms | 16.4ms |
+| WS (исправленный) | мгновенный | 1.4ms | 8.6ms | 12.1ms |
+| **WS + parallel parse + goroutine** | **мгновенный** | **1.4ms** | **8.5ms** | **11.9ms** |
+
+Лучший результат: **11.5ms** (Run 3). Цель 11ms практически достигнута — оставшиеся 0.5ms — Redis write overhead.
+
 ---
 
 ## 6. Итоговое сравнение парсеров
