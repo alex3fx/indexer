@@ -491,13 +491,25 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 | **zigparser2 PIPELINE=2** | **REMAP=16, BATCH=16** | **5.58 ms** | **5.0×** |
 | zigparser2 PIPELINE=4 | REMAP=16, BATCH=16 | 6.18 ms | 4.5× |
 
-### Realtime (1 блок за раз, 100 блоков)
+### Realtime (1 блок за раз, 100 блоков, instant gonode)
 
-| Парсер | Per-block latency | Wall-clock throughput |
-|--------|-----------------|----------------------|
-| TS1 (BATCH_SIZE=1, 1 worker) | 138.7 ms | 25.5 ms/block |
-| **zigparser2** (REALTIME=1) | **11.8 ms** | **11.8 ms/block** |
-| **Speedup** | **11.7×** | **2.2×** |
+| Парсер | Режим | fetch avg | save avg | **Per-block latency** | vs TS1 |
+|--------|-------|----------|---------|----------------------|--------|
+| TS1 | BATCH_SIZE=1, 1 worker | 6.4 ms | 127.8 ms | **138.7 ms** | 1.0× |
+| zigparser2 | polling POLL_MS=500 | 1.4 ms | 8.5 ms | **11.8 ms** | 11.7× |
+| zigparser2 | WS (исправленный) | 1.4 ms | 8.6 ms | **12.1 ms** | 11.5× |
+| **zigparser2** | **WS + parallel parse + goroutine** | **1.4 ms** | **8.5 ms** | **11.9 ms avg / 11.5 ms best** | **11.7×** |
+
+> WS и polling дают одинаковую latency на localhost. Преимущество WS — на реальной ноде:  
+> polling POLL_MS=100 → +50ms среднего ожидания; WS — мгновенное уведомление.
+
+**Realtime при 10 блоков/сек (drip-feed 100ms, 3 прогона):**
+
+| Режим | fetch avg | save avg | **total avg** |
+|-------|----------|---------|-------------|
+| WS | 2.1 ms | 11.6 ms | **16.3 ms** |
+
+Scylla "остывает" за 88ms простоя между блоками → save растёт с 8.5ms до 11.6ms.
 
 **Ключевое отличие CQL path:**
 - TS1: `cassandra-driver.execute()` → 28 sequential `Promise.allSettled` × 100 строк
