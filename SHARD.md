@@ -738,3 +738,46 @@ REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws REMAP_MOD=16 TO_BLOCK=25079196 \
 **Вывод:** WS не даёт деградации относительно polling (12.1ms vs 11.8ms — в пределах погрешности).  
 Разница 0.3ms — это overhead одного WS frame read вместо HTTP null-ответа.  
 Предыдущая «деградация» 16ms была артефактом drip-feed (Scylla простаивала между блоками).
+
+---
+
+## Часть 14: WS realtime — 10 блоков/сек (BLOCK_INTERVAL_MS=100)
+
+**Дата:** 2026-05-22  
+**Условия:** 100 блоков (25079097–25079196), REMAP_MOD=16, smp=16 tmpfs.  
+**Gonode:** BLOCK_INTERVAL_MS=100 — новый блок каждые 100ms через WS push.  
+**Zigparser2:** REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws.
+
+### Результаты
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| Fetch (WS wakeup + 3×HTTP) | 2.4 ms | 1.0 ms | 14.9 ms |
+| Transform | ~0.3 ms | — | — |
+| Save (UNLOGGED BATCH) | 11.8 ms | 4.6 ms | 44.5 ms |
+| **TOTAL (WS push → DB)** | **16.8 ms** | 6.6 ms | 51.1 ms |
+
+### Итоговое сравнение всех realtime режимов
+
+| Режим | Gonode | fetch avg | save avg | **total avg** | Объяснение |
+|-------|--------|----------|---------|-------------|-----------|
+| Polling POLL_MS=500 | мгновенный | 1.4ms | 8.5ms | **11.8ms** | Scylla горячая, нет ожидания |
+| Polling POLL_MS=250 | мгновенный | 1.4ms | 8.5ms | **11.8ms** | то же |
+| Polling POLL_MS=50 | drip-feed 50ms | 2.2ms | 11.6ms | 16.5ms | Scylla чуть остывает |
+| WS | мгновенный | 1.4ms | 8.6ms | **12.1ms** | ≈ polling, +0.3ms overhead |
+| WS | drip-feed 100ms | 2.1ms | 11.7ms | 16.4ms | 89ms idle → Scylla остывает |
+| **WS 10 блок/сек** | **drip-feed 100ms** | **2.4ms** | **11.8ms** | **16.8ms** | реалистичная продукция |
+
+### Вывод
+
+При **10 блоков/сек** (реалистичный темп для BSC/fast chains):
+- Latency WS push → DB write: **16.8ms avg** (~17ms)
+- Scylla save 11.8ms — доминирующий компонент
+- 88ms из 100ms парсер простаивает (ждёт следующего блока)
+
+На реальной ноде с RTT 10–50ms: total ≈ RTT + 2ms(transform) + 11ms(save) = **~25–65ms**.
+
+WS vs polling при 10 блок/сек (POLL_MS=100):  
+- Polling POLL_MS=100: среднее ожидание +50ms → total avg ≈ **67ms** (11.8 + 50 + overhead)  
+- WebSocket: **16.8ms** (нет ожидания — уведомление мгновенное)  
+- **WS выгоднее в ≈4× при production темпе блоков**
