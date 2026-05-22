@@ -796,3 +796,53 @@ WS vs polling при 10 блок/сек (POLL_MS=100):
 **Fetch стабилен: 2.1ms во всех трёх прогонах.**  
 **Save вариация 11.0–12.2ms** — зависит от состояния Scylla memtable после TRUNCATE.  
 **Total avg 15.6–16.8ms** — воспроизводимо в пределах ±1.2ms.
+
+---
+
+## Часть 15: loader2 — realtime single-block write benchmark
+
+**Дата:** 2026-05-22  
+**Программа:** `gotest/loader2/` — Go, нативный CQL TCP  
+**Данные:** dump_100_b1.bin — 100 блоков × 1 блок на батч, REMAP_MOD=16  
+**Условия:** BLOCK_INTERVAL_MS=100 (10 блок/сек), smp=16 tmpfs, 1 соединение на таблицу  
+**Метрика:** wall-clock от отправки первого CQL BATCH до получения последнего ответа (6 таблиц параллельно)
+
+### Что делает loader2
+
+1. Загружает dump с 1 блоком на батч в память (~124MB, 3051 rows/block avg)
+2. 6 персистентных CQL соединений (по одному на таблицу)
+3. Каждые 100ms: отправляет 6 UNLOGGED BATCH параллельно (по одному на таблицу)
+4. Измеряет `save_ms` = wall-clock от первой отправки до последнего ответа
+
+### Результаты (100 блоков, interval=100ms)
+
+| Метрика | avg | min | p50 | p95 | p99 | max |
+|---------|-----|-----|-----|-----|-----|-----|
+| **save (все 6 таблиц)** | **24.5ms** | 4.0ms | 18.5ms | 80.9ms | 112.4ms | 112.4ms |
+| itxs (доминирует) | 24.3ms | 3.9ms | 18.3ms | 80.7ms | 112.1ms | 112.1ms |
+| logs | 14.5ms | 2.2ms | 11.1ms | 46.4ms | 89.0ms | 89.0ms |
+| txs | 8.4ms | 1.6ms | 7.2ms | 17.6ms | 55.0ms | 55.0ms |
+| blocks | 2.4ms | 0.2ms | 1.7ms | 7.2ms | 26.1ms | 26.1ms |
+| contracts | 1.9ms | 0.0ms | 1.1ms | 4.8ms | 21.4ms | 21.4ms |
+| cba | 2.5ms | 0.0ms | 1.6ms | 6.3ms | 47.4ms | 47.4ms |
+
+### Анализ
+
+**Bottleneck — internal_transactions** (itxs): avg 24.3ms, max 112ms.  
+1 блок = ~1900 itxs → 19 BATCH фреймов × 100 строк. При 100ms интервале Scylla периодически делает flush (compaction outliers → p99=112ms).
+
+**Median save: 18.5ms** — типичная запись 1 блока. p50 более репрезентативен чем avg из-за outliers.
+
+**Сравнение с zigparser2 realtime (WS):** zigparser2 = 16.3ms avg vs loader2 = 24.5ms avg.  
+Разница: zigparser2 использует PIPELINE=1 с 32 соединениями на таблицу (больше параллелизма), loader2 — 1 соединение.
+
+### Запуск
+
+```bash
+cd gotest/loader2
+# Создать dump (1 блок/батч):
+BATCH_SIZE=1 REMAP_MOD=16 DUMP_FILE=dump_100_b1.bin ... zigparser2
+
+# Запустить тест:
+./loader2 -dump=dump_100_b1.bin -interval=100 -truncate
+```
