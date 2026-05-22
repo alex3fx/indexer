@@ -19,6 +19,8 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -69,7 +71,8 @@ var (
 	flagPass     = flag.String("pass", "cassandra", "Password")
 	flagInterval = flag.Int("interval", 100, "Send interval in ms (default 100 = 10 blocks/sec)")
 	flagBatch    = flag.Int("batch", 100, "Rows per UNLOGGED BATCH frame")
-	flagConns    = flag.Int("conns", 1, "CQL connections per table (pool size)")
+	flagConns    = flag.Int("conns", 0, "Uniform connections per table (0 = use -split)")
+	flagSplit    = flag.String("split", "1,3,6,20,1,1", "Connections per table: blocks,txs,logs,itxs,contracts,cba")
 	flagTrunc    = flag.Bool("truncate", false, "TRUNCATE tables before benchmark")
 )
 
@@ -269,6 +272,24 @@ func (c *CQLConn) query(stmt string) error {
 	return nil
 }
 
+// ─── Split parsing ────────────────────────────────────────────────────────────
+
+func parseSplit(s string) ([TABLE_COUNT]int, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != TABLE_COUNT {
+		return [TABLE_COUNT]int{}, fmt.Errorf("need %d values, got %d", TABLE_COUNT, len(parts))
+	}
+	var r [TABLE_COUNT]int
+	for i, p := range parts {
+		v, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || v < 1 {
+			return [TABLE_COUNT]int{}, fmt.Errorf("split[%d]=%q: must be >= 1", i, p)
+		}
+		r[i] = v
+	}
+	return r, nil
+}
+
 // ─── Dump loading ─────────────────────────────────────────────────────────────
 
 // BlockBatch holds all rows for one block, split by table.
@@ -342,12 +363,32 @@ func loadDump(path string) ([]BlockBatch, error) {
 func main() {
 	flag.Parse()
 
+	// ── Resolve split ────────────────────────────────────────────────────────
+	var split [TABLE_COUNT]int
+	if *flagConns > 0 {
+		for t := range split {
+			split[t] = *flagConns
+		}
+	} else {
+		var err error
+		split, err = parseSplit(*flagSplit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid -split: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	totalConns := 0
+	for _, n := range split {
+		totalConns += n
+	}
+
 	fmt.Printf("loader2: single-block realtime write benchmark\n")
 	fmt.Printf("  dump:     %s\n", *flagDump)
 	fmt.Printf("  host:     %s\n", *flagHost)
 	fmt.Printf("  interval: %dms (%.1f blocks/sec)\n", *flagInterval, 1000.0/float64(*flagInterval))
 	fmt.Printf("  batch:    %d rows/frame\n", *flagBatch)
-	fmt.Printf("  conns:    %d per table (%d total)\n\n", *flagConns, *flagConns*TABLE_COUNT)
+	fmt.Printf("  split:    blocks=%d txs=%d logs=%d itxs=%d conts=%d cba=%d (total=%d)\n\n",
+		split[0], split[1], split[2], split[3], split[4], split[5], totalConns)
 
 	// ── Load dump ────────────────────────────────────────────────────────────
 	fmt.Printf("Loading dump... ")
@@ -366,15 +407,13 @@ func main() {
 		len(batches), totalRows, float64(totalRows)/float64(len(batches)))
 
 	// ── Connect & prepare ────────────────────────────────────────────────────
-	poolSize := *flagConns
 	fmt.Printf("Connecting to %s ...\n", *flagHost)
 	tableNames := [TABLE_COUNT]string{"blocks", "txs", "logs", "itxs", "contracts", "cba"}
-	// pool[t][w] = w-th connection for table t
 	pool := [TABLE_COUNT][]*CQLConn{}
 	prepIDs := [TABLE_COUNT][]byte{}
 	for t := 0; t < TABLE_COUNT; t++ {
-		pool[t] = make([]*CQLConn, poolSize)
-		for w := 0; w < poolSize; w++ {
+		pool[t] = make([]*CQLConn, split[t])
+		for w := 0; w < split[t]; w++ {
 			c, err := newCQLConn(*flagHost, *flagKS, *flagUser, *flagPass)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "connect table=%d w=%d: %v\n", t, w, err)
@@ -390,7 +429,7 @@ func main() {
 				prepIDs[t] = pid
 			}
 		}
-		fmt.Printf("  table=%d (%s) x%d conns ready\n", t, tableNames[t], poolSize)
+		fmt.Printf("  table=%d (%s) x%d conns ready\n", t, tableNames[t], split[t])
 	}
 	defer func() {
 		for t := 0; t < TABLE_COUNT; t++ {
@@ -399,8 +438,7 @@ func main() {
 			}
 		}
 	}()
-	fmt.Printf("Connected (%d connections × 6 tables = %d total).\n\n",
-		poolSize, poolSize*TABLE_COUNT)
+	fmt.Printf("Connected (%d total).\n\n", totalConns)
 
 	// ── Truncate ─────────────────────────────────────────────────────────────
 	if *flagTrunc {
@@ -453,7 +491,7 @@ func main() {
 				}
 				ts := time.Now()
 				// Split rows evenly across pool connections, send in parallel
-				W := poolSize
+				W := split[t]
 				if W > len(rows) {
 					W = len(rows)
 				}
