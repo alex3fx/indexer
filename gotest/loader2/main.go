@@ -69,6 +69,7 @@ var (
 	flagPass     = flag.String("pass", "cassandra", "Password")
 	flagInterval = flag.Int("interval", 100, "Send interval in ms (default 100 = 10 blocks/sec)")
 	flagBatch    = flag.Int("batch", 100, "Rows per UNLOGGED BATCH frame")
+	flagConns    = flag.Int("conns", 1, "CQL connections per table (pool size)")
 	flagTrunc    = flag.Bool("truncate", false, "TRUNCATE tables before benchmark")
 )
 
@@ -345,7 +346,8 @@ func main() {
 	fmt.Printf("  dump:     %s\n", *flagDump)
 	fmt.Printf("  host:     %s\n", *flagHost)
 	fmt.Printf("  interval: %dms (%.1f blocks/sec)\n", *flagInterval, 1000.0/float64(*flagInterval))
-	fmt.Printf("  batch:    %d rows/frame\n\n", *flagBatch)
+	fmt.Printf("  batch:    %d rows/frame\n", *flagBatch)
+	fmt.Printf("  conns:    %d per table (%d total)\n\n", *flagConns, *flagConns*TABLE_COUNT)
 
 	// ── Load dump ────────────────────────────────────────────────────────────
 	fmt.Printf("Loading dump... ")
@@ -364,40 +366,48 @@ func main() {
 		len(batches), totalRows, float64(totalRows)/float64(len(batches)))
 
 	// ── Connect & prepare ────────────────────────────────────────────────────
+	poolSize := *flagConns
 	fmt.Printf("Connecting to %s ...\n", *flagHost)
-	conns := [TABLE_COUNT]*CQLConn{}
-	prepIDs := [TABLE_COUNT][]byte{}
 	tableNames := [TABLE_COUNT]string{"blocks", "txs", "logs", "itxs", "contracts", "cba"}
+	// pool[t][w] = w-th connection for table t
+	pool := [TABLE_COUNT][]*CQLConn{}
+	prepIDs := [TABLE_COUNT][]byte{}
 	for t := 0; t < TABLE_COUNT; t++ {
-		c, err := newCQLConn(*flagHost, *flagKS, *flagUser, *flagPass)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "connect table=%d (%s): %v\n", t, tableNames[t], err)
-			os.Exit(1)
+		pool[t] = make([]*CQLConn, poolSize)
+		for w := 0; w < poolSize; w++ {
+			c, err := newCQLConn(*flagHost, *flagKS, *flagUser, *flagPass)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "connect table=%d w=%d: %v\n", t, w, err)
+				os.Exit(1)
+			}
+			pool[t][w] = c
+			pid, err := c.prepare(insertStmts[t])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "prepare table=%d w=%d: %v\n", t, w, err)
+				os.Exit(1)
+			}
+			if w == 0 {
+				prepIDs[t] = pid
+			}
 		}
-		conns[t] = c
-		pid, err := c.prepare(insertStmts[t])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "prepare table=%d (%s): %v\n", t, tableNames[t], err)
-			os.Exit(1)
-		}
-		prepIDs[t] = pid
-		fmt.Printf("  table=%d (%s) prepared, id_len=%d\n", t, tableNames[t], len(pid))
+		fmt.Printf("  table=%d (%s) x%d conns ready\n", t, tableNames[t], poolSize)
 	}
 	defer func() {
 		for t := 0; t < TABLE_COUNT; t++ {
-			if conns[t] != nil {
-				conns[t].close()
+			for _, c := range pool[t] {
+				c.close()
 			}
 		}
 	}()
-	fmt.Printf("Connected (6 connections, 1 per table).\n\n")
+	fmt.Printf("Connected (%d connections × 6 tables = %d total).\n\n",
+		poolSize, poolSize*TABLE_COUNT)
 
 	// ── Truncate ─────────────────────────────────────────────────────────────
 	if *flagTrunc {
 		fmt.Printf("Truncating tables... ")
 		tables := []string{"blocks", "transactions", "logs", "internal_transactions", "contracts", "contracts_by_addresses"}
 		for i, tbl := range tables {
-			if err := conns[i].query("TRUNCATE eth." + tbl); err != nil {
+			if err := pool[i][0].query("TRUNCATE eth." + tbl); err != nil {
 				fmt.Fprintf(os.Stderr, "truncate %s: %v\n", tbl, err)
 				os.Exit(1)
 			}
@@ -442,16 +452,47 @@ func main() {
 					return
 				}
 				ts := time.Now()
-				// Send in chunks of batchSize
-				for off := 0; off < len(rows); off += batchSize {
-					end := off + batchSize
+				// Split rows evenly across pool connections, send in parallel
+				W := poolSize
+				if W > len(rows) {
+					W = len(rows)
+				}
+				chunkSize := (len(rows) + W - 1) / W
+				var twg sync.WaitGroup
+				var firstErr error
+				var errMu sync.Mutex
+				for w := 0; w < W; w++ {
+					start := w * chunkSize
+					if start >= len(rows) {
+						break
+					}
+					end := start + chunkSize
 					if end > len(rows) {
 						end = len(rows)
 					}
-					if e := conns[t].sendBatch(prepIDs[t], nValues[t], rows[off:end]); e != nil {
-						errs[t] = e
-						return
-					}
+					twg.Add(1)
+					go func(w int, chunk [][]byte) {
+						defer twg.Done()
+						conn := pool[t][w]
+						for off := 0; off < len(chunk); off += batchSize {
+							e := off + batchSize
+							if e > len(chunk) {
+								e = len(chunk)
+							}
+							if err := conn.sendBatch(prepIDs[t], nValues[t], chunk[off:e]); err != nil {
+								errMu.Lock()
+								if firstErr == nil {
+									firstErr = err
+								}
+								errMu.Unlock()
+								return
+							}
+						}
+					}(w, rows[start:end])
+				}
+				twg.Wait()
+				if firstErr != nil {
+					errs[t] = firstErr
 				}
 				tms[t] = float64(time.Since(ts).Microseconds()) / 1000.0
 			}(t)

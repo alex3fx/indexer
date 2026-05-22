@@ -846,3 +846,23 @@ BATCH_SIZE=1 REMAP_MOD=16 DUMP_FILE=dump_100_b1.bin ... zigparser2
 # Запустить тест:
 ./loader2 -dump=dump_100_b1.bin -interval=100 -truncate
 ```
+
+### loader2: sweep пула соединений (conns=1,2,4,8)
+
+| conns/table | save avg | p50 | p95 | p99 | itxs avg |
+|------------|---------|-----|-----|-----|---------|
+| 1 | 21.2ms | 17.8ms | 48.8ms | 69.6ms | 21.0ms |
+| **2** | **17.6ms** | **13.2ms** | 56.6ms | 94.4ms | 17.4ms |
+| **4** | **13.8ms** | **11.1ms** | **33.2ms** | **53.4ms** | **13.6ms** |
+| 8 | 14.6ms | 10.1ms | 50.5ms | 73.8ms | 14.4ms |
+
+**Оптимум: 4 соединения на таблицу** → save avg 13.8ms, p50 11.1ms.
+
+При conns=4: 1900 itxs = 19 BATCH фреймов делятся на 4 параллельных потока по ~5 фреймов. Latency ≈ 1/4 от conns=1 (21ms → 13.8ms ≈ 1.5×, не 4× — из-за накладных расходов Scylla на параллельные writes в один шард).
+
+При conns=8: немного хуже conns=4 — contention на одном шарде при 100ms интервале.
+
+**Итоговый минимум latency 1 блока:**
+- **save avg: 13.8ms** (conns=4)
+- **p50: 11.1ms**
+- **min: 2.4ms** (пустые блоки без contracts/cba)
