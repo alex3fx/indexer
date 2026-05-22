@@ -607,3 +607,51 @@ zigparser2 — нативный `UNLOGGED BATCH`:
 cd /home/alex/lotos/task1/mocknode
 bash scripts/run_ts1_realtime.sh
 ```
+
+---
+
+## Часть 12: Realtime zigparser2 — drip-feed 50ms/block
+
+**Дата:** 2026-05-22  
+**Условия:** 100 блоков (25079097–25079196), REMAP_MOD=16, smp=16 tmpfs.  
+**Gonode:** BLOCK_INTERVAL_MS=50 — новый блок появляется каждые 50ms (таймер с первого запроса).  
+**Zigparser2:** REALTIME=1, POLL_MS=50 — опрос каждые 50ms при ожидании блока.
+
+### Поведение
+
+Видны пары `[JSON breakdown] 0KB` + реальные данные — парсер поймал момент когда блок ещё недоступен (null), поспал 50ms, повторил — получил данные. Drip-feed работает корректно.
+
+### Результаты (100 блоков, poll_ms=50)
+
+| Фаза | avg | min | max |
+|------|-----|-----|-----|
+| Fetch (poll + 3×HTTP) | 2.2 ms | 0.8 ms | 7.8 ms |
+| Transform | ~0.3 ms | — | — |
+| Save (UNLOGGED BATCH) | 11.6 ms | 3.7 ms | 46.5 ms |
+| **TOTAL (poll→DB)** | **16.5 ms** | 5.3 ms | 51.2 ms |
+
+> Fetch avg выше 1.4ms (vs 500ms-poll тест) — из-за 50ms poll retry overhead при ожидании блока.
+
+### Сравнение poll интервалов (все тесты на gonode localhost)
+
+| POLL_MS | Gonode режим | fetch avg | save avg | **total avg** |
+|---------|------------|----------|---------|-------------|
+| 500 ms | мгновенный | 1.4 ms | 8.5 ms | **11.8 ms** |
+| 250 ms | мгновенный | 1.4 ms | 8.5 ms | **11.8 ms** |
+| **50 ms** | **drip-feed 50ms** | **2.2 ms** | **11.6 ms** | **16.5 ms** |
+
+Увеличение total avg с 11.8ms → 16.5ms при drip-feed объясняется:
+- fetch avg +0.8ms: иногда делает один null-poll (50ms sleep) прежде чем блок готов
+- save avg +3ms: небольшая Scylla нагрузка от более длинного теста
+
+### Запуск
+
+```bash
+# 1. Gonode с drip-feed 50ms:
+bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 BLOCK_INTERVAL_MS=50 \
+  mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+
+# 2. Парсер:
+REALTIME=1 POLL_MS=50 REMAP_MOD=16 TO_BLOCK=25079196 \
+  zigtest2/zig-out/bin/zigparser2
+```

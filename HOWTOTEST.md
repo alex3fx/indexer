@@ -304,10 +304,31 @@ bash scripts/run_ts1_realtime.sh
 
 Wall-clock throughput: 25.5 ms/block (save перекрывается через BullMQ)
 
-### 5.3 Realtime: сравнение
+### 5.3 Realtime: zigparser2 с drip-feed gonode (BLOCK_INTERVAL_MS=50)
 
-| Метрика | TS1 (BATCH_SIZE=1) | zigparser2 | Разница |
-|---------|-------------------|------------|---------|
+Для честного теста gonode выдаёт блоки по одному каждые 50ms (`BLOCK_INTERVAL_MS=50`, таймер с первого запроса). Парсер с `POLL_MS=50` опрашивает ноду каждые 50ms пока блок не готов.
+
+```bash
+# Gonode с drip-feed:
+bash -c 'MOCK_DATA_FILE=packtest/data/blocks_fresh_100.json CHAIN_ID=1 BLOCK_INTERVAL_MS=50 \
+  mocknode/gonode/gonode > /tmp/gonode.log 2>&1 &'
+
+# Zigparser2:
+REALTIME=1 POLL_MS=50 REMAP_MOD=16 TO_BLOCK=25079196 ./zig-out/bin/zigparser2
+```
+
+| POLL_MS | Gonode режим | fetch avg | save avg | **total avg** |
+|---------|------------|----------|---------|-------------|
+| 500 ms | все блоки готовы | 1.4 ms | 8.5 ms | 11.8 ms |
+| 250 ms | все блоки готовы | 1.4 ms | 8.5 ms | 11.8 ms |
+| **50 ms** | **drip-feed 50ms/block** | **2.2 ms** | **11.6 ms** | **16.5 ms** |
+
+При drip-feed: парсер видит null (блок ещё не готов), спит 50ms, повторяет — поэтому fetch avg 2.2ms вместо 1.4ms. Save avg 11.6ms (чуть выше обычного — Scylla под нагрузкой более длинного теста).
+
+### 5.4 Realtime: сравнение TS1 vs zigparser2
+
+| Метрика | TS1 (BATCH_SIZE=1) | zigparser2 (poll=500) | Разница |
+|---------|-------------------|----------------------|---------|
 | Fetch avg | 6.4 ms | 1.4 ms | 4.6× |
 | Transform avg | 4.2 ms | 0.3 ms | 14× |
 | Queue overhead | 6.7 ms (BullMQ) | 0 ms | — |
