@@ -498,17 +498,17 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 
 | Парсер | Конфигурация | ms/block | vs TS1 |
 |--------|-------------|---------|--------|
-| TS1 | 5 workers, BullMQ, cassandra-driver | **54.75 ms** | 1.0× |
-| **zigparser2 PIPELINE=2** | **REMAP=32, pool=32** | **11.82 ms** | **4.6×** |
+| TS1 | 5 workers, BullMQ, cassandra-driver | **55.50 ms** | 1.0× |
+| **zigparser2 PIPELINE=2** | **REMAP=32, pool=32, BATCH_SIZE=50** | **12.47 ms** | **4.5×** |
 
-**Детализация zigparser2 (сервер):**
+**Детализация zigparser2 (сервер, 2026-05-25, после BATCH_SIZE=50 fix):**
 
 | Фаза | avg/block |
 |------|-----------|
-| FBDR (fetch+parse, 3×HTTP параллельно) | 80.7 ms |
-| TPT (fetch+transform) | 12.8 ms |
-| Save (UNLOGGED BATCH, 6 таблиц параллельно) | 10.8 ms |
-| **Total wall-clock** | **11.82 ms/block** |
+| FBDR (fetch+parse, 3×HTTP параллельно) | 90.3 ms |
+| TPT (fetch+transform) | 13.9 ms |
+| Save (UNLOGGED BATCH, 6 таблиц параллельно) | 11.4 ms |
+| **Total wall-clock** | **12.47 ms/block** |
 
 **Детализация TS1 (сервер):**
 
@@ -517,16 +517,19 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 | FBDR | 64.1 ms |
 | Transform | 100.0 ms |
 | BullMQ addJob | 93.8 ms |
-| TPT total | 2048 ms / 20.3 ms/block |
+| TPT total | 2108 ms / 20.9 ms/block |
 | Save total (5 workers async) | ~3400 ms |
-| **Total wall-clock** | **54.75 ms/block** |
+| **Total wall-clock** | **55.50 ms/block** |
 
 **Почему сервер медленнее localhost по абсолютным числам:**
-- gonode читает из файла на диске (не tmpfs) → FBDR 80ms vs 34ms
+- gonode читает из файла на диске (не tmpfs) → FBDR 90ms vs 34ms
 - Scylla в Docker vs native → дополнительный overhead на save
-- Оба парсера страдают одинаково → relative speedup сохраняется (4.6×)
+- Оба парсера страдают одинаково → relative speedup сохраняется (4.5×)
 
-**Итог: zigparser2 стабильно быстрее TS1 в 4.6–5.0× на любом стенде.**
+> **BATCH_SIZE 100 → 50**: +0.65 ms/block (+5.5%) из-за вдвое большего числа CQL round-trips.  
+> Изменение обязательно: BATCH_SIZE=100 вызывал `Batch too large` на блоках с большими `log.data`.
+
+**Итог: zigparser2 стабильно быстрее TS1 в 4.5–5.0× на любом стенде.**
 
 ### 6.3 Realtime — localhost (WSL2, instant gonode)
 

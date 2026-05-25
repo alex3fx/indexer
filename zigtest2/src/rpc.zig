@@ -245,14 +245,11 @@ fn httpPostZC(
     }
 
     // Allocate result buffer: from arena (zero-copy) or gpa (regular).
+    // No fallback: if arena is provided but full, fail fast — avoids from_arena mismatch.
     const result = if (result_arena) |la|
-        la.alloc(content_length) orelse try gpa.alloc(u8, content_length)
+        (la.alloc(content_length) orelse return error.OutOfMemory)
     else
         try gpa.alloc(u8, content_length);
-    // Note: if allocated from arena, caller must NOT free result — arena owns it.
-    // If allocated from gpa (fallback), caller must free.
-    // We tag the result via `out.from_arena` so the caller knows.
-    // (Simpler: if result_arena != null, always succeeded via arena.)
 
     const tail_len = hdr_len - body_start_in_hdr;
     const copy_len = @min(tail_len, content_length);
@@ -871,8 +868,7 @@ pub fn fetchBlock(
     var outs:       [3]RawOut                   = .{ .{}, .{}, .{} };
     var args:       [3]FlatFetchArg             = undefined;
     var threads:    [3]std.Thread               = undefined;
-    var bodies:     [3][]u8                     = .{ &.{}, &.{}, &.{} };
-    var body_ok:    [3]bool                     = .{ false, false, false };
+    var bodies: [3][]u8 = .{ &.{}, &.{}, &.{} };
 
     const t_start = nowNs(); // timer before any work (no allocations precede this)
 
@@ -888,7 +884,6 @@ pub fn fetchBlock(
     bodies[2] = std.fmt.bufPrint(body_pool[2 * BODY_SLOT ..][0..BODY_SLOT],
         \\{{"jsonrpc":"2.0","id":1,"method":"trace_block","params":["{s}"]}}
     , .{hex_num}) catch return 0;
-    body_ok[0] = true; body_ok[1] = true; body_ok[2] = true;
 
     var locked: [3]LockedArena = .{
         .{ .arena = &method_arenas[0] },
@@ -962,91 +957,3 @@ pub fn fetchBlock(
     return fbdr_ms;
 }
 
-// ─── Deep copy helpers (all allocations go into dc_alloc — caller uses ArenaAllocator) ───
-
-fn deepCopyBlock(dc: std.mem.Allocator, src: RpcBlock) !RpcBlock {
-    var txs = try std.ArrayList(RpcTransaction).initCapacity(dc, src.transactions.len);
-    for (src.transactions) |tx| {
-        try txs.append(dc, try deepCopyTx(dc, tx));
-    }
-    return RpcBlock{
-        .number = try dc.dupe(u8, src.number),
-        .timestamp = try dc.dupe(u8, src.timestamp),
-        .milliTimestamp = if (src.milliTimestamp) |m| try dc.dupe(u8, m) else null,
-        .miner = try dc.dupe(u8, src.miner),
-        .transactions = try txs.toOwnedSlice(dc),
-    };
-}
-
-fn deepCopyTx(dc: std.mem.Allocator, src: RpcTransaction) !RpcTransaction {
-    return RpcTransaction{
-        .hash = try dc.dupe(u8, src.hash),
-        .transactionIndex = try dc.dupe(u8, src.transactionIndex),
-        .from = try dc.dupe(u8, src.from),
-        .to = if (src.to) |t| try dc.dupe(u8, t) else null,
-        .value = try dc.dupe(u8, src.value),
-        .gas = try dc.dupe(u8, src.gas),
-        .gasPrice = try dc.dupe(u8, src.gasPrice),
-        .input = try dc.dupe(u8, src.input),
-        .@"type" = try dc.dupe(u8, src.@"type"),
-        .maxPriorityFeePerGas = if (src.maxPriorityFeePerGas) |v| try dc.dupe(u8, v) else null,
-        .maxFeePerGas = if (src.maxFeePerGas) |v| try dc.dupe(u8, v) else null,
-    };
-}
-
-fn deepCopyReceipts(dc: std.mem.Allocator, src: []RpcReceipt) ![]RpcReceipt {
-    const dst = try dc.alloc(RpcReceipt, src.len);
-    for (src, dst) |s, *d| {
-        d.* = try deepCopyReceipt(dc, s);
-    }
-    return dst;
-}
-
-fn deepCopyReceipt(dc: std.mem.Allocator, src: RpcReceipt) !RpcReceipt {
-    const logs = try dc.alloc(RpcLog, src.logs.len);
-    for (src.logs, logs) |sl, *dl| {
-        const topics = try dc.alloc([]const u8, sl.topics.len);
-        for (sl.topics, topics) |st, *dt| dt.* = try dc.dupe(u8, st);
-        dl.* = RpcLog{
-            .address = try dc.dupe(u8, sl.address),
-            .topics = topics,
-            .data = try dc.dupe(u8, sl.data),
-            .transactionHash = try dc.dupe(u8, sl.transactionHash),
-            .transactionIndex = try dc.dupe(u8, sl.transactionIndex),
-            .logIndex = try dc.dupe(u8, sl.logIndex),
-            .removed = sl.removed,
-        };
-    }
-    return RpcReceipt{
-        .transactionHash = try dc.dupe(u8, src.transactionHash),
-        .transactionIndex = try dc.dupe(u8, src.transactionIndex),
-        .gasUsed = try dc.dupe(u8, src.gasUsed),
-        .cumulativeGasUsed = try dc.dupe(u8, src.cumulativeGasUsed),
-        .effectiveGasPrice = if (src.effectiveGasPrice) |v| try dc.dupe(u8, v) else null,
-        .contractAddress = if (src.contractAddress) |v| try dc.dupe(u8, v) else null,
-        .status = try dc.dupe(u8, src.status),
-        .logs = logs,
-    };
-}
-
-fn deepCopyTraces(dc: std.mem.Allocator, src: []RpcTrace) ![]RpcTrace {
-    const dst = try dc.alloc(RpcTrace, src.len);
-    for (src, dst) |s, *d| {
-        d.* = RpcTrace{
-            .transactionHash = if (s.transactionHash) |v| try dc.dupe(u8, v) else null,
-            .action = RpcAction{
-                .from = try dc.dupe(u8, s.action.from),
-                .to = if (s.action.to) |v| try dc.dupe(u8, v) else null,
-                .value = if (s.action.value) |v| try dc.dupe(u8, v) else null,
-                .init = if (s.action.init) |v| try dc.dupe(u8, v) else null,
-                .input = if (s.action.input) |v| try dc.dupe(u8, v) else null,
-                .creationMethod = if (s.action.creationMethod) |v| try dc.dupe(u8, v) else null,
-            },
-            .result = if (s.result) |r| RpcResult{
-                .address = if (r.address) |v| try dc.dupe(u8, v) else null,
-                .code = if (r.code) |v| try dc.dupe(u8, v) else null,
-            } else null,
-        };
-    }
-    return dst;
-}

@@ -34,7 +34,6 @@ pub const BatchState = struct {
     save_ms:       f64 = 0,
     save_error:    ?anyerror = null,
     cql_pool:      *db.CqlPool,
-    prep_ids:      *db.PreparedIds,
     gpa:           std.mem.Allocator,
     dump_file:     ?std.Io.File = null,
     dump_io:       std.Io = undefined,
@@ -60,8 +59,6 @@ pub fn doSave(state: *BatchState) void {
     } else {
         db.saveBatch(.{
             .pool      = state.cql_pool,
-            .gpa       = state.gpa,
-            .prep_ids  = state.prep_ids,
             .ent       = &state.ent,
             .result_ms = &state.save_ms,
         }) catch |err| {
@@ -151,8 +148,8 @@ pub fn finishPrev(
     batches.items[p.metric_idx].save_ms  = ps.save_ms;
     batches.items[p.metric_idx].total_ms = ps.tpt_ms + ps.save_ms;
     if (ps.ent.last_block > 0) {
-        const s = try std.fmt.allocPrint(gpa, "{d}", .{ps.ent.last_block});
-        defer gpa.free(s);
+        var buf: [20]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{ps.ent.last_block}) catch unreachable;
         try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
     }
     const batch_blocks = ps.batch_end - ps.batch_start + 1;
@@ -177,7 +174,6 @@ pub fn runHistorical(
     gpa:          std.mem.Allocator,
     cfg:          *const Config,
     pools:        []db.CqlPool,
-    prep_ids:     []db.PreparedIds,
     dump_file_opt: ?std.Io.File,
     redis:        *db.RedisConn,
     from:         u64,
@@ -206,7 +202,7 @@ pub fn runHistorical(
 
         // Launch P fetch+transform workers in parallel
         for (0..P) |p| {
-            if (i > cfg.to_block) break;
+            if (i > to) break;
             const batch_start = i;
             const batch_end   = @min(i + cfg.batch_size - 1, to);
             const batch_count = batch_end - batch_start + 1;
@@ -229,7 +225,6 @@ pub fn runHistorical(
                 .batch_end     = batch_end,
                 .fbdr_ms = 0, .transform_ms = 0, .tpt_ms = 0, .save_ms = 0,
                 .cql_pool  = &pools[p],
-                .prep_ids  = &prep_ids[p],
                 .gpa       = gpa,
                 .dump_file = dump_file_opt,
                 .dump_io   = io,
@@ -248,7 +243,7 @@ pub fn runHistorical(
         // Join previous round's saves (overlap: ran while we were fetching)
         for (prev_saves) |*slot| {
             if (slot.*) |*ps| {
-                try finishPrev(ps, gpa, redis, &metrics.batches, cfg.to_block, &blocks_done);
+                try finishPrev(ps, gpa, redis, &metrics.batches, to, &blocks_done);
                 slot.* = null;
             }
         }
@@ -292,7 +287,7 @@ pub fn runHistorical(
     // Final join
     for (prev_saves) |*slot| {
         if (slot.*) |*ps| {
-            try finishPrev(ps, gpa, redis, &metrics.batches, cfg.to_block, &blocks_done);
+            try finishPrev(ps, gpa, redis, &metrics.batches, to, &blocks_done);
             slot.* = null;
         }
     }

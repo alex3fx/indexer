@@ -77,7 +77,6 @@ pub fn processBlock(
     gpa:       std.mem.Allocator,
     cfg:       *const Config,
     pool:      *db.CqlPool,
-    prep_ids:  *db.PreparedIds,
     block_num: u64,
     method_arenas: *[3]std.heap.ArenaAllocator,
     block_arena:   *std.heap.ArenaAllocator,
@@ -110,8 +109,6 @@ pub fn processBlock(
     var save_ms: f64 = 0;
     try db.saveBatch(.{
         .pool      = pool,
-        .gpa       = gpa,
-        .prep_ids  = prep_ids,
         .ent       = &ent,
         .result_ms = &save_ms,
     });
@@ -134,7 +131,6 @@ fn processWsBlock(
     gpa:          std.mem.Allocator,
     cfg:          *const Config,
     pool:         *db.CqlPool,
-    prep_ids:     *db.PreparedIds,
     block_num:    u64,
     method_arenas: *[3]std.heap.ArenaAllocator,
     block_arena:  *std.heap.ArenaAllocator,
@@ -142,10 +138,10 @@ fn processWsBlock(
     cursor:       *u64,
     redis:        *db.RedisConn,
 ) !void {
-    const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num, method_arenas, block_arena);
+    const br = try processBlock(io, gpa, cfg, pool, block_num, method_arenas, block_arena);
     const r = br orelse blk: {
         sleepMs(5);
-        const br2 = try processBlock(io, gpa, cfg, pool, prep_ids, block_num, method_arenas, block_arena);
+        const br2 = try processBlock(io, gpa, cfg, pool, block_num, method_arenas, block_arena);
         if (br2 == null) {
             std.debug.print("\u{26a0} [{d}] block not available after retry — skipping\n", .{block_num});
             return;
@@ -154,8 +150,8 @@ fn processWsBlock(
     };
     stats.update(r);
     cursor.* = block_num;
-    const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
-    defer gpa.free(s);
+    var buf: [20]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{block_num}) catch unreachable;
     try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
 }
 
@@ -165,7 +161,6 @@ pub fn runRealtime(
     gpa:      std.mem.Allocator,
     cfg:      *const Config,
     pool:     *db.CqlPool,
-    prep_ids: *db.PreparedIds,
     redis:    *db.RedisConn,
 ) !void {
     std.debug.print("Realtime mode: poll_ms={d}  chunk=block%{d}  to={d}\n\n",
@@ -193,7 +188,7 @@ pub fn runRealtime(
     var stats = RtStats{};
 
     while (block_num <= cfg.to_block) {
-        const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
+        const br = try processBlock(io, gpa, cfg, pool, block_num,
                                     &method_arenas, &block_arena);
         if (br == null) {
             sleepMs(cfg.poll_ms);
@@ -201,8 +196,8 @@ pub fn runRealtime(
         }
         stats.update(br.?);
 
-        const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
-        defer gpa.free(s);
+        var cursor_buf: [20]u8 = undefined;
+        const s = std.fmt.bufPrint(&cursor_buf, "{d}", .{block_num}) catch unreachable;
         try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
         block_num += 1;
     }
@@ -281,7 +276,6 @@ pub fn runRealtimeWs(
     gpa:      std.mem.Allocator,
     cfg:      *const Config,
     pool:     *db.CqlPool,
-    prep_ids: *db.PreparedIds,
     redis:    *db.RedisConn,
 ) !void {
     const parsed = parseWsUrl(cfg.ws_url);
@@ -323,7 +317,7 @@ pub fn runRealtimeWs(
     while (ch.recv()) |block_num| {
         if (block_num <= cursor) continue;
         if (block_num > cfg.to_block) break;
-        try processWsBlock(io, gpa, cfg, pool, prep_ids, block_num,
+        try processWsBlock(io, gpa, cfg, pool, block_num,
                            &method_arenas, &block_arena, &stats, &cursor, redis);
         if (cursor >= cfg.to_block) break;
     }
@@ -339,7 +333,6 @@ pub fn runCatchupAndRealtime(
     gpa:      std.mem.Allocator,
     cfg:      *const Config,
     pools:    []db.CqlPool,
-    prep_ids: []db.PreparedIds,
     redis:    *db.RedisConn,
     from:     u64,
     metrics:  *Metrics,
@@ -369,7 +362,7 @@ pub fn runCatchupAndRealtime(
     // Sync history from `from` to ws_first-1. WS listener buffers new blocks during this.
     if (from < ws_first) {
         std.debug.print("Syncing history {d}\u{2192}{d}...\n\n", .{ from, ws_first - 1 });
-        try pipe.runHistorical(io, gpa, cfg, pools, prep_ids, null, redis, from, ws_first - 1, metrics);
+        try pipe.runHistorical(io, gpa, cfg, pools, null, redis, from, ws_first - 1, metrics);
         metrics.print();
     }
 
@@ -390,14 +383,14 @@ pub fn runCatchupAndRealtime(
     var stats = RtStats{};
 
     if (ws_first > cursor and ws_first <= cfg.to_block) {
-        try processWsBlock(io, gpa, cfg, &pools[0], &prep_ids[0], ws_first,
+        try processWsBlock(io, gpa, cfg, &pools[0], ws_first,
                            &method_arenas, &block_arena, &stats, &cursor, redis);
     }
 
     while (ch.recv()) |block_num| {
         if (block_num <= cursor) continue;
         if (block_num > cfg.to_block) break;
-        try processWsBlock(io, gpa, cfg, &pools[0], &prep_ids[0], block_num,
+        try processWsBlock(io, gpa, cfg, &pools[0], block_num,
                            &method_arenas, &block_arena, &stats, &cursor, redis);
         if (cursor >= cfg.to_block) break;
     }

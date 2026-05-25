@@ -1228,3 +1228,46 @@ H1 полезна только при:
 - Multi-partition workload (разные chunk для разных блоков)
 - Proper per-request routing (1 connection per target shard, route each request)
 - Текущий тест: chunk=25079 (1 шард), все соединения на этот шард = перегрузка реактора
+
+---
+
+## Часть 22: После code review — BATCH_SIZE=50, сервер bench
+
+**Дата:** 2026-05-25  
+**Изменения:** code review + рефакторинг. Ключевое изменение производительности: `BATCH_SIZE: usize = 100` → `BATCH_SIZE: usize = 50` в db.zig (fix: "Batch too large" на блоках с большими `log.data`).
+
+### Сравнение до/после на реальном сервере (100 блоков, 25079097–25079196)
+
+| Конфигурация | ms/block | vs TS1 |
+|-------------|---------|--------|
+| До (BATCH_SIZE=100) | 11.82 ms | 4.6× |
+| **После (BATCH_SIZE=50)** | **12.47 ms** | **4.5×** |
+| TS1 | 55.50 ms | 1.0× |
+
+**Регрессия:** +0.65 ms/block (+5.5%) — вдвое больше CQL round-trips.  
+Исправление обязательно: BATCH_SIZE=100 вызывал `[CQL ERROR] code=0x2200 Batch too large` на продакшн-блоках.
+
+### Полный вывод bench_server.sh
+
+```
+════ [1/2] zigparser2 PIPELINE=2 REMAP_MOD=32 ════
+Historical: blocks 25079097 → 25079196  pipeline=2
+...
+Total run time: 854 ms
+
+📊 Zig2 Parser Results (100 blocks, 10 batches)
+  FBDR avg/block  : 90.3 ms
+  FBDR max        : 128.1 ms
+  TPT avg/block   : 13.9 ms
+  Save total      : 1141 ms
+
+zigparser2: 1247ms total  |  12.47ms/block
+
+════ [2/2] TS1 historical (5 workers) ════
+  TPT avg/block:         20.9 ms
+TS1: 5550ms total  |  55.50ms/block
+
+  Speedup: zigparser2 is 4.5x faster than TS1
+```
+
+**Итог:** code review не деградировал производительность значимо. Speedup 4.5× сохранён.

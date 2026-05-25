@@ -219,11 +219,12 @@ const CQL_OPCODE_RESULT: u8 = 0x08;
 const CQL_OPCODE_ERROR: u8 = 0x00;
 const CQL_CONSISTENCY_ONE: u16  = 0x0001;
 const CQL_OPCODE_BATCH:    u8   = 0x0D;
-const BATCH_SIZE: usize = 100; // rows per UNLOGGED BATCH frame
+const BATCH_SIZE: usize = 50; // rows per UNLOGGED BATCH frame
 
 pub const CqlConn = struct {
     fd: i32,
     gpa: std.mem.Allocator,
+    prep_ids: PreparedIds = undefined,
 
     pub fn init(
         io: std.Io,
@@ -248,7 +249,7 @@ pub const CqlConn = struct {
         pass: []const u8,
     ) !CqlConn {
         var self = CqlConn{ .fd = fd, .gpa = gpa };
-        errdefer _ = linux.close(fd);
+        errdefer _ = linux.close(self.fd);
 
         try self.sendStartup();
         {
@@ -273,10 +274,17 @@ pub const CqlConn = struct {
             if (r.opcode == CQL_OPCODE_ERROR) return error.CqlUseKeyspaceFailed;
         }
 
+        self.prep_ids = try prepareAll(&self);
         return self;
     }
 
     pub fn deinit(self: *CqlConn) void {
+        self.gpa.free(self.prep_ids.blocks);
+        self.gpa.free(self.prep_ids.transactions);
+        self.gpa.free(self.prep_ids.logs);
+        self.gpa.free(self.prep_ids.internal_txs);
+        self.gpa.free(self.prep_ids.contracts);
+        self.gpa.free(self.prep_ids.contracts_by_addr);
         _ = linux.close(self.fd);
     }
 
@@ -711,6 +719,7 @@ pub const CqlPool = struct {
     ) !CqlPool {
         const conns = try gpa.alloc(*CqlConn, POOL_SIZE);
         var pool = CqlPool{ .conns = conns, .gpa = gpa };
+        errdefer pool.deinit();
 
         if (cfg.shard_aware) {
             // Connect all pool connections to the target shard via port 19042.
@@ -770,7 +779,7 @@ const INSERT_INT_TXS = "INSERT INTO internal_transactions (chunk,block_number,bl
 const INSERT_CONTRACTS = "INSERT INTO contracts (chunk,block_number,transaction_index,transaction_hash,trace_index,block_timestamp_s,block_timestamp_ms,address,creation_method,creator_address,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_CONTRACTS_BY_ADDR = "INSERT INTO contracts_by_addresses (address,creator,tx_hash,block_number,timestamp,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?)";
 
-pub fn prepareAll(conn: *CqlConn) !PreparedIds {
+fn prepareAll(conn: *CqlConn) !PreparedIds {
     return .{
         .blocks           = try conn.prepare(INSERT_BLOCKS),
         .transactions     = try conn.prepare(INSERT_TXS),
@@ -815,7 +824,7 @@ fn workerBuf(comptime est: usize) std.ArrayList(u8) {
 // Read and discard one CQL response frame — zero heap allocation.
 fn recvFrameCheck(fd: i32) !void {
     var header: [9]u8 = undefined;
-    tcpReadExact(fd, &header) catch return;
+    try tcpReadExact(fd, &header);
     const opcode   = header[4];
     const body_len = std.mem.readInt(u32, header[5..9], .big);
     if (body_len == 0) {
@@ -825,7 +834,7 @@ fn recvFrameCheck(fd: i32) !void {
 
     var buf: [512]u8 = undefined;
     const read_len = @min(body_len, buf.len);
-    tcpReadExact(fd, buf[0..read_len]) catch {};
+    try tcpReadExact(fd, buf[0..read_len]);
 
     if (opcode == 0x00) {
         const code    = if (read_len >= 4) std.mem.readInt(i32, buf[0..4], .big) else -1;
@@ -838,7 +847,7 @@ fn recvFrameCheck(fd: i32) !void {
     var remaining: usize = body_len -| read_len;
     while (remaining > 0) {
         const n = @min(remaining, discard.len);
-        tcpReadExact(fd, discard[0..n]) catch return;
+        try tcpReadExact(fd, discard[0..n]);
         remaining -= n;
     }
 
@@ -847,12 +856,12 @@ fn recvFrameCheck(fd: i32) !void {
 
 // ─── Typed worker args ────────────────────────────────────────────────────────
 
-const BlocksWA  = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.BlockRow,           had_error: *bool };
-const TxsWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.TxRow,             had_error: *bool };
-const LogsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.LogRow,            had_error: *bool };
-const ITxsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.InternalTxRow,     had_error: *bool };
-const ContWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractRow,       had_error: *bool };
-const CBAWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractByAddrRow, had_error: *bool };
+const BlocksWA  = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.BlockRow,           had_error: *std.atomic.Value(bool), dropped: *std.atomic.Value(u32) };
+const TxsWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.TxRow,             had_error: *std.atomic.Value(bool), dropped: *std.atomic.Value(u32) };
+const LogsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.LogRow,            had_error: *std.atomic.Value(bool), dropped: *std.atomic.Value(u32) };
+const ITxsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.InternalTxRow,     had_error: *std.atomic.Value(bool), dropped: *std.atomic.Value(u32) };
+const ContWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractRow,       had_error: *std.atomic.Value(bool), dropped: *std.atomic.Value(u32) };
+const CBAWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractByAddrRow, had_error: *std.atomic.Value(bool), dropped: *std.atomic.Value(u32) };
 
 // ─── Typed worker functions — UNLOGGED BATCH mode ─────────────────────────────
 // Each worker collects up to BATCH_SIZE rows into bd[], sends as one BATCH frame.
@@ -880,7 +889,7 @@ fn blocksWorker(wa: BlocksWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 5, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
+        wa.conn.batchSendRows(wa.prep_id, 5, ptrs[0..enc]) catch { wa.had_error.store(true, .monotonic); return; };
         i = end;
     }
 }
@@ -923,7 +932,7 @@ fn txsWorker(wa: TxsWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 21, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
+        wa.conn.batchSendRows(wa.prep_id, 21, ptrs[0..enc]) catch { wa.had_error.store(true, .monotonic); return; };
         i = end;
     }
 }
@@ -960,7 +969,7 @@ fn logsWorker(wa: LogsWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 15, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
+        wa.conn.batchSendRows(wa.prep_id, 15, ptrs[0..enc]) catch { wa.had_error.store(true, .monotonic); return; };
         i = end;
     }
 }
@@ -992,7 +1001,7 @@ fn itxsWorker(wa: ITxsWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 10, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
+        wa.conn.batchSendRows(wa.prep_id, 10, ptrs[0..enc]) catch { wa.had_error.store(true, .monotonic); return; };
         i = end;
     }
 }
@@ -1027,7 +1036,7 @@ fn contWorker(wa: ContWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 13, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
+        wa.conn.batchSendRows(wa.prep_id, 13, ptrs[0..enc]) catch { wa.had_error.store(true, .monotonic); return; };
         i = end;
     }
 }
@@ -1057,7 +1066,7 @@ fn cbaWorker(wa: CBAWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 8, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
+        wa.conn.batchSendRows(wa.prep_id, 8, ptrs[0..enc]) catch { wa.had_error.store(true, .monotonic); return; };
         i = end;
     }
 }
@@ -1065,15 +1074,17 @@ fn cbaWorker(wa: CBAWA) void {
 // ─── Spawn helper ─────────────────────────────────────────────────────────────
 
 // Split rows across connections, spawn one worker thread per connection.
+// Each connection uses its own prepared statement ID from conn.prep_ids.<prep_field>.
 fn spawnTable(
     comptime WA: type,
     comptime workerFn: fn(WA) void,
+    comptime prep_field: []const u8,
     conns: []*CqlConn,
-    prep_id: []const u8,
     rows: anytype,
     threads: []std.Thread,
     spawned: *usize,
-    had_error: *bool,
+    had_error: *std.atomic.Value(bool),
+    dropped: *std.atomic.Value(u32),
 ) void {
     if (rows.len == 0 or conns.len == 0) return;
     const n = @min(conns.len, rows.len);
@@ -1081,7 +1092,13 @@ fn spawnTable(
     for (0..n) |w| {
         const s = w * per;
         const e = if (w == n - 1) rows.len else s + per;
-        const wa = WA{ .conn = conns[w], .prep_id = prep_id, .rows = rows[s..e], .had_error = had_error };
+        const wa = WA{
+            .conn      = conns[w],
+            .prep_id   = @field(conns[w].prep_ids, prep_field),
+            .rows      = rows[s..e],
+            .had_error = had_error,
+            .dropped   = dropped,
+        };
         if (std.Thread.spawn(.{}, workerFn, .{wa})) |t| {
             threads[spawned.*] = t;
             spawned.* += 1;
@@ -1095,8 +1112,6 @@ fn spawnTable(
 
 pub const SaveArgs = struct {
     pool: *CqlPool,
-    gpa: std.mem.Allocator,
-    prep_ids: *PreparedIds,
     ent: *transform.Entities,
     result_ms: *f64,
 };
@@ -1104,25 +1119,30 @@ pub const SaveArgs = struct {
 pub fn saveBatch(args: SaveArgs) !void {
     const t0 = nowNs();
     const c  = args.pool.conns;
-    const p  = args.prep_ids;
     const e  = args.ent;
 
-    var had_error: bool = false;
+    var had_error: std.atomic.Value(bool) = .init(false);
+    var dropped:   std.atomic.Value(u32)  = .init(0);
     var threads: [6 * POOL_SIZE]std.Thread = undefined;
     var spawned: usize = 0;
 
-    spawnTable(BlocksWA, blocksWorker, c[SPLIT_OFF[0]..SPLIT_OFF[1]], p.blocks,            e.blocks.items,            &threads, &spawned, &had_error);
-    spawnTable(TxsWA,    txsWorker,    c[SPLIT_OFF[1]..SPLIT_OFF[2]], p.transactions,      e.txs.items,               &threads, &spawned, &had_error);
-    spawnTable(LogsWA,   logsWorker,   c[SPLIT_OFF[2]..SPLIT_OFF[3]], p.logs,              e.logs.items,              &threads, &spawned, &had_error);
-    spawnTable(ITxsWA,   itxsWorker,   c[SPLIT_OFF[3]..SPLIT_OFF[4]], p.internal_txs,      e.internal_txs.items,      &threads, &spawned, &had_error);
-    spawnTable(ContWA,   contWorker,   c[SPLIT_OFF[4]..SPLIT_OFF[5]], p.contracts,         e.contracts.items,         &threads, &spawned, &had_error);
-    spawnTable(CBAWA,    cbaWorker,    c[SPLIT_OFF[5]..SPLIT_OFF[6]], p.contracts_by_addr, e.contracts_by_addr.items, &threads, &spawned, &had_error);
+    spawnTable(BlocksWA, blocksWorker, "blocks",            c[SPLIT_OFF[0]..SPLIT_OFF[1]], e.blocks.items,            &threads, &spawned, &had_error, &dropped);
+    spawnTable(TxsWA,    txsWorker,    "transactions",      c[SPLIT_OFF[1]..SPLIT_OFF[2]], e.txs.items,               &threads, &spawned, &had_error, &dropped);
+    spawnTable(LogsWA,   logsWorker,   "logs",              c[SPLIT_OFF[2]..SPLIT_OFF[3]], e.logs.items,              &threads, &spawned, &had_error, &dropped);
+    spawnTable(ITxsWA,   itxsWorker,   "internal_txs",      c[SPLIT_OFF[3]..SPLIT_OFF[4]], e.internal_txs.items,      &threads, &spawned, &had_error, &dropped);
+    spawnTable(ContWA,   contWorker,   "contracts",         c[SPLIT_OFF[4]..SPLIT_OFF[5]], e.contracts.items,         &threads, &spawned, &had_error, &dropped);
+    spawnTable(CBAWA,    cbaWorker,    "contracts_by_addr", c[SPLIT_OFF[5]..SPLIT_OFF[6]], e.contracts_by_addr.items, &threads, &spawned, &had_error, &dropped);
 
     for (threads[0..spawned]) |t| t.join();
 
     args.result_ms.* = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
 
-    if (had_error) return error.SaveFailed;
+    if (had_error.load(.monotonic)) return error.SaveFailed;
+    const n_dropped = dropped.load(.monotonic);
+    if (n_dropped > 0) {
+        std.debug.print("[ERROR] {d} rows dropped due to encoding errors\n", .{n_dropped});
+        return error.RowEncodingFailed;
+    }
 }
 
 // ─── Dump mode: write encoded CQL rows to a binary file ──────────────────────
@@ -1303,10 +1323,10 @@ pub const RedisConn = struct {
     fn sendCmd(self: *RedisConn, parts: []const []const u8) !void {
         var cmd: std.ArrayList(u8) = .empty;
         defer cmd.deinit(self.gpa);
-
-        try cmd.appendSlice(self.gpa, try std.fmt.allocPrint(self.gpa, "*{d}\r\n", .{parts.len}));
+        var buf: [32]u8 = undefined;
+        try cmd.appendSlice(self.gpa, try std.fmt.bufPrint(&buf, "*{d}\r\n", .{parts.len}));
         for (parts) |p| {
-            try cmd.appendSlice(self.gpa, try std.fmt.allocPrint(self.gpa, "${d}\r\n", .{p.len}));
+            try cmd.appendSlice(self.gpa, try std.fmt.bufPrint(&buf, "${d}\r\n", .{p.len}));
             try cmd.appendSlice(self.gpa, p);
             try cmd.appendSlice(self.gpa, "\r\n");
         }

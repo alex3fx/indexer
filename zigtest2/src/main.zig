@@ -55,28 +55,21 @@ pub fn main(init: std.process.Init) !void {
     const P = cfg.pipeline;
     const dump_mode = cfg.dump_file.len > 0;
     var dump_file_opt: ?std.Io.File = null;
-    const pools    = try gpa.alloc(db.CqlPool, P);
-    const prep_ids = try gpa.alloc(db.PreparedIds, P);
+    const pools = try gpa.alloc(db.CqlPool, P);
     defer gpa.free(pools);
-    defer gpa.free(prep_ids);
 
     if (dump_mode) {
         std.debug.print("DUMP MODE: writing to {s}\n", .{cfg.dump_file});
         dump_file_opt = try db.dumpOpen(io, cfg.dump_file);
-        for (0..P) |p| {
-            pools[p]    = .{};
-            prep_ids[p] = .{ .blocks=&.{}, .transactions=&.{}, .logs=&.{},
-                              .internal_txs=&.{}, .contracts=&.{}, .contracts_by_addr=&.{} };
-        }
+        for (0..P) |p| pools[p] = .{};
     } else {
         std.debug.print("ScyllaDB: {s}:{d}  pool={d}  workers={d}  split={}+{}+{}+{}+{}+{}\n",
             .{ cfg.scylla_host, cfg.scylla_port, db.POOL_SIZE, P,
                db.SPLIT[0], db.SPLIT[1], db.SPLIT[2], db.SPLIT[3], db.SPLIT[4], db.SPLIT[5] });
         std.debug.print("Connecting ({d} pool(s))...\n", .{P});
         for (0..P) |p| {
-            pools[p]    = try db.CqlPool.init(io, gpa, cfg.scylla_host, cfg.scylla_port,
-                              cfg.scylla_keyspace, cfg.scylla_user, cfg.scylla_pass);
-            prep_ids[p] = try db.prepareAll(pools[p].conns[0]);
+            pools[p] = try db.CqlPool.init(io, gpa, cfg.scylla_host, cfg.scylla_port,
+                           cfg.scylla_keyspace, cfg.scylla_user, cfg.scylla_pass);
         }
     }
     defer if (!dump_mode) { for (0..P) |p| pools[p].deinit(); };
@@ -85,21 +78,21 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.ws_url.len > 0 and !dump_mode) {
         var metrics: Metrics = .{};
         defer metrics.deinit(gpa);
-        try rt.runCatchupAndRealtime(io, gpa, &cfg, pools, prep_ids, &redis, from, &metrics);
+        try rt.runCatchupAndRealtime(io, gpa, &cfg, pools, &redis, from, &metrics);
         metrics.saveJson(gpa, io, cfg.results_dir);
         return;
     }
 
     // ── Pure realtime mode (REALTIME=1, no WS) ───────────────────────────────
     if (cfg.realtime and !dump_mode) {
-        return rt.runRealtime(io, gpa, &cfg, &pools[0], &prep_ids[0], &redis);
+        return rt.runRealtime(io, gpa, &cfg, &pools[0], &redis);
     }
 
     // ── Historical batch mode ─────────────────────────────────────────────────
     var metrics: Metrics = .{};
     defer metrics.deinit(gpa);
 
-    try pipe.runHistorical(io, gpa, &cfg, pools, prep_ids, dump_file_opt, &redis, from, cfg.to_block, &metrics);
+    try pipe.runHistorical(io, gpa, &cfg, pools, dump_file_opt, &redis, from, cfg.to_block, &metrics);
 
     metrics.print();
     metrics.saveJson(gpa, io, cfg.results_dir);

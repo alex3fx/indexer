@@ -31,6 +31,16 @@ pub const BatchMetric = struct {
     contracts:    usize,
 };
 
+const Agg = struct {
+    fbdr_avg:   f64,
+    fbdr_max:   f64,
+    http_avg:   f64,
+    tpt_total:  f64,
+    tpt_avg:    f64,
+    save_total: f64,
+    total_rows: usize,
+};
+
 pub const Metrics = struct {
     blocks:  std.ArrayList(BlockMetric) = .empty,
     batches: std.ArrayList(BatchMetric) = .empty,
@@ -40,14 +50,13 @@ pub const Metrics = struct {
         self.batches.deinit(gpa);
     }
 
-    pub fn print(self: *Metrics) void {
+    fn aggregate(self: *const Metrics) Agg {
         var fbdr_sum: f64 = 0;
         var fbdr_max: f64 = 0;
         var http_sum: f64 = 0;
         var tpt_total: f64 = 0;
         var save_total: f64 = 0;
         var total_rows: usize = 0;
-
         for (self.blocks.items) |b| {
             fbdr_sum += b.fbdr_ms;
             if (b.fbdr_ms > fbdr_max) fbdr_max = b.fbdr_ms;
@@ -59,19 +68,28 @@ pub const Metrics = struct {
             total_rows += b.txs + b.logs + b.internal_txs + b.contracts + b.blocks;
         }
         const n = @as(f64, @floatFromInt(self.blocks.items.len));
-        const fbdr_avg = if (n > 0) fbdr_sum / n else 0;
-        const http_avg = if (n > 0) http_sum / n else 0;
-        const tpt_avg  = if (n > 0) tpt_total / n else 0;
+        return .{
+            .fbdr_avg   = if (n > 0) fbdr_sum / n else 0,
+            .fbdr_max   = fbdr_max,
+            .http_avg   = if (n > 0) http_sum / n else 0,
+            .tpt_total  = tpt_total,
+            .tpt_avg    = if (n > 0) tpt_total / n else 0,
+            .save_total = save_total,
+            .total_rows = total_rows,
+        };
+    }
 
+    pub fn print(self: *Metrics) void {
+        const a = self.aggregate();
         std.debug.print("\n📊 Zig2 Parser Results ({d} blocks, {d} batches)\n",
             .{ self.blocks.items.len, self.batches.items.len });
-        std.debug.print("  FBDR avg/block  : {d:.1} ms\n", .{fbdr_avg});
-        std.debug.print("  FBDR max        : {d:.1} ms\n", .{fbdr_max});
-        std.debug.print("  HTTP avg/req    : {d:.1} ms\n", .{http_avg});
-        std.debug.print("  TPT total       : {d:.0} ms\n", .{tpt_total});
-        std.debug.print("  TPT avg/block   : {d:.1} ms\n", .{tpt_avg});
-        std.debug.print("  Save total      : {d:.0} ms\n", .{save_total});
-        std.debug.print("  Total rows      : {d}\n",       .{total_rows});
+        std.debug.print("  FBDR avg/block  : {d:.1} ms\n", .{a.fbdr_avg});
+        std.debug.print("  FBDR max        : {d:.1} ms\n", .{a.fbdr_max});
+        std.debug.print("  HTTP avg/req    : {d:.1} ms\n", .{a.http_avg});
+        std.debug.print("  TPT total       : {d:.0} ms\n", .{a.tpt_total});
+        std.debug.print("  TPT avg/block   : {d:.1} ms\n", .{a.tpt_avg});
+        std.debug.print("  Save total      : {d:.0} ms\n", .{a.save_total});
+        std.debug.print("  Total rows      : {d}\n",       .{a.total_rows});
     }
 
     pub fn saveJson(self: *Metrics, gpa: std.mem.Allocator, io: std.Io, results_dir: []const u8) void {
@@ -81,21 +99,7 @@ pub const Metrics = struct {
     }
 
     fn writeJsonFile(self: *Metrics, gpa: std.mem.Allocator, io: std.Io, results_dir: []const u8) !void {
-        var fbdr_sum: f64 = 0; var fbdr_max: f64 = 0; var http_sum: f64 = 0;
-        var tpt_total: f64 = 0; var save_total: f64 = 0; var total_rows: usize = 0;
-        for (self.blocks.items) |b| {
-            fbdr_sum += b.fbdr_ms;
-            if (b.fbdr_ms > fbdr_max) fbdr_max = b.fbdr_ms;
-            http_sum += (b.http_block_ms + b.http_rcpt_ms + b.http_trc_ms) / 3.0;
-        }
-        for (self.batches.items) |b| {
-            tpt_total += b.tpt_ms; save_total += b.save_ms;
-            total_rows += b.txs + b.logs + b.internal_txs + b.contracts + b.blocks;
-        }
-        const n = @as(f64, @floatFromInt(self.blocks.items.len));
-        const fbdr_avg = if (n > 0) fbdr_sum / n else 0;
-        const http_avg = if (n > 0) http_sum / n else 0;
-        const tpt_avg  = if (n > 0) tpt_total / n else 0;
+        const a = self.aggregate();
 
         const ts_ms = @divTrunc(nowNs(), 1_000_000);
         var aw = std.Io.Writer.Allocating.init(gpa);
@@ -110,7 +114,7 @@ pub const Metrics = struct {
             \\"save_total_ms":{d:.0},"total_rows":{d}
             \\}}}}
         , .{ ts_ms, ts_ms, self.blocks.items.len, self.batches.items.len,
-             fbdr_avg, fbdr_max, http_avg, tpt_total, tpt_avg, save_total, total_rows });
+             a.fbdr_avg, a.fbdr_max, a.http_avg, a.tpt_total, a.tpt_avg, a.save_total, a.total_rows });
 
         const json_data = aw.written();
         const filename = try std.fmt.allocPrint(gpa, "zigtest2_{d}.json", .{ts_ms});

@@ -105,10 +105,10 @@ pub fn parseConfig(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ
     }
 
     var scylla_user: []const u8 = "cassandra";
-    var scylla_pass_: []const u8 = "cassandra";
+    var scylla_password: []const u8 = "cassandra";
     const creds_str = getEnv(env, "SCYLLA_DB_CREDENTIALS", "{\"username\":\"cassandra\",\"password\":\"cassandra\"}");
     if (extractJsonStr(gpa, creds_str, "username")) |u| scylla_user = u;
-    if (extractJsonStr(gpa, creds_str, "password")) |p| scylla_pass_ = p;
+    if (extractJsonStr(gpa, creds_str, "password")) |p| scylla_password = p;
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_len = std.process.executablePath(io, &exe_buf) catch 0;
@@ -139,7 +139,7 @@ pub fn parseConfig(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ
         .scylla_port    = scylla_port,
         .scylla_keyspace = getEnv(env, "SCYLLA_DB_KEYSPACE", "eth"),
         .scylla_user    = scylla_user,
-        .scylla_pass    = scylla_pass_,
+        .scylla_pass    = scylla_password,
         .results_dir    = results_dir,
         .dump_file      = getEnv(env, "DUMP_FILE", ""),
         .fetch_mode     = fetch_mode,
