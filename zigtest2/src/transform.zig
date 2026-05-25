@@ -289,7 +289,7 @@ pub fn transformBlock(
         const from_addr = li(trace.action.from);
         const to_addr   = liOpt(trace.action.to);
 
-        if (from_addr.len > 0 and to_addr.len > 0 and trace.action.value != null) {
+        if (from_addr.len > 0 and trace.action.value != null) {
             try ent.internal_txs.append(arena, .{
                 .chunk             = chunk,
                 .block_number      = number,

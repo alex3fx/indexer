@@ -84,6 +84,30 @@ pub fn fetchWorker(args: *FetchArgs) void {
         rpc.fetchBatchFlat(args.io, args.gpa, &s.method_arenas, cfg.rpc_url, s.block_nums, s.block_results)
     else
         cfg.fetch_fn(args.io, args.gpa, s.batch_arena.allocator(), cfg.rpc_url, s.block_nums, s.block_results);
+
+    // Retry failed blocks via reserve RPC if available.
+    if (cfg.reserve_rpc_url.len > 0) {
+        var retry_buf: [64]u64 = undefined;
+        var retry_idx: [64]usize = undefined;
+        var retry_count: usize = 0;
+        for (s.block_results, 0..) |bd, i| {
+            if (bd.err and retry_count < retry_buf.len) {
+                retry_buf[retry_count] = s.block_nums[i];
+                retry_idx[retry_count] = i;
+                retry_count += 1;
+            }
+        }
+        if (retry_count > 0) {
+            const retry_results = args.gpa.alloc(rpc.BlockData, retry_count) catch unreachable;
+            defer args.gpa.free(retry_results);
+            _ = rpc.fetchBlockBatch(args.io, args.gpa, s.batch_arena.allocator(),
+                cfg.reserve_rpc_url, retry_buf[0..retry_count], retry_results);
+            for (retry_results, retry_idx[0..retry_count]) |rb, idx| {
+                s.block_results[idx] = rb;
+            }
+        }
+    }
+
     const t1 = nowNs();
     s.ent = transform.transformBatch(s.batch_arena.allocator(), s.block_results, cfg.chunk_size, cfg.remap_mod) catch return;
     const t2 = nowNs();
@@ -100,10 +124,12 @@ pub const PrevBatch = struct {
 };
 
 pub fn finishPrev(
-    p:       *PrevBatch,
-    gpa:     std.mem.Allocator,
-    redis:   *db.RedisConn,
-    batches: *std.ArrayList(BatchMetric),
+    p:          *PrevBatch,
+    gpa:        std.mem.Allocator,
+    redis:      *db.RedisConn,
+    batches:    *std.ArrayList(BatchMetric),
+    to_block:   u64,
+    blocks_done: *u64,
 ) !void {
     p.thread.join();
     const ps = p.state;
@@ -114,11 +140,14 @@ pub fn finishPrev(
         defer gpa.free(s);
         try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
     }
+    const batch_blocks = ps.batch_end - ps.batch_start + 1;
+    blocks_done.* += batch_blocks;
+    const left = if (to_block >= ps.batch_end) to_block - ps.batch_end else 0;
     const e = &ps.ent;
     std.debug.print(
-        "\u{2705} [{d}\u{2025}{d}] FBDR={d:.0}ms transform={d:.0}ms TPT={d:.0}ms save={d:.0}ms | B:{d} T:{d} L:{d} IT:{d} C:{d}\n",
-        .{ ps.batch_start, ps.batch_end,
-           ps.fbdr_ms, ps.transform_ms, ps.tpt_ms, ps.save_ms,
+        "\u{2705} [{d}\u{2025}{d}] left={d} FBDR={d:.0}ms TPT={d:.0}ms save={d:.0}ms | B:{d} T:{d} L:{d} IT:{d} C:{d}\n",
+        .{ ps.batch_start, ps.batch_end, left,
+           ps.fbdr_ms, ps.tpt_ms, ps.save_ms,
            e.blocks.items.len, e.txs.items.len, e.logs.items.len,
            e.internal_txs.items.len, e.contracts.items.len },
     );
@@ -146,6 +175,7 @@ pub fn runHistorical(
     const t_run_start = nowNs();
     var i: u64 = from;
     var batch_counter: u32 = 0;
+    var blocks_done: u64 = 0;
 
     const prev_saves  = try gpa.alloc(?PrevBatch, P); defer gpa.free(prev_saves);
     const round_states  = try gpa.alloc(?*BatchState, P); defer gpa.free(round_states);
@@ -202,7 +232,7 @@ pub fn runHistorical(
         // Join previous round's saves (overlap: ran while we were fetching)
         for (prev_saves) |*slot| {
             if (slot.*) |*ps| {
-                try finishPrev(ps, gpa, redis, &metrics.batches);
+                try finishPrev(ps, gpa, redis, &metrics.batches, cfg.to_block, &blocks_done);
                 slot.* = null;
             }
         }
@@ -246,7 +276,7 @@ pub fn runHistorical(
     // Final join
     for (prev_saves) |*slot| {
         if (slot.*) |*ps| {
-            try finishPrev(ps, gpa, redis, &metrics.batches);
+            try finishPrev(ps, gpa, redis, &metrics.batches, cfg.to_block, &blocks_done);
             slot.* = null;
         }
     }

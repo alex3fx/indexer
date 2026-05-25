@@ -45,14 +45,10 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.redis_pass.len > 0) try redis.auth(cfg.redis_pass);
     try redis.selectDb(cfg.redis_db);
 
-    var from: u64 = 0;
+    var from: u64 = cfg.from_block;
     if (try redis.get("LATEST_PROCESSED_BLOCK_NUMBER")) |val| {
         defer gpa.free(val);
         from = (std.fmt.parseInt(u64, val, 10) catch 0) + 1;
-    }
-    if (from == 0) {
-        std.debug.print("ERROR: LATEST_PROCESSED_BLOCK_NUMBER not set in Redis\n", .{});
-        return error.NoStartBlock;
     }
 
     // ── CQL pools (PIPELINE=N → N pools, each POOL_SIZE connections) ─────────

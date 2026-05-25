@@ -816,10 +816,25 @@ fn workerBuf(comptime est: usize) std.ArrayList(u8) {
 fn recvFrameDiscard(fd: i32) void {
     var header: [9]u8 = undefined;
     tcpReadExact(fd, &header) catch return;
+    const opcode   = header[4];
     const body_len = std.mem.readInt(u32, header[5..9], .big);
     if (body_len == 0) return;
+
+    // Read body (needed both for error parsing and to drain the socket).
+    var buf: [512]u8 = undefined;
+    const read_len = @min(body_len, buf.len);
+    tcpReadExact(fd, buf[0..read_len]) catch {};
+
+    if (opcode == 0x00 and read_len >= 6) { // ERROR frame
+        const code = std.mem.readInt(i32, buf[0..4], .big);
+        const msg_len = std.mem.readInt(u16, buf[4..6], .big);
+        const msg = buf[6..@min(6 + msg_len, read_len)];
+        std.debug.print("[CQL ERROR] code=0x{x:0>4} msg={s}\n", .{ code, msg });
+    }
+
+    // Drain any remaining body bytes not read into buf.
     var discard: [128]u8 = undefined;
-    var remaining: usize = body_len;
+    var remaining: usize = body_len -| read_len;
     while (remaining > 0) {
         const n = @min(remaining, discard.len);
         tcpReadExact(fd, discard[0..n]) catch return;

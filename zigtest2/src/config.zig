@@ -17,10 +17,12 @@ pub const fetch_mode_names = [3][]const u8{
 
 pub const Config = struct {
     rpc_url:        []const u8,
+    reserve_rpc_url: []const u8, // RESERVE_RPC_URL="" — fallback if primary RPC fails
     ws_url:         []const u8,  // WS_URL=ws://host:port/path — use newHeads instead of polling
     chain_id:       u64,
     chunk_size:     u64,
     remap_mod:      u64,   // 0 = use chunk_size; N = chunk = block_number % N
+    from_block:     u64,   // FROM_BLOCK=0 — start block when Redis key is absent
     to_block:       u64,
     batch_size:     usize,
     pipeline:       usize, // parallel fetch+save workers (1 = classic PrevBatch)
@@ -117,12 +119,14 @@ pub fn parseConfig(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ
     const fetch_mode = std.fmt.parseInt(u8, mode_str, 10) catch 0;
 
     return Config{
-        .rpc_url        = getEnv(env, "RPC_URL", "http://127.0.0.1:8545"),
-        .ws_url         = getEnv(env, "WS_URL", ""),
-        .chain_id       = getEnvInt(u64, env, "CHAIN_ID", 1),
-        .chunk_size     = getEnvInt(u64, env, "RAW_CHUNK_SIZE", 1000),
-        .remap_mod      = getEnvInt(u64, env, "REMAP_MOD", 0),
-        .to_block       = getEnvInt(u64, env, "TO_BLOCK", 25_079_196),
+        .rpc_url         = getEnv(env, "RPC_URL", "http://127.0.0.1:8545"),
+        .reserve_rpc_url = getEnv(env, "RESERVE_RPC_URL", ""),
+        .ws_url          = getEnv(env, "WS_URL", ""),
+        .chain_id        = getEnvInt(u64, env, "CHAIN_ID", 1),
+        .chunk_size      = getEnvInt(u64, env, "RAW_CHUNK_SIZE", 1000),
+        .remap_mod       = getEnvInt(u64, env, "REMAP_MOD", 0),
+        .from_block      = getEnvInt(u64, env, "FROM_BLOCK", 0),
+        .to_block        = getEnvInt(u64, env, "TO_BLOCK", 25_079_196),
         .batch_size     = getEnvInt(usize, env, "BATCH_SIZE", 10),
         .pipeline       = @max(1, getEnvInt(usize, env, "PIPELINE", 1)),
         .realtime       = std.mem.eql(u8, getEnv(env, "REALTIME", "0"), "1"),
