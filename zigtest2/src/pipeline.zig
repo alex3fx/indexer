@@ -32,6 +32,7 @@ pub const BatchState = struct {
     transform_ms:  f64,
     tpt_ms:        f64,
     save_ms:       f64 = 0,
+    save_error:    ?anyerror = null,
     cql_pool:      *db.CqlPool,
     prep_ids:      *db.PreparedIds,
     gpa:           std.mem.Allocator,
@@ -63,7 +64,9 @@ pub fn doSave(state: *BatchState) void {
             .prep_ids  = state.prep_ids,
             .ent       = &state.ent,
             .result_ms = &state.save_ms,
-        });
+        }) catch |err| {
+            state.save_error = err;
+        };
     }
 }
 
@@ -108,6 +111,11 @@ pub fn fetchWorker(args: *FetchArgs) void {
         }
     }
 
+    // Log blocks that are still failed after all retries.
+    for (s.block_results, s.block_nums) |bd, bn| {
+        if (bd.err) std.debug.print("[WARN] block {d} fetch failed — will be skipped\n", .{bn});
+    }
+
     const t1 = nowNs();
     s.ent = transform.transformBatch(s.batch_arena.allocator(), s.block_results, cfg.chunk_size, cfg.remap_mod) catch return;
     const t2 = nowNs();
@@ -133,6 +141,13 @@ pub fn finishPrev(
 ) !void {
     p.thread.join();
     const ps = p.state;
+    if (ps.save_error) |err| {
+        std.debug.print("[FATAL] save failed blocks {d}-{d}: {s}\n",
+            .{ ps.batch_start, ps.batch_end, @errorName(err) });
+        ps.deinit();
+        gpa.destroy(ps);
+        return err;
+    }
     batches.items[p.metric_idx].save_ms  = ps.save_ms;
     batches.items[p.metric_idx].total_ms = ps.tpt_ms + ps.save_ms;
     if (ps.ent.last_block > 0) {
@@ -166,11 +181,12 @@ pub fn runHistorical(
     dump_file_opt: ?std.Io.File,
     redis:        *db.RedisConn,
     from:         u64,
+    to:           u64,
     metrics:      *Metrics,
 ) !void {
     const P = cfg.pipeline;
 
-    std.debug.print("Starting: blocks {d} → {d}  pipeline={d}\n\n", .{ from, cfg.to_block, P });
+    std.debug.print("Historical: blocks {d} → {d}  pipeline={d}\n\n", .{ from, to, P });
 
     const t_run_start = nowNs();
     var i: u64 = from;
@@ -183,7 +199,7 @@ pub fn runHistorical(
     const fetch_args    = try gpa.alloc(?*FetchArgs, P); defer gpa.free(fetch_args);
     @memset(prev_saves, null);
 
-    while (i <= cfg.to_block) {
+    while (i <= to) {
         @memset(round_states, null);
         @memset(fetch_threads, null);
         @memset(fetch_args, null);
@@ -192,7 +208,7 @@ pub fn runHistorical(
         for (0..P) |p| {
             if (i > cfg.to_block) break;
             const batch_start = i;
-            const batch_end   = @min(i + cfg.batch_size - 1, cfg.to_block);
+            const batch_end   = @min(i + cfg.batch_size - 1, to);
             const batch_count = batch_end - batch_start + 1;
 
             const state = try gpa.create(BatchState);

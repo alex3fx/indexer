@@ -81,11 +81,17 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (!dump_mode) { for (0..P) |p| pools[p].deinit(); };
 
-    // ── Realtime mode ─────────────────────────────────────────────────────────
+    // ── Catchup + Realtime mode (WS_URL set) ─────────────────────────────────
+    if (cfg.ws_url.len > 0 and !dump_mode) {
+        var metrics: Metrics = .{};
+        defer metrics.deinit(gpa);
+        try rt.runCatchupAndRealtime(io, gpa, &cfg, pools, prep_ids, &redis, from, &metrics);
+        metrics.saveJson(gpa, io, cfg.results_dir);
+        return;
+    }
+
+    // ── Pure realtime mode (REALTIME=1, no WS) ───────────────────────────────
     if (cfg.realtime and !dump_mode) {
-        if (cfg.ws_url.len > 0) {
-            return rt.runRealtimeWs(io, gpa, &cfg, &pools[0], &prep_ids[0], &redis);
-        }
         return rt.runRealtime(io, gpa, &cfg, &pools[0], &prep_ids[0], &redis);
     }
 
@@ -93,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     var metrics: Metrics = .{};
     defer metrics.deinit(gpa);
 
-    try pipe.runHistorical(io, gpa, &cfg, pools, prep_ids, dump_file_opt, &redis, from, &metrics);
+    try pipe.runHistorical(io, gpa, &cfg, pools, prep_ids, dump_file_opt, &redis, from, cfg.to_block, &metrics);
 
     metrics.print();
     metrics.saveJson(gpa, io, cfg.results_dir);

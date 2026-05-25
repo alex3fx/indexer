@@ -1,15 +1,18 @@
 // Realtime mode: processes blocks one at a time as they arrive.
-// Two sub-modes:
-//   Polling (default): fetchBlock every POLL_MS until block available.
-//   WebSocket (WS_URL set): subscribe to eth_subscribe newHeads, fetch on notification.
-// Minimum latency path: [ws notification →] fetchBlock → transformBlock → saveBatch → Redis.
+// Three sub-modes:
+//   Polling (REALTIME=1): fetchBlock every POLL_MS until block available.
+//   WebSocket (REALTIME=1, WS_URL set): subscribe to newHeads, fetch on notification.
+//   Catchup+Realtime (WS_URL set, default): sync history then transition to WS realtime.
 const std       = @import("std");
 const rpc       = @import("rpc");
 const transform = @import("transform");
 const db        = @import("db");
 const config    = @import("config");
+const met       = @import("metrics");
+const pipe      = @import("pipeline");
 const ws        = @import("ws");
-const Config = config.Config;
+const Config  = config.Config;
+const Metrics = met.Metrics;
 
 fn nowNs() i64 {
     const linux = std.os.linux;
@@ -32,6 +35,39 @@ pub const BlockResult = struct {
     transform_ms: f64,
     save_ms:      f64,
     total_ms:     f64,
+};
+
+const RtStats = struct {
+    n:         u64 = 0,
+    sum_total: f64 = 0,  min_total: f64 = std.math.floatMax(f64),  max_total: f64 = 0,
+    sum_fetch: f64 = 0,  min_fetch: f64 = std.math.floatMax(f64),  max_fetch: f64 = 0,
+    sum_save:  f64 = 0,  min_save:  f64 = std.math.floatMax(f64),  max_save:  f64 = 0,
+
+    fn update(self: *RtStats, r: BlockResult) void {
+        self.n += 1;
+        self.sum_total += r.total_ms;  self.sum_fetch += r.fetch_ms;  self.sum_save += r.save_ms;
+        if (r.total_ms < self.min_total) self.min_total = r.total_ms;
+        if (r.total_ms > self.max_total) self.max_total = r.total_ms;
+        if (r.fetch_ms < self.min_fetch) self.min_fetch = r.fetch_ms;
+        if (r.fetch_ms > self.max_fetch) self.max_fetch = r.fetch_ms;
+        if (r.save_ms  < self.min_save)  self.min_save  = r.save_ms;
+        if (r.save_ms  > self.max_save)  self.max_save  = r.save_ms;
+    }
+
+    fn print(self: *const RtStats, label: []const u8) void {
+        if (self.n == 0) return;
+        const fn_ = @as(f64, @floatFromInt(self.n));
+        std.debug.print(
+            "\n\u{26a1} {s} ({d} blocks)\n" ++
+            "  fetch  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
+            "  save   avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
+            "  TOTAL  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n",
+            .{ label, self.n,
+               self.sum_fetch/fn_, self.min_fetch, self.max_fetch,
+               self.sum_save/fn_,  self.min_save,  self.max_save,
+               self.sum_total/fn_, self.min_total, self.max_total },
+        );
+    }
 };
 
 /// Process a single block end-to-end: fetch → transform → save.
@@ -62,7 +98,7 @@ pub fn processBlock(
     const t0 = nowNs();
     const fetch_ms = rpc.fetchBlock(io, gpa, method_arenas, cfg.rpc_url, block_num, &bd);
 
-    if (bd.block == null) return null; // not yet available
+    if (bd.block == null) return null;
 
     const t1 = nowNs();
     var ent = transform.initEntities();
@@ -72,7 +108,7 @@ pub fn processBlock(
     const transform_ms = @as(f64, @floatFromInt(t2 - t1)) / 1e6;
 
     var save_ms: f64 = 0;
-    db.saveBatch(.{
+    try db.saveBatch(.{
         .pool      = pool,
         .gpa       = gpa,
         .prep_ids  = prep_ids,
@@ -90,6 +126,37 @@ pub fn processBlock(
 
     return .{ .fetch_ms = fetch_ms, .transform_ms = transform_ms,
                .save_ms = save_ms, .total_ms = total_ms };
+}
+
+/// Process a WS-notified block with one retry; update stats and Redis cursor on success.
+fn processWsBlock(
+    io:           std.Io,
+    gpa:          std.mem.Allocator,
+    cfg:          *const Config,
+    pool:         *db.CqlPool,
+    prep_ids:     *db.PreparedIds,
+    block_num:    u64,
+    method_arenas: *[3]std.heap.ArenaAllocator,
+    block_arena:  *std.heap.ArenaAllocator,
+    stats:        *RtStats,
+    cursor:       *u64,
+    redis:        *db.RedisConn,
+) !void {
+    const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num, method_arenas, block_arena);
+    const r = br orelse blk: {
+        sleepMs(5);
+        const br2 = try processBlock(io, gpa, cfg, pool, prep_ids, block_num, method_arenas, block_arena);
+        if (br2 == null) {
+            std.debug.print("\u{26a0} [{d}] block not available after retry — skipping\n", .{block_num});
+            return;
+        }
+        break :blk br2.?;
+    };
+    stats.update(r);
+    cursor.* = block_num;
+    const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
+    defer gpa.free(s);
+    try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
 }
 
 /// Realtime loop: poll for new blocks, process each immediately.
@@ -123,32 +190,16 @@ pub fn runRealtime(
         return error.NoStartBlock;
     }
 
-    // Per-block stats
-    var n: u64 = 0;
-    var sum_total: f64 = 0;  var min_total: f64 = std.math.floatMax(f64);  var max_total: f64 = 0;
-    var sum_fetch: f64 = 0;  var min_fetch: f64 = std.math.floatMax(f64);  var max_fetch: f64 = 0;
-    var sum_save:  f64 = 0;  var min_save:  f64 = std.math.floatMax(f64);  var max_save:  f64 = 0;
+    var stats = RtStats{};
 
     while (block_num <= cfg.to_block) {
         const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
                                     &method_arenas, &block_arena);
-
         if (br == null) {
             sleepMs(cfg.poll_ms);
             continue;
         }
-
-        const r = br.?;
-        sum_total += r.total_ms;
-        sum_fetch += r.fetch_ms;
-        sum_save  += r.save_ms;
-        if (r.total_ms < min_total) min_total = r.total_ms;
-        if (r.total_ms > max_total) max_total = r.total_ms;
-        if (r.fetch_ms < min_fetch) min_fetch = r.fetch_ms;
-        if (r.fetch_ms > max_fetch) max_fetch = r.fetch_ms;
-        if (r.save_ms  < min_save)  min_save  = r.save_ms;
-        if (r.save_ms  > max_save)  max_save  = r.save_ms;
-        n += 1;
+        stats.update(br.?);
 
         const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
         defer gpa.free(s);
@@ -156,24 +207,10 @@ pub fn runRealtime(
         block_num += 1;
     }
 
-    if (n > 0) {
-        const fn_ = @as(f64, @floatFromInt(n));
-        std.debug.print(
-            "\n⚡ Realtime summary ({d} blocks, poll_ms={d})\n" ++
-            "  fetch  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
-            "  save   avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
-            "  TOTAL  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n",
-            .{ n, cfg.poll_ms,
-               sum_fetch/fn_, min_fetch, max_fetch,
-               sum_save/fn_,  min_save,  max_save,
-               sum_total/fn_, min_total, max_total },
-        );
-    }
+    stats.print("Realtime summary");
 }
 
-// ─── WebSocket realtime mode ──────────────────────────────────────────────────
-// Connects to WS_URL, subscribes to newHeads, processes each block immediately.
-// Measures latency from WS event receipt to DB write (no poll overhead).
+// ─── WebSocket support ────────────────────────────────────────────────────────
 
 fn parseWsUrl(url: []const u8) struct { host: []const u8, port: u16, path: []const u8 } {
     var s = url;
@@ -192,14 +229,12 @@ fn parseWsUrl(url: []const u8) struct { host: []const u8, port: u16, path: []con
     return .{ .host = host_port, .port = 8545, .path = path };
 }
 
-// ─── Block channel: WS listener → processor via pipe ─────────────────────────
-// Single-producer / single-consumer: uses OS pipe for blocking recv with zero spin.
-// WS goroutine writes 8-byte block numbers; processor reads (blocks until data).
-// Closing the write end causes read to return 0 bytes → signals done.
-
+// OS pipe for WS listener → processor communication.
+// Listener writes 8-byte block numbers; processor reads (blocks until data).
+// Closing the write end returns 0 bytes on read → signals done.
 const BlockChannel = struct {
-    rd: i32,  // read end
-    wr: i32,  // write end
+    rd: i32,
+    wr: i32,
 
     fn init() !BlockChannel {
         const lnx = std.os.linux;
@@ -214,7 +249,6 @@ const BlockChannel = struct {
         _ = std.os.linux.write(self.wr, @ptrCast(&val), 8);
     }
 
-    // Returns null when write end is closed (done signal).
     fn recv(self: *const BlockChannel) ?u64 {
         var val: u64 = 0;
         const n = std.os.linux.read(self.rd, @ptrCast(&val), 8);
@@ -227,8 +261,8 @@ const BlockChannel = struct {
 };
 
 const WsListenerArg = struct {
-    conn:    *ws.WsConn,
-    ch:      *const BlockChannel,
+    conn:     *ws.WsConn,
+    ch:       *const BlockChannel,
     to_block: u64,
 };
 
@@ -238,9 +272,10 @@ fn wsListenerThread(arg: WsListenerArg) void {
         arg.ch.send(block_num);
         if (block_num >= arg.to_block) break;
     }
-    arg.ch.closeWrite(); // signals EOF to reader
+    arg.ch.closeWrite();
 }
 
+/// Pure WS realtime mode (REALTIME=1 + WS_URL): no historical sync.
 pub fn runRealtimeWs(
     io:       std.Io,
     gpa:      std.mem.Allocator,
@@ -259,13 +294,9 @@ pub fn runRealtimeWs(
 
     var conn = try ws.WsConn.init(gpa, parsed.host, parsed.port, parsed.path);
     defer conn.deinit();
-
     const sub_id = try conn.subscribeNewHeads();
     std.debug.print("Subscribed: {s}  (WS listener in separate thread)\n\n", .{sub_id});
 
-    // WS listener runs in a separate thread — receives block numbers independently.
-    // Uses OS pipe: listener writes 8-byte block_num, processor reads (blocks until ready).
-    // This decouples WS protocol overhead from the fetch→transform→save critical path.
     const ch = try BlockChannel.init();
     defer ch.closeRead();
     const listener_arg = WsListenerArg{ .conn = &conn, .ch = &ch, .to_block = cfg.to_block };
@@ -281,77 +312,95 @@ pub fn runRealtimeWs(
     var block_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer block_arena.deinit();
 
-    var n: u64 = 0;
-    var sum_total: f64 = 0;  var min_total: f64 = std.math.floatMax(f64);  var max_total: f64 = 0;
-    var sum_fetch: f64 = 0;  var min_fetch: f64 = std.math.floatMax(f64);  var max_fetch: f64 = 0;
-    var sum_save:  f64 = 0;  var min_save:  f64 = std.math.floatMax(f64);  var max_save:  f64 = 0;
-
     var cursor: u64 = 0;
     if (try redis.get("LATEST_PROCESSED_BLOCK_NUMBER")) |val| {
         defer gpa.free(val);
         cursor = std.fmt.parseInt(u64, val, 10) catch 0;
     }
 
+    var stats = RtStats{};
+
     while (ch.recv()) |block_num| {
         if (block_num <= cursor) continue;
         if (block_num > cfg.to_block) break;
-
-        // t0 starts HERE — WS notification already received by listener goroutine.
-        // total_ms = pure processing latency: fetch + transform + save.
-        const br = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
-                                    &method_arenas, &block_arena);
-
-        const r = br orelse {
-            sleepMs(5);
-            const br2 = try processBlock(io, gpa, cfg, pool, prep_ids, block_num,
-                                         &method_arenas, &block_arena);
-            if (br2 == null) {
-                std.debug.print("⚠ [{d}] block not available\n", .{block_num});
-                continue;
-            }
-            const r2 = br2.?;
-            sum_total += r2.total_ms; sum_fetch += r2.fetch_ms; sum_save += r2.save_ms; n += 1;
-            if (r2.total_ms < min_total) min_total = r2.total_ms;
-            if (r2.total_ms > max_total) max_total = r2.total_ms;
-            if (r2.fetch_ms < min_fetch) min_fetch = r2.fetch_ms;
-            if (r2.fetch_ms > max_fetch) max_fetch = r2.fetch_ms;
-            if (r2.save_ms  < min_save)  min_save  = r2.save_ms;
-            if (r2.save_ms  > max_save)  max_save  = r2.save_ms;
-            cursor = block_num;
-            const s2 = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
-            defer gpa.free(s2);
-            try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s2);
-            continue;
-        };
-
-        sum_total += r.total_ms; sum_fetch += r.fetch_ms; sum_save += r.save_ms; n += 1;
-        if (r.total_ms < min_total) min_total = r.total_ms;
-        if (r.total_ms > max_total) max_total = r.total_ms;
-        if (r.fetch_ms < min_fetch) min_fetch = r.fetch_ms;
-        if (r.fetch_ms > max_fetch) max_fetch = r.fetch_ms;
-        if (r.save_ms  < min_save)  min_save  = r.save_ms;
-        if (r.save_ms  > max_save)  max_save  = r.save_ms;
-
-        cursor = block_num;
-        const s = try std.fmt.allocPrint(gpa, "{d}", .{block_num});
-        defer gpa.free(s);
-        try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
-
-        if (block_num >= cfg.to_block) break;
+        try processWsBlock(io, gpa, cfg, pool, prep_ids, block_num,
+                           &method_arenas, &block_arena, &stats, &cursor, redis);
+        if (cursor >= cfg.to_block) break;
     }
 
-    if (n > 0) {
-        const fn_ = @as(f64, @floatFromInt(n));
-        std.debug.print(
-            "\n⚡ Realtime WS summary ({d} blocks)\n" ++
-            "  fetch  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
-            "  save   avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n" ++
-            "  TOTAL  avg={d:.1}ms  min={d:.1}ms  max={d:.1}ms\n",
-            .{ n,
-               sum_fetch/fn_, min_fetch, max_fetch,
-               sum_save/fn_,  min_save,  max_save,
-               sum_total/fn_, min_total, max_total },
-        );
-    }
+    stats.print("Realtime WS summary");
 }
 
+/// Catchup+Realtime mode (WS_URL set, default when WS_URL is configured).
+/// Subscribes to WS first to buffer notifications, runs historical batch
+/// up to ws_first-1, then processes buffered + future WS blocks.
+pub fn runCatchupAndRealtime(
+    io:       std.Io,
+    gpa:      std.mem.Allocator,
+    cfg:      *const Config,
+    pools:    []db.CqlPool,
+    prep_ids: []db.PreparedIds,
+    redis:    *db.RedisConn,
+    from:     u64,
+    metrics:  *Metrics,
+) !void {
+    const parsed = parseWsUrl(cfg.ws_url);
+    std.debug.print(
+        "Catchup+Realtime: from={d}  ws://{s}:{d}{s}  to={d}\n\n",
+        .{ from, parsed.host, parsed.port, parsed.path, cfg.to_block },
+    );
+
+    var conn = try ws.WsConn.init(gpa, parsed.host, parsed.port, parsed.path);
+    defer conn.deinit();
+    const sub_id = try conn.subscribeNewHeads();
+    std.debug.print("Subscribed: {s}\n\n", .{sub_id});
+
+    // WS listener buffers block notifications while history syncs.
+    const ch = try BlockChannel.init();
+    defer ch.closeRead();
+    const listener_arg = WsListenerArg{ .conn = &conn, .ch = &ch, .to_block = cfg.to_block };
+    const ws_thread = try std.Thread.spawn(.{}, wsListenerThread, .{listener_arg});
+    defer ws_thread.join();
+
+    // First WS block tells us where history ends.
+    const ws_first = ch.recv() orelse return;
+    std.debug.print("WS first block: {d}\n", .{ws_first});
+
+    // Sync history from `from` to ws_first-1. WS listener buffers new blocks during this.
+    if (from < ws_first) {
+        std.debug.print("Syncing history {d}\u{2192}{d}...\n\n", .{ from, ws_first - 1 });
+        try pipe.runHistorical(io, gpa, cfg, pools, prep_ids, null, redis, from, ws_first - 1, metrics);
+        metrics.print();
+    }
+
+    // Realtime phase: process ws_first (already consumed from channel) + buffered + future blocks.
+    std.debug.print("\nRealtime phase from block {d}\n\n", .{ws_first});
+
+    var method_arenas = [3]std.heap.ArenaAllocator{
+        std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    };
+    defer for (&method_arenas) |*a| a.deinit();
+    var block_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer block_arena.deinit();
+
+    // cursor = last processed block before realtime phase
+    var cursor: u64 = if (from < ws_first) ws_first - 1 else if (from > 0) from - 1 else 0;
+    var stats = RtStats{};
+
+    if (ws_first > cursor and ws_first <= cfg.to_block) {
+        try processWsBlock(io, gpa, cfg, &pools[0], &prep_ids[0], ws_first,
+                           &method_arenas, &block_arena, &stats, &cursor, redis);
+    }
+
+    while (ch.recv()) |block_num| {
+        if (block_num <= cursor) continue;
+        if (block_num > cfg.to_block) break;
+        try processWsBlock(io, gpa, cfg, &pools[0], &prep_ids[0], block_num,
+                           &method_arenas, &block_arena, &stats, &cursor, redis);
+        if (cursor >= cfg.to_block) break;
+    }
+
+    stats.print("Realtime WS summary");
+}

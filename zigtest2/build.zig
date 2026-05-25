@@ -82,6 +82,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transform", .module = transform_mod },
             .{ .name = "db",        .module = db_mod },
             .{ .name = "config",    .module = config_mod },
+            .{ .name = "metrics",   .module = metrics_mod },
+            .{ .name = "pipeline",  .module = pipeline_mod },
             .{ .name = "ws",        .module = ws_mod },
         },
     });

@@ -382,7 +382,7 @@ pub const CqlConn = struct {
         try frame.append(A, 0x00);
 
         try self.sendFrame(CQL_OPCODE_BATCH, frame.items);
-        recvFrameDiscard(self.fd);
+        try recvFrameCheck(self.fd);
     }
 
     // Receive full CQL frame: 9-byte header + body
@@ -813,26 +813,27 @@ fn workerBuf(comptime est: usize) std.ArrayList(u8) {
 }
 
 // Read and discard one CQL response frame — zero heap allocation.
-fn recvFrameDiscard(fd: i32) void {
+fn recvFrameCheck(fd: i32) !void {
     var header: [9]u8 = undefined;
     tcpReadExact(fd, &header) catch return;
     const opcode   = header[4];
     const body_len = std.mem.readInt(u32, header[5..9], .big);
-    if (body_len == 0) return;
+    if (body_len == 0) {
+        if (opcode == 0x00) return error.CqlError;
+        return;
+    }
 
-    // Read body (needed both for error parsing and to drain the socket).
     var buf: [512]u8 = undefined;
     const read_len = @min(body_len, buf.len);
     tcpReadExact(fd, buf[0..read_len]) catch {};
 
-    if (opcode == 0x00 and read_len >= 6) { // ERROR frame
-        const code = std.mem.readInt(i32, buf[0..4], .big);
-        const msg_len = std.mem.readInt(u16, buf[4..6], .big);
-        const msg = buf[6..@min(6 + msg_len, read_len)];
+    if (opcode == 0x00) {
+        const code    = if (read_len >= 4) std.mem.readInt(i32, buf[0..4], .big) else -1;
+        const msg_len = if (read_len >= 6) std.mem.readInt(u16, buf[4..6], .big) else 0;
+        const msg     = buf[6..@min(6 + @as(usize, msg_len), read_len)];
         std.debug.print("[CQL ERROR] code=0x{x:0>4} msg={s}\n", .{ code, msg });
     }
 
-    // Drain any remaining body bytes not read into buf.
     var discard: [128]u8 = undefined;
     var remaining: usize = body_len -| read_len;
     while (remaining > 0) {
@@ -840,16 +841,18 @@ fn recvFrameDiscard(fd: i32) void {
         tcpReadExact(fd, discard[0..n]) catch return;
         remaining -= n;
     }
+
+    if (opcode == 0x00) return error.CqlError;
 }
 
 // ─── Typed worker args ────────────────────────────────────────────────────────
 
-const BlocksWA  = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.BlockRow };
-const TxsWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.TxRow };
-const LogsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.LogRow };
-const ITxsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.InternalTxRow };
-const ContWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractRow };
-const CBAWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractByAddrRow };
+const BlocksWA  = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.BlockRow,           had_error: *bool };
+const TxsWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.TxRow,             had_error: *bool };
+const LogsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.LogRow,            had_error: *bool };
+const ITxsWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.InternalTxRow,     had_error: *bool };
+const ContWA    = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractRow,       had_error: *bool };
+const CBAWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const transform.ContractByAddrRow, had_error: *bool };
 
 // ─── Typed worker functions — UNLOGGED BATCH mode ─────────────────────────────
 // Each worker collects up to BATCH_SIZE rows into bd[], sends as one BATCH frame.
@@ -877,7 +880,7 @@ fn blocksWorker(wa: BlocksWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 5, ptrs[0..enc]) catch {};
+        wa.conn.batchSendRows(wa.prep_id, 5, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
         i = end;
     }
 }
@@ -920,7 +923,7 @@ fn txsWorker(wa: TxsWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 21, ptrs[0..enc]) catch {};
+        wa.conn.batchSendRows(wa.prep_id, 21, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
         i = end;
     }
 }
@@ -957,7 +960,7 @@ fn logsWorker(wa: LogsWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 15, ptrs[0..enc]) catch {};
+        wa.conn.batchSendRows(wa.prep_id, 15, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
         i = end;
     }
 }
@@ -989,7 +992,7 @@ fn itxsWorker(wa: ITxsWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 10, ptrs[0..enc]) catch {};
+        wa.conn.batchSendRows(wa.prep_id, 10, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
         i = end;
     }
 }
@@ -1024,7 +1027,7 @@ fn contWorker(wa: ContWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 13, ptrs[0..enc]) catch {};
+        wa.conn.batchSendRows(wa.prep_id, 13, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
         i = end;
     }
 }
@@ -1054,7 +1057,7 @@ fn cbaWorker(wa: CBAWA) void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        wa.conn.batchSendRows(wa.prep_id, 8, ptrs[0..enc]) catch {};
+        wa.conn.batchSendRows(wa.prep_id, 8, ptrs[0..enc]) catch { wa.had_error.* = true; return; };
         i = end;
     }
 }
@@ -1070,6 +1073,7 @@ fn spawnTable(
     rows: anytype,
     threads: []std.Thread,
     spawned: *usize,
+    had_error: *bool,
 ) void {
     if (rows.len == 0 or conns.len == 0) return;
     const n = @min(conns.len, rows.len);
@@ -1077,7 +1081,7 @@ fn spawnTable(
     for (0..n) |w| {
         const s = w * per;
         const e = if (w == n - 1) rows.len else s + per;
-        const wa = WA{ .conn = conns[w], .prep_id = prep_id, .rows = rows[s..e] };
+        const wa = WA{ .conn = conns[w], .prep_id = prep_id, .rows = rows[s..e], .had_error = had_error };
         if (std.Thread.spawn(.{}, workerFn, .{wa})) |t| {
             threads[spawned.*] = t;
             spawned.* += 1;
@@ -1097,26 +1101,28 @@ pub const SaveArgs = struct {
     result_ms: *f64,
 };
 
-pub fn saveBatch(args: SaveArgs) void {
+pub fn saveBatch(args: SaveArgs) !void {
     const t0 = nowNs();
     const c  = args.pool.conns;
     const p  = args.prep_ids;
     const e  = args.ent;
 
-    // Connection partition driven by SPLIT build option (sum must == POOL_SIZE).
+    var had_error: bool = false;
     var threads: [6 * POOL_SIZE]std.Thread = undefined;
     var spawned: usize = 0;
 
-    spawnTable(BlocksWA, blocksWorker, c[SPLIT_OFF[0]..SPLIT_OFF[1]], p.blocks,            e.blocks.items,            &threads, &spawned);
-    spawnTable(TxsWA,    txsWorker,    c[SPLIT_OFF[1]..SPLIT_OFF[2]], p.transactions,      e.txs.items,               &threads, &spawned);
-    spawnTable(LogsWA,   logsWorker,   c[SPLIT_OFF[2]..SPLIT_OFF[3]], p.logs,              e.logs.items,              &threads, &spawned);
-    spawnTable(ITxsWA,   itxsWorker,   c[SPLIT_OFF[3]..SPLIT_OFF[4]], p.internal_txs,      e.internal_txs.items,      &threads, &spawned);
-    spawnTable(ContWA,   contWorker,   c[SPLIT_OFF[4]..SPLIT_OFF[5]], p.contracts,         e.contracts.items,         &threads, &spawned);
-    spawnTable(CBAWA,    cbaWorker,    c[SPLIT_OFF[5]..SPLIT_OFF[6]], p.contracts_by_addr, e.contracts_by_addr.items, &threads, &spawned);
+    spawnTable(BlocksWA, blocksWorker, c[SPLIT_OFF[0]..SPLIT_OFF[1]], p.blocks,            e.blocks.items,            &threads, &spawned, &had_error);
+    spawnTable(TxsWA,    txsWorker,    c[SPLIT_OFF[1]..SPLIT_OFF[2]], p.transactions,      e.txs.items,               &threads, &spawned, &had_error);
+    spawnTable(LogsWA,   logsWorker,   c[SPLIT_OFF[2]..SPLIT_OFF[3]], p.logs,              e.logs.items,              &threads, &spawned, &had_error);
+    spawnTable(ITxsWA,   itxsWorker,   c[SPLIT_OFF[3]..SPLIT_OFF[4]], p.internal_txs,      e.internal_txs.items,      &threads, &spawned, &had_error);
+    spawnTable(ContWA,   contWorker,   c[SPLIT_OFF[4]..SPLIT_OFF[5]], p.contracts,         e.contracts.items,         &threads, &spawned, &had_error);
+    spawnTable(CBAWA,    cbaWorker,    c[SPLIT_OFF[5]..SPLIT_OFF[6]], p.contracts_by_addr, e.contracts_by_addr.items, &threads, &spawned, &had_error);
 
     for (threads[0..spawned]) |t| t.join();
 
     args.result_ms.* = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
+
+    if (had_error) return error.SaveFailed;
 }
 
 // ─── Dump mode: write encoded CQL rows to a binary file ──────────────────────
