@@ -1161,3 +1161,70 @@ total: 32ms (одиночный блок, реалистичный темп)
 ```
 
 Следующее: тест с равномерным распределением по шардам (remap-mod=32) — ожидаем save < 10ms.
+
+---
+
+## Часть 21: H1 — Shard-aware routing (port 19042)
+
+**Дата:** 2026-05-25  
+**Сервер:** lotos-archive-01, smp=32, memory=128G  
+**Парсер:** zigparser2_shard5, pool=48, split=1,4,8,30,3,2  
+**Режим:** WS realtime, drip-feed `BLOCK_INTERVAL_MS=250`  
+**Гипотеза H1:** все 48 соединений → шард 5 (владелец chunk=25079) через порт 19042 с SO_REUSEADDR + bind(src_port % 32 == 5)
+
+### Реализация
+
+- `tcpConnectBound(host, dst_port=19042, src_port)` — bind перед connect
+- `queryNumShards` — OPTIONS frame → SCYLLA_NR_SHARDS из SUPPORTED
+- `CqlConn.initWithFd` — рефакторинг: отдельный handshake от connect
+- `cfg.shard_aware=true`, `cfg.shard_aware_target_shard=5`
+- Source ports: `40000 + i*32 + 5` для i=0..47 → все порты % 32 == 5
+
+Верификация: `src_port % 32 == shard_id` работает для порта 19042 (проверено через OPTIONS/SCYLLA_SHARD).
+
+Определение целевого шарда: `SELECT token(chunk) FROM eth.internal_transactions WHERE chunk=25079 LIMIT 1` → token=4056395136387274616. Shard = (token + 2^63) >> 12) % 32 = **5**.
+
+### Результаты
+
+| Прогон | fetch avg | save avg | **total avg** | total min | total max |
+|--------|---------|---------|-------------|---------|---------|
+| Baseline (spread, p9042) | 5.3 ms | 20.9 ms | **32.2 ms** | — | — |
+| **H1 (shard=5, p19042)** | **5.3 ms** | **36.1 ms** | **47.9 ms** | 22.2 ms | 92.7 ms |
+
+### Анализ: почему хуже?
+
+**H1 вредит при single-partition workload.** Причина:
+
+```
+Без shard-aware (spread):
+  - 48 conn → 32 шарда (1-2 conn/shard)
+  - I/O load: 32 шарда × 1-2 conn = распределено
+  - Data processing: шард 5 обрабатывает 30 батчей последовательно
+  - Шард 5 делает только: обработку данных
+
+С shard-aware (все → шард 5):
+  - 48 conn → шард 5
+  - I/O load: шард 5 поллит 48 FD одновременно
+  - Data processing: шард 5 обрабатывает 30 батчей последовательно
+  - Шард 5 делает: I/O (48 conn) + обработку данных = перегружен
+```
+
+Когда все 48 соединений на шарде 5, его seastar реактор (single-threaded) обрабатывает:
+- Чтение 30 batch request frames из 30 сокетов
+- Обработку 30 батчей (memtable write, commitlog)
+- Запись 30 response frames в 30 сокетов
+- + 18 idle connections в epoll
+
+В spread-режиме: 32 шарда × ~1.5 conn = I/O распределён. Шард 5 получает форвардированные запросы, обрабатывает данные, возвращает через форвард. Cross-shard forwarding overhead (~50µs/batch) меньше, чем экономия от распределения I/O.
+
+**Контринтуитивный вывод:** для single-partition workload I/O distribution важнее, чем устранение cross-shard forwarding. Традиционный сценарий для shard-aware (multi-partition workload, balanced routing) здесь не применим.
+
+### Вывод
+
+**H1 отклонена** для single-partition workload.  
+save: 20.9ms → 36.1ms (+15ms) — значительно хуже baseline.
+
+H1 полезна только при:
+- Multi-partition workload (разные chunk для разных блоков)
+- Proper per-request routing (1 connection per target shard, route each request)
+- Текущий тест: chunk=25079 (1 шард), все соединения на этот шард = перегрузка реактора
