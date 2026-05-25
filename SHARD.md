@@ -1115,3 +1115,49 @@ ACK отправляется после шага 2 (memtable), **до fsync**. b
 ### Следующий шаг
 
 Реальный bottleneck — single-shard write throughput. Исторически `remap-mod=8` давал **5.4ms** вместо 13–15ms на WSL (3× улучшение). Нужно тестировать равномерное распределение по шардам на сервере (H1: shard-aware routing или remap-mod=32).
+
+---
+
+## Часть 20: Drip-feed тест — реалистичный темп 4 блока/сек
+
+**Дата:** 2026-05-25  
+**Сервер:** lotos-archive-01, 48 ядер, 256 GB RAM  
+**Scylla:** Docker 6.2, smp=32, memory=128G, `developer-mode=1`, реальный диск, `bypass-fsync=1`  
+**Парсер:** zigparser2_p48, pool=48, split=1,4,8,30,3,2  
+**Режим:** WS realtime, gonode drip-feed `BLOCK_INTERVAL_MS=250` (4 блока/сек)  
+**Чанкование:** chunk = block_number / 1000
+
+### Результаты
+
+| Прогон | fetch avg | save avg | **total avg** | total min | total max |
+|--------|---------|---------|-------------|---------|---------|
+| Run 1 | 5.3 ms | 20.9 ms | **32.2 ms** | 21.4 ms | 56.3 ms |
+
+### Сравнение: instant vs drip-feed
+
+| Режим | fetch avg | save avg | total avg | Δ total |
+|-------|---------|---------|---------|---------|
+| Instant (100 блоков сразу) | 3.3 ms | 17.0 ms | 25.3 ms | — |
+| **Drip-feed 250ms (4 блок/сек)** | **5.3 ms** | **20.9 ms** | **32.2 ms** | **+6.9 ms** |
+
+### Анализ
+
+**Drip-feed медленнее на ~7ms — это и есть реальная production latency одиночного блока.**
+
+**fetch +2ms (3.3→5.3ms):**  
+WS watcher в gonode поллит каждые 5ms и отправляет уведомление только когда блок стал доступен. Добавляется до 5ms задержки между "блок готов" и "WS notification отправлен". В instant-режиме все уведомления уже в буфере, 0ms ожидания.
+
+**save +4ms (17→21ms):**  
+В instant-режиме 100 блоков пишутся подряд без пауз — Scylla-шард горячий: memtable в кеше, connection pool активен, I/O pipeline заполнен. В drip-режиме между блоками 250ms паузы — шард "остывает": GC, background compaction housekeeping, TCP connections idle.
+
+**Итог:** реальная latency одиночного блока (WS notification → данные в Scylla) = **~32ms** на текущей конфигурации. Для mainnet (~12 сек/блок) абсолютно приемлемо. Bottleneck — save=21ms на одном шарде Scylla (chunk 25079).
+
+### Production-ready baseline
+
+```
+fetch: 5ms  (WS notification → HTTP fetch → parse)
+save:  21ms (transform + CQL BATCH → Scylla ack)
+total: 32ms (одиночный блок, реалистичный темп)
+```
+
+Следующее: тест с равномерным распределением по шардам (remap-mod=32) — ожидаем save < 10ms.
