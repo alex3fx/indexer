@@ -480,9 +480,9 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 
 ## 6. Итоговое сравнение парсеров
 
-Все измерения: gonode HTTP, native ScyllaDB smp=16 tmpfs, 2026-05-22.
+### 6.1 Historical — localhost (WSL2)
 
-### Historical (1000 блоков)
+Измерения: gonode HTTP, native ScyllaDB smp=16 tmpfs, 2026-05-22, 1000 блоков.
 
 | Парсер | Конфигурация | ms/block | vs TS1 |
 |--------|-------------|---------|--------|
@@ -491,7 +491,46 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 | **zigparser2 PIPELINE=2** | **REMAP=16, BATCH=16** | **5.58 ms** | **5.0×** |
 | zigparser2 PIPELINE=4 | REMAP=16, BATCH=16 | 6.18 ms | 4.5× |
 
-### Realtime (1 блок за раз, 100 блоков, instant gonode)
+### 6.2 Historical — реальный сервер
+
+Измерения: gonode HTTP (локально на сервере), ScyllaDB Docker smp=32/128G `--developer-mode --unsafe-bypass-fsync`,  
+2026-05-25, 100 блоков (25079097–25079196), сервер Intel Xeon Gold 5412U / 48 ядер / 251 GB RAM.
+
+| Парсер | Конфигурация | ms/block | vs TS1 |
+|--------|-------------|---------|--------|
+| TS1 | 5 workers, BullMQ, cassandra-driver | **54.75 ms** | 1.0× |
+| **zigparser2 PIPELINE=2** | **REMAP=32, pool=32** | **11.82 ms** | **4.6×** |
+
+**Детализация zigparser2 (сервер):**
+
+| Фаза | avg/block |
+|------|-----------|
+| FBDR (fetch+parse, 3×HTTP параллельно) | 80.7 ms |
+| TPT (fetch+transform) | 12.8 ms |
+| Save (UNLOGGED BATCH, 6 таблиц параллельно) | 10.8 ms |
+| **Total wall-clock** | **11.82 ms/block** |
+
+**Детализация TS1 (сервер):**
+
+| Фаза | avg/batch (10 блоков) |
+|------|----------------------|
+| FBDR | 64.1 ms |
+| Transform | 100.0 ms |
+| BullMQ addJob | 93.8 ms |
+| TPT total | 2048 ms / 20.3 ms/block |
+| Save total (5 workers async) | ~3400 ms |
+| **Total wall-clock** | **54.75 ms/block** |
+
+**Почему сервер медленнее localhost по абсолютным числам:**
+- gonode читает из файла на диске (не tmpfs) → FBDR 80ms vs 34ms
+- Scylla в Docker vs native → дополнительный overhead на save
+- Оба парсера страдают одинаково → relative speedup сохраняется (4.6×)
+
+**Итог: zigparser2 стабильно быстрее TS1 в 4.6–5.0× на любом стенде.**
+
+### 6.3 Realtime — localhost (WSL2, instant gonode)
+
+100 блоков, 2026-05-22.
 
 | Парсер | Режим | fetch avg | save avg | **Per-block latency** | vs TS1 |
 |--------|-------|----------|---------|----------------------|--------|
@@ -511,18 +550,90 @@ TO_BLOCK=25079196 REMAP_MOD=16 REALTIME=1 WS_URL=ws://127.0.0.1:8545/ws \
 
 Scylla "остывает" за 88ms простоя между блоками → save растёт с 8.5ms до 11.6ms.
 
+### 6.4 Catchup+Realtime — localhost (WSL2)
+
+Новый режим (WS_URL задан): история синхронизируется батчами, потом переход на WS realtime.  
+2026-05-25, 900 блоков history + 100 блоков WS (500ms/block), REMAP_MOD=16, PIPELINE=2.
+
+| Фаза | Результат |
+|------|-----------|
+| Historical (900 блоков, PIPELINE=2) | 7018 ms / 7.8 ms/block |
+| WS first block | 25079097 (seamless transition) |
+| Realtime WS fetch avg | 2.2 ms |
+| Realtime WS save avg | 13.5 ms |
+| **Realtime WS TOTAL avg** | **18.1 ms/block** |
+
 **Ключевое отличие CQL path:**
 - TS1: `cassandra-driver.execute()` → 28 sequential `Promise.allSettled` × 100 строк
 - zigparser2: `UNLOGGED BATCH` → 28 параллельных фреймов через pool=32
 
 ---
 
-## 7. loader2 — минимальная latency записи 1 блока
+## 7. Бенчмарк на реальном сервере (lotos-archive-01)
+
+Сервер: `alexey_smolyakov@100.64.0.4` (Tailscale).  
+Конфигурация: 48 ядер Xeon Gold 5412U, 251 GB RAM, 2 TB HDD.  
+Scylla: Docker `scylladb/scylla:6.2`, smp=32, memory=128G, `--developer-mode --unsafe-bypass-fsync`.
+
+### 7.1 Первичная установка (один раз)
+
+```bash
+ssh alexey_smolyakov@100.64.0.4
+
+# Установить bun (если нет)
+curl -fsSL https://bun.sh/install | bash
+
+# Создать dragonfly с BullMQ-совместимыми флагами (порт 6380, не конфликтует с native redis)
+docker stop dragonfly 2>/dev/null; docker rm dragonfly 2>/dev/null
+docker run -d --name dragonfly --network host --restart unless-stopped \
+  docker.dragonflydb.io/dragonflydb/dragonfly:latest \
+  --bind=0.0.0.0 --port=6380 --requirepass=redispass \
+  --lock_on_hashtags --cluster_mode=emulated
+
+# Перенести TS1 source (с dev-машины)
+rsync -az /home/alex/lotos/task1/mocknode/src/ alexey_smolyakov@100.64.0.4:~/ts1/src/
+rsync -az /home/alex/lotos/task1/mocknode/package.json \
+          /home/alex/lotos/task1/mocknode/tsconfig.json \
+          /home/alex/lotos/task1/mocknode/bun.lock \
+          alexey_smolyakov@100.64.0.4:~/ts1/
+ssh alexey_smolyakov@100.64.0.4 "cd ~/ts1 && ~/.bun/bin/bun install"
+```
+
+### 7.2 Обновить бинари (после пересборки)
+
+```bash
+scp /home/alex/lotos/task1/zigtest2/zig-out/bin/zigparser2 \
+    alexey_smolyakov@100.64.0.4:~/zigparser_full/zigparser2_latest
+scp /home/alex/lotos/task1/mocknode/gonode/gonode \
+    alexey_smolyakov@100.64.0.4:~/zigparser_full/gonode_latest
+```
+
+### 7.3 Запустить бенчмарк
+
+```bash
+# Загрузить скрипт (если нет)
+scp /tmp/bench_server.sh alexey_smolyakov@100.64.0.4:~/bench_server.sh
+
+ssh alexey_smolyakov@100.64.0.4 "bash ~/bench_server.sh"
+```
+
+**Реквизиты сервера:**
+
+| Ресурс | Адрес | Пароль |
+|--------|-------|--------|
+| Native Redis | `127.0.0.1:6379` | `ZCy8k4G6pcRYVFfm` |
+| Dragonfly (BullMQ) | `127.0.0.1:6380` | `redispass` |
+| ScyllaDB | `127.0.0.1:9042` | `cassandra/cassandra` |
+| gonode HTTP/WS | `127.0.0.1:8545` | — |
+
+---
+
+## 9. loader2 — минимальная latency записи 1 блока
 
 loader2 измеряет время записи ровно одного блока в ScyllaDB:  
 6 таблиц × UNLOGGED BATCH, все параллельно, 1 блок каждые 100ms.
 
-### 7.1 Создание dump (1 блок/батч)
+### 9.1 Создание dump (1 блок/батч)
 
 ```bash
 cd /home/alex/lotos/task1/zigtest2
@@ -541,14 +652,14 @@ DUMP_FILE=/home/alex/lotos/task1/gotest/loader2/dump_100_b1.bin \
 # → gotest/loader2/dump_100_b1.bin (~124MB, 100 батчей × 1 блок)
 ```
 
-### 7.2 Сборка loader2
+### 9.2 Сборка loader2
 
 ```bash
 cd /home/alex/lotos/task1/gotest/loader2
 /usr/local/go/bin/go build -o loader2 .
 ```
 
-### 7.3 Запуск теста
+### 9.3 Запуск теста
 
 ```bash
 cd /home/alex/lotos/task1/gotest/loader2
@@ -567,7 +678,7 @@ sleep 5
 ./loader2 -dump=dump_100_b1.bin -interval=100 -conns=4
 ```
 
-### 7.4 Результаты (100 блоков, interval=100ms, smp=16 tmpfs)
+### 9.4 Результаты (100 блоков, interval=100ms, smp=16 tmpfs)
 
 **Sweep split/conns:**
 
@@ -592,7 +703,7 @@ sleep 5
 Каждому соединению достаётся ~100 строк = 1 BATCH фрейм.  
 При 32+ соединениях на itxs: contention на одном шарде → деградация.
 
-### 7.5 Флаги loader2
+### 9.5 Флаги loader2
 
 | Флаг | По умолчанию | Описание |
 |------|-------------|---------|
@@ -605,7 +716,7 @@ sleep 5
 
 ---
 
-## 8. Валидация данных
+## 10. Валидация данных
 
 После записи — сверить с prod CSV:
 
@@ -615,7 +726,7 @@ python3 /mnt/c/Users/Public/zig20260521/validate_db.py
 
 ---
 
-## 9. Типичные проблемы
+## 11. Типичные проблемы
 
 | Симптом | Причина | Решение |
 |---------|---------|---------|
