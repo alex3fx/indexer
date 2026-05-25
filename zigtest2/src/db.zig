@@ -49,6 +49,103 @@ fn tcpConnectRaw(host: []const u8, port: u16) !i32 {
     return fd;
 }
 
+// Connect and bind to a specific local port (for shard-aware routing via Scylla port 19042).
+// Scylla routes connections on port 19042 to shard = source_port % num_shards.
+fn tcpConnectBound(host: []const u8, dst_port: u16, src_port: u16) !i32 {
+    const sock_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+    if (sock_fd > @as(usize, std.math.maxInt(i32))) return error.SocketFailed;
+    const fd: i32 = @intCast(sock_fd);
+    errdefer _ = linux.close(fd);
+
+    const reuse: c_int = 1;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR,
+        @ptrCast(&reuse), @sizeOf(c_int));
+
+    const local = linux.sockaddr.in{
+        .family = linux.AF.INET,
+        .port   = std.mem.nativeToBig(u16, src_port),
+        .addr   = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero   = std.mem.zeroes([8]u8),
+    };
+    if (linux.bind(fd, @ptrCast(&local), @sizeOf(linux.sockaddr.in)) != 0)
+        return error.BindFailed;
+
+    var ip: [4]u8 = .{127, 0, 0, 1};
+    var iter = std.mem.splitScalar(u8, host, '.');
+    var idx: usize = 0;
+    while (iter.next()) |p| : (idx += 1) {
+        if (idx >= 4) break;
+        ip[idx] = std.fmt.parseInt(u8, p, 10) catch 0;
+    }
+    const ip_host = (@as(u32, ip[0]) << 24) | (@as(u32, ip[1]) << 16) |
+                    (@as(u32, ip[2]) << 8)  |  @as(u32, ip[3]);
+    const addr = linux.sockaddr.in{
+        .family = linux.AF.INET,
+        .port   = std.mem.nativeToBig(u16, dst_port),
+        .addr   = std.mem.nativeToBig(u32, ip_host),
+        .zero   = std.mem.zeroes([8]u8),
+    };
+    if (linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)) != 0)
+        return error.ConnectFailed;
+
+    const nodelay: c_int = 1;
+    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)),
+        linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
+    return fd;
+}
+
+// Query Scylla SUPPORTED frame to find SCYLLA_NR_SHARDS.
+// Returns 1 on any error (safe fallback).
+fn queryNumShards(host: []const u8, port: u16, gpa: std.mem.Allocator) u32 {
+    const fd = tcpConnectRaw(host, port) catch return 1;
+    defer _ = linux.close(fd);
+
+    const req: [9]u8 = .{0x04, 0x00, 0x00, 0x01, CQL_OPCODE_OPTIONS, 0, 0, 0, 0};
+    tcpWrite(fd, &req) catch return 1;
+
+    var hdr: [9]u8 = undefined;
+    tcpReadExact(fd, &hdr) catch return 1;
+    const body_len = std.mem.readInt(u32, hdr[5..9], .big);
+    if (body_len > 65536) return 1;
+
+    const body = gpa.alloc(u8, body_len) catch return 1;
+    defer gpa.free(body);
+    tcpReadExact(fd, body) catch return 1;
+
+    var pos: usize = 0;
+    if (pos + 2 > body.len) return 1;
+    const n_pairs = std.mem.readInt(u16, body[pos..][0..2], .big);
+    pos += 2;
+
+    for (0..n_pairs) |_| {
+        if (pos + 2 > body.len) break;
+        const kl = std.mem.readInt(u16, body[pos..][0..2], .big);
+        pos += 2;
+        if (pos + kl > body.len) break;
+        const key = body[pos..][0..kl];
+        pos += kl;
+
+        if (pos + 2 > body.len) break;
+        const nv = std.mem.readInt(u16, body[pos..][0..2], .big);
+        pos += 2;
+
+        var first: ?[]const u8 = null;
+        for (0..nv) |vi| {
+            if (pos + 2 > body.len) break;
+            const vl = std.mem.readInt(u16, body[pos..][0..2], .big);
+            pos += 2;
+            if (pos + vl > body.len) break;
+            const val = body[pos..][0..vl];
+            pos += vl;
+            if (vi == 0) first = val;
+        }
+        if (std.mem.eql(u8, key, "SCYLLA_NR_SHARDS")) {
+            if (first) |v| return std.fmt.parseInt(u32, v, 10) catch 1;
+        }
+    }
+    return 1;
+}
+
 fn tcpWrite(fd: i32, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
@@ -108,7 +205,9 @@ fn tcpReadSome(fd: i32, buf: []u8) !usize {
 // ─── CQL frame protocol ───────────────────────────────────────────────────────
 
 const CQL_REQUEST_VERSION: u8 = 0x04;
-const CQL_OPCODE_STARTUP: u8 = 0x01;
+const CQL_OPCODE_STARTUP:      u8 = 0x01;
+const CQL_OPCODE_OPTIONS:      u8 = 0x05;
+const CQL_OPCODE_SUPPORTED:    u8 = 0x06;
 const CQL_OPCODE_AUTH_RESPONSE: u8 = 0x0F;
 const CQL_OPCODE_QUERY: u8 = 0x07;
 const CQL_OPCODE_PREPARE: u8 = 0x09;
@@ -135,9 +234,21 @@ pub const CqlConn = struct {
         user: []const u8,
         pass: []const u8,
     ) !CqlConn {
-        _ = io; // raw Linux sockets, no Io needed
+        _ = io;
         const fd = try tcpConnectRaw(host, port);
+        return initWithFd(fd, gpa, keyspace, user, pass);
+    }
+
+    // Used by shard-aware pool init: fd already bound/connected externally.
+    pub fn initWithFd(
+        fd: i32,
+        gpa: std.mem.Allocator,
+        keyspace: []const u8,
+        user: []const u8,
+        pass: []const u8,
+    ) !CqlConn {
         var self = CqlConn{ .fd = fd, .gpa = gpa };
+        errdefer _ = linux.close(fd);
 
         try self.sendStartup();
         {
@@ -153,7 +264,6 @@ pub const CqlConn = struct {
             }
         }
 
-        // USE keyspace — must consume full response frame
         const use_query = try std.fmt.allocPrint(gpa, "USE {s}", .{keyspace});
         defer gpa.free(use_query);
         try self.sendQuery(use_query);
@@ -601,11 +711,28 @@ pub const CqlPool = struct {
     ) !CqlPool {
         const conns = try gpa.alloc(*CqlConn, POOL_SIZE);
         var pool = CqlPool{ .conns = conns, .gpa = gpa };
-        for (0..POOL_SIZE) |i| {
-            const conn = try gpa.create(CqlConn);
-            conn.* = try CqlConn.init(io, gpa, host, port, keyspace, user, pass);
-            pool.conns[i] = conn;
-            pool.count = i + 1;
+
+        if (cfg.shard_aware) {
+            // Connect all pool connections to the target shard via port 19042.
+            // Scylla routes connections on 19042 to shard = source_port % num_shards.
+            const num_shards = queryNumShards(host, port, gpa);
+            const target: u32 = @intCast(cfg.shard_aware_target_shard);
+            std.log.info("[db] shard-aware: target_shard={} / num_shards={}", .{ target, num_shards });
+            for (0..POOL_SIZE) |i| {
+                const conn = try gpa.create(CqlConn);
+                const src: u16 = @intCast(40000 + i * num_shards + target);
+                const fd = try tcpConnectBound(host, 19042, src);
+                conn.* = try CqlConn.initWithFd(fd, gpa, keyspace, user, pass);
+                pool.conns[i] = conn;
+                pool.count = i + 1;
+            }
+        } else {
+            for (0..POOL_SIZE) |i| {
+                const conn = try gpa.create(CqlConn);
+                conn.* = try CqlConn.init(io, gpa, host, port, keyspace, user, pass);
+                pool.conns[i] = conn;
+                pool.count = i + 1;
+            }
         }
         return pool;
     }

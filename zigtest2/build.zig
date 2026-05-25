@@ -10,11 +10,19 @@ pub fn build(b: *std.Build) void {
     const split_str = b.option([]const u8, "split",
         "Connection split across 6 tables (default \"1,3,6,20,1,1\")")
         orelse "1,3,6,20,1,1";
+    const shard_aware = b.option(bool, "shard_aware",
+        "Connect all CQL connections to a specific Scylla shard (default false)")
+        orelse false;
+    const shard_aware_target_shard = b.option(u32, "shard_aware_target_shard",
+        "Target shard index for shard-aware routing (default 0)")
+        orelse 0;
 
     const tuning = b.addOptions();
-    tuning.addOption(u32,        "pool_size", pool_size);
-    tuning.addOption(u32,        "pipeline",  pipeline);
-    tuning.addOption([]const u8, "split",     split_str);
+    tuning.addOption(u32,        "pool_size",                pool_size);
+    tuning.addOption(u32,        "pipeline",                 pipeline);
+    tuning.addOption([]const u8, "split",                    split_str);
+    tuning.addOption(bool,       "shard_aware",              shard_aware);
+    tuning.addOption(u32,        "shard_aware_target_shard", shard_aware_target_shard);
     const tuning_mod = tuning.createModule();
 
     // ── Source modules ────────────────────────────────────────────────────────
