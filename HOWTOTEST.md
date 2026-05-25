@@ -553,15 +553,32 @@ Scylla "остывает" за 88ms простоя между блоками →
 ### 6.4 Catchup+Realtime — localhost (WSL2)
 
 Новый режим (WS_URL задан): история синхронизируется батчами, потом переход на WS realtime.  
-2026-05-25, 900 блоков history + 100 блоков WS (500ms/block), REMAP_MOD=16, PIPELINE=2.
+2026-05-25, 900 блоков history + 100 блоков WS (WS_BLOCK_INTERVAL_MS=500), REMAP_MOD=16, PIPELINE=2.
 
 | Фаза | Результат |
 |------|-----------|
-| Historical (900 блоков, PIPELINE=2) | 7018 ms / 7.8 ms/block |
-| WS first block | 25079097 (seamless transition) |
+| WS first block | 25079097 — seamless, 0 пропусков |
+| Historical (900 блоков, PIPELINE=2) | 7018 ms / **7.8 ms/block** |
 | Realtime WS fetch avg | 2.2 ms |
 | Realtime WS save avg | 13.5 ms |
 | **Realtime WS TOTAL avg** | **18.1 ms/block** |
+
+### 6.5 Catchup+Realtime — реальный сервер
+
+2026-05-25, 80 блоков history + 20 блоков WS (WS_BLOCK_INTERVAL_MS=500),  
+REMAP_MOD=32, PIPELINE=2, Scylla Docker smp=32/128G.
+
+| Фаза | Результат |
+|------|-----------|
+| WS first block | 25079177 — seamless, 0 пропусков |
+| Historical (80 блоков, PIPELINE=2) | 506 ms / **6.3 ms/block** |
+| Historical FBDR avg | 50.4 ms |
+| Historical save avg | 8.6 ms |
+| Realtime WS fetch avg | 5.5 ms |
+| Realtime WS save avg | 24.0 ms |
+| **Realtime WS TOTAL avg** | **36.0 ms/block** |
+
+> Realtime save 24ms (vs 13.5ms WSL2): Scylla Docker без tmpfs + "остывание" за ~8s простоя во время исторической синхронизации. На продовой ноде с непрерывным потоком блоков save вернётся к ~10-15ms.
 
 **Ключевое отличие CQL path:**
 - TS1: `cassandra-driver.execute()` → 28 sequential `Promise.allSettled` × 100 строк
