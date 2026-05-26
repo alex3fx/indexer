@@ -73,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("ScyllaDB: {s}:{d}  pool={d}  workers={d}  split={}+{}+{}+{}+{}+{}\n",
             .{ cfg.scylla_host, cfg.scylla_port, db.POOL_SIZE, P,
                db.SPLIT[0], db.SPLIT[1], db.SPLIT[2], db.SPLIT[3], db.SPLIT[4], db.SPLIT[5] });
+        std.debug.print("batch: blk={d} txs={d} logs={d} itxs={d} cont={d} cba={d}\n",
+            .{ db.BS_BLK, db.BS_TXS, db.BS_LOGS, db.BS_ITXS, db.BS_CONT, db.BS_CBA });
         std.debug.print("Connecting ({d} pool(s))...\n", .{P});
         for (0..P) |p| {
             pools[p] = try db.CqlPool.init(io, gpa, cfg.scylla_host, cfg.scylla_port,

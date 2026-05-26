@@ -76,7 +76,7 @@ pub fn processBlock(
     io:        std.Io,
     gpa:       std.mem.Allocator,
     cfg:       *const Config,
-    pool:      *db.CqlPool,
+    wpool:     *db.WorkerPool,
     block_num: u64,
     method_arenas: *[3]std.heap.ArenaAllocator,
     block_arena:   *std.heap.ArenaAllocator,
@@ -107,11 +107,7 @@ pub fn processBlock(
     const transform_ms = @as(f64, @floatFromInt(t2 - t1)) / 1e6;
 
     var save_ms: f64 = 0;
-    try db.saveBatch(.{
-        .pool      = pool,
-        .ent       = &ent,
-        .result_ms = &save_ms,
-    });
+    try wpool.saveBatch(&ent, &save_ms);
 
     const total_ms = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
 
@@ -130,7 +126,7 @@ fn processWsBlock(
     io:           std.Io,
     gpa:          std.mem.Allocator,
     cfg:          *const Config,
-    pool:         *db.CqlPool,
+    wpool:        *db.WorkerPool,
     block_num:    u64,
     method_arenas: *[3]std.heap.ArenaAllocator,
     block_arena:  *std.heap.ArenaAllocator,
@@ -138,10 +134,10 @@ fn processWsBlock(
     cursor:       *u64,
     redis:        *db.RedisConn,
 ) !void {
-    const br = try processBlock(io, gpa, cfg, pool, block_num, method_arenas, block_arena);
+    const br = try processBlock(io, gpa, cfg, wpool, block_num, method_arenas, block_arena);
     const r = br orelse blk: {
         sleepMs(5);
-        const br2 = try processBlock(io, gpa, cfg, pool, block_num, method_arenas, block_arena);
+        const br2 = try processBlock(io, gpa, cfg, wpool, block_num, method_arenas, block_arena);
         if (br2 == null) {
             std.debug.print("\u{26a0} [{d}] block not available after retry — skipping\n", .{block_num});
             return;
@@ -166,6 +162,9 @@ pub fn runRealtime(
     std.debug.print("Realtime mode: poll_ms={d}  chunk=block%{d}  to={d}\n\n",
         .{ cfg.poll_ms, if (cfg.remap_mod > 0) cfg.remap_mod else cfg.chunk_size, cfg.to_block });
 
+    const wpool = try db.WorkerPool.init(gpa, pool);
+    defer wpool.deinit();
+
     var method_arenas = [3]std.heap.ArenaAllocator{
         std.heap.ArenaAllocator.init(std.heap.page_allocator),
         std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -188,7 +187,7 @@ pub fn runRealtime(
     var stats = RtStats{};
 
     while (block_num <= cfg.to_block) {
-        const br = try processBlock(io, gpa, cfg, pool, block_num,
+        const br = try processBlock(io, gpa, cfg, wpool, block_num,
                                     &method_arenas, &block_arena);
         if (br == null) {
             sleepMs(cfg.poll_ms);
@@ -369,6 +368,9 @@ pub fn runCatchupAndRealtime(
     // Realtime phase: process ws_first (already consumed from channel) + buffered + future blocks.
     std.debug.print("\nRealtime phase from block {d}\n\n", .{ws_first});
 
+    const wpool = try db.WorkerPool.init(gpa, &pools[0]);
+    defer wpool.deinit();
+
     var method_arenas = [3]std.heap.ArenaAllocator{
         std.heap.ArenaAllocator.init(std.heap.page_allocator),
         std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -383,14 +385,14 @@ pub fn runCatchupAndRealtime(
     var stats = RtStats{};
 
     if (ws_first > cursor and ws_first <= cfg.to_block) {
-        try processWsBlock(io, gpa, cfg, &pools[0], ws_first,
+        try processWsBlock(io, gpa, cfg, wpool, ws_first,
                            &method_arenas, &block_arena, &stats, &cursor, redis);
     }
 
     while (ch.recv()) |block_num| {
         if (block_num <= cursor) continue;
         if (block_num > cfg.to_block) break;
-        try processWsBlock(io, gpa, cfg, &pools[0], block_num,
+        try processWsBlock(io, gpa, cfg, wpool, block_num,
                            &method_arenas, &block_arena, &stats, &cursor, redis);
         if (cursor >= cfg.to_block) break;
     }

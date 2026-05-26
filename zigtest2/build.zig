@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
     const shard_aware_target_shard = b.option(u32, "shard_aware_target_shard",
         "Target shard index for shard-aware routing (default 0)")
         orelse 0;
+    const bs_blk  = b.option(u32, "bs_blk",  "BATCH rows for blocks table (default 50)") orelse 50;
+    const bs_txs  = b.option(u32, "bs_txs",  "BATCH rows for transactions table (default 50)") orelse 50;
+    const bs_logs = b.option(u32, "bs_logs", "BATCH rows for logs table (default 50)") orelse 50;
+    const bs_itxs = b.option(u32, "bs_itxs", "BATCH rows for internal_transactions table (default 50)") orelse 50;
+    const bs_cont = b.option(u32, "bs_cont", "BATCH rows for contracts table (default 50)") orelse 50;
+    const bs_cba  = b.option(u32, "bs_cba",  "BATCH rows for contracts_by_addresses table (default 50)") orelse 50;
 
     const tuning = b.addOptions();
     tuning.addOption(u32,        "pool_size",                pool_size);
@@ -23,6 +29,12 @@ pub fn build(b: *std.Build) void {
     tuning.addOption([]const u8, "split",                    split_str);
     tuning.addOption(bool,       "shard_aware",              shard_aware);
     tuning.addOption(u32,        "shard_aware_target_shard", shard_aware_target_shard);
+    tuning.addOption(u32,        "bs_blk",                   bs_blk);
+    tuning.addOption(u32,        "bs_txs",                   bs_txs);
+    tuning.addOption(u32,        "bs_logs",                  bs_logs);
+    tuning.addOption(u32,        "bs_itxs",                  bs_itxs);
+    tuning.addOption(u32,        "bs_cont",                  bs_cont);
+    tuning.addOption(u32,        "bs_cba",                   bs_cba);
     const tuning_mod = tuning.createModule();
 
     // ── Source modules ────────────────────────────────────────────────────────

@@ -219,7 +219,16 @@ const CQL_OPCODE_RESULT: u8 = 0x08;
 const CQL_OPCODE_ERROR: u8 = 0x00;
 const CQL_CONSISTENCY_ONE: u16  = 0x0001;
 const CQL_OPCODE_BATCH:    u8   = 0x0D;
-const BATCH_SIZE: usize = 50; // rows per UNLOGGED BATCH frame
+
+// Per-table CQL BATCH sizes (rows per UNLOGGED BATCH frame).
+// Set at build time via -Dbs_blk=N etc. Default 50 for all tables.
+pub const BS_BLK:  usize = cfg.bs_blk;
+pub const BS_TXS:  usize = cfg.bs_txs;
+pub const BS_LOGS: usize = cfg.bs_logs;
+pub const BS_ITXS: usize = cfg.bs_itxs;
+pub const BS_CONT: usize = cfg.bs_cont;
+pub const BS_CBA:  usize = cfg.bs_cba;
+const BS_COMP: usize = 50; // block_completions — small rows, fixed
 
 pub const CqlConn = struct {
     fd: i32,
@@ -910,13 +919,13 @@ const CBAWA     = struct { conn: *CqlConn, prep_id: []const u8, rows: []const tr
 // bd = contiguous buffer, starts[] marks per-row slice boundaries.
 
 fn blocksWorker(wa: BlocksWA) void {
-    var v  = workerBuf(EST_BLOCK_ROW);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * EST_BLOCK_ROW); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var v  = workerBuf(EST_BLOCK_ROW);             defer v.deinit(A);
+    var bd = workerBuf(BS_BLK * EST_BLOCK_ROW);    defer bd.deinit(A);
+    var starts: [BS_BLK + 1]usize = undefined;
+    var ptrs:   [BS_BLK][]const u8 = undefined;
     var i: usize = 0;
     while (i < wa.rows.len) {
-        const end = @min(i + BATCH_SIZE, wa.rows.len);
+        const end = @min(i + BS_BLK, wa.rows.len);
         bd.items.len = 0; var enc: usize = 0;
         for (i..end) |j| {
             v.items.len = 0; starts[enc] = bd.items.len;
@@ -937,13 +946,13 @@ fn blocksWorker(wa: BlocksWA) void {
 }
 
 fn txsWorker(wa: TxsWA) void {
-    var v  = workerBuf(EST_TX_ROW);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * EST_TX_ROW); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var v  = workerBuf(EST_TX_ROW);             defer v.deinit(A);
+    var bd = workerBuf(BS_TXS * EST_TX_ROW);    defer bd.deinit(A);
+    var starts: [BS_TXS + 1]usize = undefined;
+    var ptrs:   [BS_TXS][]const u8 = undefined;
     var i: usize = 0;
     while (i < wa.rows.len) {
-        const end = @min(i + BATCH_SIZE, wa.rows.len);
+        const end = @min(i + BS_TXS, wa.rows.len);
         bd.items.len = 0; var enc: usize = 0;
         for (i..end) |j| {
             v.items.len = 0; starts[enc] = bd.items.len;
@@ -980,13 +989,13 @@ fn txsWorker(wa: TxsWA) void {
 }
 
 fn logsWorker(wa: LogsWA) void {
-    var v  = workerBuf(EST_LOG_ROW);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * EST_LOG_ROW); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var v  = workerBuf(EST_LOG_ROW);             defer v.deinit(A);
+    var bd = workerBuf(BS_LOGS * EST_LOG_ROW);   defer bd.deinit(A);
+    var starts: [BS_LOGS + 1]usize = undefined;
+    var ptrs:   [BS_LOGS][]const u8 = undefined;
     var i: usize = 0;
     while (i < wa.rows.len) {
-        const end = @min(i + BATCH_SIZE, wa.rows.len);
+        const end = @min(i + BS_LOGS, wa.rows.len);
         bd.items.len = 0; var enc: usize = 0;
         for (i..end) |j| {
             v.items.len = 0; starts[enc] = bd.items.len;
@@ -1017,13 +1026,13 @@ fn logsWorker(wa: LogsWA) void {
 }
 
 fn itxsWorker(wa: ITxsWA) void {
-    var v  = workerBuf(EST_ITX_ROW);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * EST_ITX_ROW); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var v  = workerBuf(EST_ITX_ROW);             defer v.deinit(A);
+    var bd = workerBuf(BS_ITXS * EST_ITX_ROW);   defer bd.deinit(A);
+    var starts: [BS_ITXS + 1]usize = undefined;
+    var ptrs:   [BS_ITXS][]const u8 = undefined;
     var i: usize = 0;
     while (i < wa.rows.len) {
-        const end = @min(i + BATCH_SIZE, wa.rows.len);
+        const end = @min(i + BS_ITXS, wa.rows.len);
         bd.items.len = 0; var enc: usize = 0;
         for (i..end) |j| {
             v.items.len = 0; starts[enc] = bd.items.len;
@@ -1049,13 +1058,13 @@ fn itxsWorker(wa: ITxsWA) void {
 }
 
 fn contWorker(wa: ContWA) void {
-    var v  = workerBuf(EST_CONTRACT_ROW);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * EST_CONTRACT_ROW); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var v  = workerBuf(EST_CONTRACT_ROW);            defer v.deinit(A);
+    var bd = workerBuf(BS_CONT * EST_CONTRACT_ROW);  defer bd.deinit(A);
+    var starts: [BS_CONT + 1]usize = undefined;
+    var ptrs:   [BS_CONT][]const u8 = undefined;
     var i: usize = 0;
     while (i < wa.rows.len) {
-        const end = @min(i + BATCH_SIZE, wa.rows.len);
+        const end = @min(i + BS_CONT, wa.rows.len);
         bd.items.len = 0; var enc: usize = 0;
         for (i..end) |j| {
             v.items.len = 0; starts[enc] = bd.items.len;
@@ -1084,13 +1093,13 @@ fn contWorker(wa: ContWA) void {
 }
 
 fn cbaWorker(wa: CBAWA) void {
-    var v  = workerBuf(EST_CBA_ROW);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * EST_CBA_ROW); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var v  = workerBuf(EST_CBA_ROW);             defer v.deinit(A);
+    var bd = workerBuf(BS_CBA * EST_CBA_ROW);    defer bd.deinit(A);
+    var starts: [BS_CBA + 1]usize = undefined;
+    var ptrs:   [BS_CBA][]const u8 = undefined;
     var i: usize = 0;
     while (i < wa.rows.len) {
-        const end = @min(i + BATCH_SIZE, wa.rows.len);
+        const end = @min(i + BS_CBA, wa.rows.len);
         bd.items.len = 0; var enc: usize = 0;
         for (i..end) |j| {
             v.items.len = 0; starts[enc] = bd.items.len;
@@ -1160,9 +1169,9 @@ fn writeBlockCompletions(pool: *CqlPool, ent: *transform.Entities) !void {
     const conn = pool.acquire();
 
     var v  = workerBuf(64);              defer v.deinit(A);
-    var bd = workerBuf(BATCH_SIZE * 64); defer bd.deinit(A);
-    var starts: [BATCH_SIZE + 1]usize = undefined;
-    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+    var bd = workerBuf(BS_COMP * 64);    defer bd.deinit(A);
+    var starts: [BS_COMP + 1]usize = undefined;
+    var ptrs:   [BS_COMP][]const u8 = undefined;
 
     // Linear pass to count rows per block — entities are in block_number order.
     var tx_idx:  usize = 0;
@@ -1172,7 +1181,7 @@ fn writeBlockCompletions(pool: *CqlPool, ent: *transform.Entities) !void {
 
     var i: usize = 0;
     while (i < ent.blocks.items.len) {
-        const batch_end = @min(i + BATCH_SIZE, ent.blocks.items.len);
+        const batch_end = @min(i + BS_COMP, ent.blocks.items.len);
         bd.items.len = 0;
         var enc: usize = 0;
 
@@ -1267,6 +1276,391 @@ pub fn saveBatch(args: SaveArgs) !void {
     try writeBlockCompletions(args.pool, args.ent);
 
     args.result_ms.* = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
+}
+
+// ─── Persistent worker pool for realtime mode ────────────────────────────────
+// Eliminates per-block thread spawn/join (clone+mmap+join ≈ 1-5ms overhead).
+// Workers are created once at startup; saveBatch dispatches rows via futex.
+//
+// Worker state (per-worker atomic u32):  0=idle  1=work_ready  3=shutdown
+// Barrier (pool.pending atomic u32): counts active workers; main futex_waits until 0.
+
+const PWorkerTask = union(enum) {
+    blocks: []const transform.BlockRow,
+    txs:    []const transform.TxRow,
+    logs:   []const transform.LogRow,
+    itxs:   []const transform.InternalTxRow,
+    cont:   []const transform.ContractRow,
+    cba:    []const transform.ContractByAddrRow,
+};
+
+const PWorkerCtx = struct {
+    conn: *CqlConn,
+    pool: *WorkerPool,
+
+    state:     std.atomic.Value(u32) = .init(0), // 0=idle 1=work_ready 3=shutdown
+    task:      PWorkerTask           = undefined,
+    had_error: bool                  = false,
+
+    v:  std.ArrayList(u8) = .empty,
+    bd: std.ArrayList(u8) = .empty,
+};
+
+pub const WorkerPool = struct {
+    workers: []PWorkerCtx,
+    threads: []std.Thread,
+    cql:     *CqlPool,
+    gpa:     std.mem.Allocator,
+
+    pending:   std.atomic.Value(u32)  = .init(0),
+    had_error: std.atomic.Value(bool) = .init(false),
+
+    pub fn init(gpa: std.mem.Allocator, cql: *CqlPool) !*WorkerPool {
+        const self = try gpa.create(WorkerPool);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .workers = try gpa.alloc(PWorkerCtx, POOL_SIZE),
+            .threads = try gpa.alloc(std.Thread, POOL_SIZE),
+            .cql = cql,
+            .gpa = gpa,
+        };
+        errdefer gpa.free(self.workers);
+        errdefer gpa.free(self.threads);
+
+        var n_spawned: usize = 0;
+        errdefer {
+            for (self.workers[0..n_spawned]) |*w| {
+                w.state.store(3, .release);
+                _ = linux.futex_3arg(@ptrCast(&w.state.raw), .{ .cmd = .WAKE, .private = true }, 1);
+            }
+            for (self.threads[0..n_spawned]) |t| t.join();
+        }
+
+        for (0..POOL_SIZE) |i| {
+            self.workers[i] = .{ .conn = cql.conns[i], .pool = self };
+            self.workers[i].v.ensureTotalCapacity(A, 1024) catch {};
+            self.workers[i].bd.ensureTotalCapacity(A, 32768) catch {};
+            self.threads[i] = try std.Thread.spawn(.{}, pWorkerLoop, .{&self.workers[i]});
+            n_spawned += 1;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *WorkerPool) void {
+        for (self.workers) |*w| {
+            w.state.store(3, .release);
+            _ = linux.futex_3arg(@ptrCast(&w.state.raw), .{ .cmd = .WAKE, .private = true }, 1);
+        }
+        for (self.threads) |t| t.join();
+        for (self.workers) |*w| { w.v.deinit(A); w.bd.deinit(A); }
+        self.gpa.free(self.workers);
+        self.gpa.free(self.threads);
+        self.gpa.destroy(self);
+    }
+
+    pub fn saveBatch(self: *WorkerPool, ent: *transform.Entities, result_ms: *f64) !void {
+        const t0 = nowNs();
+
+        // Count dispatches before setting pending (avoids race with fast workers)
+        var n_total: u32 = 0;
+        n_total += pCountDisp(ent.blocks.items.len,            SPLIT_OFF[0], SPLIT_OFF[1]);
+        n_total += pCountDisp(ent.txs.items.len,               SPLIT_OFF[1], SPLIT_OFF[2]);
+        n_total += pCountDisp(ent.logs.items.len,              SPLIT_OFF[2], SPLIT_OFF[3]);
+        n_total += pCountDisp(ent.internal_txs.items.len,      SPLIT_OFF[3], SPLIT_OFF[4]);
+        n_total += pCountDisp(ent.contracts.items.len,         SPLIT_OFF[4], SPLIT_OFF[5]);
+        n_total += pCountDisp(ent.contracts_by_addr.items.len, SPLIT_OFF[5], SPLIT_OFF[6]);
+
+        self.pending.store(n_total, .release);
+        self.had_error.store(false, .release);
+
+        pSend(self, ent.blocks.items,            SPLIT_OFF[0], SPLIT_OFF[1], .blocks);
+        pSend(self, ent.txs.items,               SPLIT_OFF[1], SPLIT_OFF[2], .txs);
+        pSend(self, ent.logs.items,              SPLIT_OFF[2], SPLIT_OFF[3], .logs);
+        pSend(self, ent.internal_txs.items,      SPLIT_OFF[3], SPLIT_OFF[4], .itxs);
+        pSend(self, ent.contracts.items,         SPLIT_OFF[4], SPLIT_OFF[5], .cont);
+        pSend(self, ent.contracts_by_addr.items, SPLIT_OFF[5], SPLIT_OFF[6], .cba);
+
+        if (n_total > 0) {
+            var rem = self.pending.load(.acquire);
+            while (rem > 0) {
+                _ = linux.futex_4arg(@ptrCast(&self.pending.raw),
+                    .{ .cmd = .WAIT, .private = true }, rem, null);
+                rem = self.pending.load(.acquire);
+            }
+            if (self.had_error.load(.acquire)) return error.SaveFailed;
+        }
+
+        try writeBlockCompletions(self.cql, ent);
+        result_ms.* = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
+    }
+};
+
+fn pCountDisp(rows_len: usize, off_s: u32, off_e: u32) u32 {
+    if (rows_len == 0 or off_s >= off_e) return 0;
+    return @intCast(@min(rows_len, off_e - off_s));
+}
+
+fn pSend(
+    pool: *WorkerPool,
+    rows: anytype,
+    off_s: u32,
+    off_e: u32,
+    comptime tag: std.meta.Tag(PWorkerTask),
+) void {
+    if (rows.len == 0 or off_s >= off_e) return;
+    const n: usize = @min(rows.len, off_e - off_s);
+    const per = rows.len / n;
+    for (0..n) |w| {
+        const s = w * per;
+        const e = if (w == n - 1) rows.len else s + per;
+        const wctx = &pool.workers[off_s + w];
+        wctx.task = @unionInit(PWorkerTask, @tagName(tag), rows[s..e]);
+        wctx.state.store(1, .release);
+        _ = linux.futex_3arg(@ptrCast(&wctx.state.raw), .{ .cmd = .WAKE, .private = true }, 1);
+    }
+}
+
+fn pWorkerLoop(ctx: *PWorkerCtx) void {
+    while (true) {
+        // Sleep until state != 0 (FUTEX_WAIT returns immediately if state already != 0)
+        var s = ctx.state.load(.acquire);
+        while (s == 0) {
+            _ = linux.futex_4arg(@ptrCast(&ctx.state.raw),
+                .{ .cmd = .WAIT, .private = true }, 0, null);
+            s = ctx.state.load(.acquire);
+        }
+        if (s == 3) return;
+
+        ctx.had_error = false;
+        switch (ctx.task) {
+            .blocks => |rows| pBlocksWork(ctx, rows),
+            .txs    => |rows| pTxsWork(ctx, rows),
+            .logs   => |rows| pLogsWork(ctx, rows),
+            .itxs   => |rows| pItxsWork(ctx, rows),
+            .cont   => |rows| pContWork(ctx, rows),
+            .cba    => |rows| pCbaWork(ctx, rows),
+        }
+
+        if (ctx.had_error) ctx.pool.had_error.store(true, .release);
+
+        // Reset to idle before decrementing so main can re-dispatch safely.
+        ctx.state.store(0, .release);
+        const rem = ctx.pool.pending.fetchSub(1, .acq_rel);
+        if (rem == 1) {
+            _ = linux.futex_3arg(@ptrCast(&ctx.pool.pending.raw),
+                .{ .cmd = .WAKE, .private = true }, 1);
+        }
+    }
+}
+
+fn pBlocksWork(ctx: *PWorkerCtx, rows: []const transform.BlockRow) void {
+    const v = &ctx.v; const bd = &ctx.bd;
+    var starts: [BS_BLK + 1]usize = undefined;
+    var ptrs:   [BS_BLK][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + BS_BLK, rows.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            valInt32(v, A, r.chunk) catch continue;
+            valBigint(v, A, r.number) catch continue;
+            valBigint(v, A, r.timestamp_s) catch continue;
+            valBigint(v, A, r.timestamp_ms) catch continue;
+            valTextRequired(v, A, r.miner) catch continue;
+            bd.appendSlice(A, v.items) catch continue;
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        ctx.conn.batchSendRows(ctx.conn.prep_ids.blocks, 5, ptrs[0..enc]) catch {
+            ctx.had_error = true; return;
+        };
+        i = end;
+    }
+}
+
+fn pTxsWork(ctx: *PWorkerCtx, rows: []const transform.TxRow) void {
+    const v = &ctx.v; const bd = &ctx.bd;
+    var starts: [BS_TXS + 1]usize = undefined;
+    var ptrs:   [BS_TXS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + BS_TXS, rows.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            valInt32(v, A, r.chunk) catch continue;
+            valBigint(v, A, r.block_number) catch continue;
+            valInt32(v, A, r.transaction_index) catch continue;
+            valTextRequired(v, A, r.hash) catch continue;
+            valBigint(v, A, r.block_timestamp_s) catch continue;
+            valBigint(v, A, r.block_timestamp_ms) catch continue;
+            valText(v, A, r.method_id) catch continue;
+            valText(v, A, r.input) catch continue;
+            valTextRequired(v, A, r.from_address) catch continue;
+            valText(v, A, r.to_address) catch continue;
+            valVarint(v, A, r.value) catch continue;
+            valBigint(v, A, r.gas_limit) catch continue;
+            valBigint(v, A, r.gas_price) catch continue;
+            valBigint(v, A, r.gas_used) catch continue;
+            valBigint(v, A, r.max_priority_fee) catch continue;
+            valBigint(v, A, r.max_fee) catch continue;
+            valBigint(v, A, r.cumulative_gas_used) catch continue;
+            valBigint(v, A, r.effective_gas_price) catch continue;
+            valText(v, A, r.contract_address) catch continue;
+            valTinyint(v, A, r.status) catch continue;
+            valTinyint(v, A, r.tx_type) catch continue;
+            bd.appendSlice(A, v.items) catch continue;
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        ctx.conn.batchSendRows(ctx.conn.prep_ids.transactions, 21, ptrs[0..enc]) catch {
+            ctx.had_error = true; return;
+        };
+        i = end;
+    }
+}
+
+fn pLogsWork(ctx: *PWorkerCtx, rows: []const transform.LogRow) void {
+    const v = &ctx.v; const bd = &ctx.bd;
+    var starts: [BS_LOGS + 1]usize = undefined;
+    var ptrs:   [BS_LOGS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + BS_LOGS, rows.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            valInt32(v, A, r.chunk) catch continue;
+            valBigint(v, A, r.block_number) catch continue;
+            valInt32(v, A, r.transaction_index) catch continue;
+            valInt32(v, A, r.log_index) catch continue;
+            valBigint(v, A, r.block_timestamp_s) catch continue;
+            valBigint(v, A, r.block_timestamp_ms) catch continue;
+            valTextRequired(v, A, r.address) catch continue;
+            valTextRequired(v, A, r.data) catch continue;
+            valText(v, A, r.topic_zeroth) catch continue;
+            valText(v, A, r.topic_first) catch continue;
+            valText(v, A, r.topic_second) catch continue;
+            valText(v, A, r.topic_third) catch continue;
+            valListText(v, A, r.rest_topics) catch continue;
+            valTextRequired(v, A, r.transaction_hash) catch continue;
+            valBool(v, A, r.removed) catch continue;
+            bd.appendSlice(A, v.items) catch continue;
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        ctx.conn.batchSendRows(ctx.conn.prep_ids.logs, 15, ptrs[0..enc]) catch {
+            ctx.had_error = true; return;
+        };
+        i = end;
+    }
+}
+
+fn pItxsWork(ctx: *PWorkerCtx, rows: []const transform.InternalTxRow) void {
+    const v = &ctx.v; const bd = &ctx.bd;
+    var starts: [BS_ITXS + 1]usize = undefined;
+    var ptrs:   [BS_ITXS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + BS_ITXS, rows.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            valInt32(v, A, r.chunk) catch continue;
+            valBigint(v, A, r.block_number) catch continue;
+            valBigint(v, A, r.block_timestamp_s) catch continue;
+            valBigint(v, A, r.block_timestamp_ms) catch continue;
+            valInt32(v, A, r.transaction_index) catch continue;
+            valTextRequired(v, A, r.transaction_hash) catch continue;
+            valInt32(v, A, r.trace_index) catch continue;
+            valTextRequired(v, A, r.from_address) catch continue;
+            valTextRequired(v, A, r.to_address) catch continue;
+            valVarint(v, A, r.value) catch continue;
+            bd.appendSlice(A, v.items) catch continue;
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        ctx.conn.batchSendRows(ctx.conn.prep_ids.internal_txs, 10, ptrs[0..enc]) catch {
+            ctx.had_error = true; return;
+        };
+        i = end;
+    }
+}
+
+fn pContWork(ctx: *PWorkerCtx, rows: []const transform.ContractRow) void {
+    const v = &ctx.v; const bd = &ctx.bd;
+    var starts: [BS_CONT + 1]usize = undefined;
+    var ptrs:   [BS_CONT][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + BS_CONT, rows.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            valInt32(v, A, r.chunk) catch continue;
+            valBigint(v, A, r.block_number) catch continue;
+            valInt32(v, A, r.transaction_index) catch continue;
+            valTextRequired(v, A, r.transaction_hash) catch continue;
+            valInt32(v, A, r.trace_index) catch continue;
+            valBigint(v, A, r.block_timestamp_s) catch continue;
+            valBigint(v, A, r.block_timestamp_ms) catch continue;
+            valTextRequired(v, A, r.address) catch continue;
+            valTinyint(v, A, r.creation_method) catch continue;
+            valTextRequired(v, A, r.creator_address) catch continue;
+            valText(v, A, r.contract_factory) catch continue;
+            valTextRequired(v, A, r.creation_bytecode) catch continue;
+            valTextRequired(v, A, r.deployed_bytecode) catch continue;
+            bd.appendSlice(A, v.items) catch continue;
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        ctx.conn.batchSendRows(ctx.conn.prep_ids.contracts, 13, ptrs[0..enc]) catch {
+            ctx.had_error = true; return;
+        };
+        i = end;
+    }
+}
+
+fn pCbaWork(ctx: *PWorkerCtx, rows: []const transform.ContractByAddrRow) void {
+    const v = &ctx.v; const bd = &ctx.bd;
+    var starts: [BS_CBA + 1]usize = undefined;
+    var ptrs:   [BS_CBA][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + BS_CBA, rows.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            valTextRequired(v, A, r.address) catch continue;
+            valTextRequired(v, A, r.creator) catch continue;
+            valTextRequired(v, A, r.tx_hash) catch continue;
+            valBigint(v, A, r.block_number) catch continue;
+            valBigint(v, A, r.timestamp) catch continue;
+            valText(v, A, r.contract_factory) catch continue;
+            valTextRequired(v, A, r.creation_bytecode) catch continue;
+            valTextRequired(v, A, r.deployed_bytecode) catch continue;
+            bd.appendSlice(A, v.items) catch continue;
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        ctx.conn.batchSendRows(ctx.conn.prep_ids.contracts_by_addr, 8, ptrs[0..enc]) catch {
+            ctx.had_error = true; return;
+        };
+        i = end;
+    }
 }
 
 // ─── Dump mode: write encoded CQL rows to a binary file ──────────────────────
