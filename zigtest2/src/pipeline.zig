@@ -150,7 +150,7 @@ pub fn finishPrev(
     if (ps.ent.last_block > 0) {
         var buf: [20]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{d}", .{ps.ent.last_block}) catch unreachable;
-        try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
+        try db.redisSetWithRetry(redis, "LATEST_PROCESSED_BLOCK_NUMBER", s);
     }
     const batch_blocks = ps.batch_end - ps.batch_start + 1;
     blocks_done.* += batch_blocks;

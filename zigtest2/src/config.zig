@@ -39,6 +39,7 @@ pub const Config = struct {
     scylla_pass:    []const u8,
     results_dir:    []const u8,
     dump_file:      []const u8,
+    verify:         bool,
     fetch_fn:       FetchFn,
     fetch_mode:     u8,
 };
@@ -142,6 +143,7 @@ pub fn parseConfig(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ
         .scylla_pass    = scylla_password,
         .results_dir    = results_dir,
         .dump_file      = getEnv(env, "DUMP_FILE", ""),
+        .verify         = std.mem.eql(u8, getEnv(env, "VERIFY", "0"), "1"),
         .fetch_mode     = fetch_mode,
         .fetch_fn       = switch (fetch_mode) {
             1   => &rpc.fetchBatch3,

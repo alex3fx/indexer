@@ -285,7 +285,19 @@ pub const CqlConn = struct {
         self.gpa.free(self.prep_ids.internal_txs);
         self.gpa.free(self.prep_ids.contracts);
         self.gpa.free(self.prep_ids.contracts_by_addr);
+        self.gpa.free(self.prep_ids.block_completions);
         _ = linux.close(self.fd);
+    }
+
+    /// Send a CQL query string and return the raw RESULT frame body (caller owns slice).
+    pub fn queryRaw(self: *CqlConn, query: []const u8) ![]u8 {
+        try self.sendQuery(query);
+        const r = try self.recvFrame();
+        if (r.opcode == CQL_OPCODE_ERROR) {
+            self.gpa.free(r.body);
+            return error.CqlQueryError;
+        }
+        return r.body;
     }
 
     // Send a CQL frame with a body (stream=1, for handshake/prepare/query)
@@ -770,6 +782,7 @@ pub const PreparedIds = struct {
     internal_txs: []u8,
     contracts: []u8,
     contracts_by_addr: []u8,
+    block_completions: []u8,
 };
 
 const INSERT_BLOCKS = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
@@ -778,15 +791,17 @@ const INSERT_LOGS = "INSERT INTO logs (chunk,block_number,transaction_index,log_
 const INSERT_INT_TXS = "INSERT INTO internal_transactions (chunk,block_number,block_timestamp_s,block_timestamp_ms,transaction_index,transaction_hash,trace_index,from_address,to_address,value) VALUES (?,?,?,?,?,?,?,?,?,?)";
 const INSERT_CONTRACTS = "INSERT INTO contracts (chunk,block_number,transaction_index,transaction_hash,trace_index,block_timestamp_s,block_timestamp_ms,address,creation_method,creator_address,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_CONTRACTS_BY_ADDR = "INSERT INTO contracts_by_addresses (address,creator,tx_hash,block_number,timestamp,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?)";
+const INSERT_BLOCK_COMPLETIONS = "INSERT INTO block_completions (chunk,block_number,tx_count,log_count,itx_count,contract_count) VALUES (?,?,?,?,?,?)";
 
 fn prepareAll(conn: *CqlConn) !PreparedIds {
     return .{
-        .blocks           = try conn.prepare(INSERT_BLOCKS),
-        .transactions     = try conn.prepare(INSERT_TXS),
-        .logs             = try conn.prepare(INSERT_LOGS),
-        .internal_txs     = try conn.prepare(INSERT_INT_TXS),
-        .contracts        = try conn.prepare(INSERT_CONTRACTS),
+        .blocks            = try conn.prepare(INSERT_BLOCKS),
+        .transactions      = try conn.prepare(INSERT_TXS),
+        .logs              = try conn.prepare(INSERT_LOGS),
+        .internal_txs      = try conn.prepare(INSERT_INT_TXS),
+        .contracts         = try conn.prepare(INSERT_CONTRACTS),
         .contracts_by_addr = try conn.prepare(INSERT_CONTRACTS_BY_ADDR),
+        .block_completions = try conn.prepare(INSERT_BLOCK_COMPLETIONS),
     };
 }
 
@@ -1108,6 +1123,85 @@ fn spawnTable(
     }
 }
 
+// ─── Block completion markers ─────────────────────────────────────────────────
+// Written after all 6 data tables succeed. Presence of a row in block_completions
+// means the block is fully indexed and safe to read.
+
+fn writeBlockCompletions(pool: *CqlPool, ent: *transform.Entities) !void {
+    if (ent.blocks.items.len == 0) return;
+
+    const conn = pool.acquire();
+
+    var v  = workerBuf(64);              defer v.deinit(A);
+    var bd = workerBuf(BATCH_SIZE * 64); defer bd.deinit(A);
+    var starts: [BATCH_SIZE + 1]usize = undefined;
+    var ptrs:   [BATCH_SIZE][]const u8 = undefined;
+
+    // Linear pass to count rows per block — entities are in block_number order.
+    var tx_idx:  usize = 0;
+    var log_idx: usize = 0;
+    var itx_idx: usize = 0;
+    var con_idx: usize = 0;
+
+    var i: usize = 0;
+    while (i < ent.blocks.items.len) {
+        const batch_end = @min(i + BATCH_SIZE, ent.blocks.items.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+
+        for (i..batch_end) |j| {
+            const b = ent.blocks.items[j];
+            var tx_cnt:  i32 = 0;
+            var log_cnt: i32 = 0;
+            var itx_cnt: i32 = 0;
+            var con_cnt: i32 = 0;
+
+            while (tx_idx  < ent.txs.items.len          and ent.txs.items[tx_idx].block_number          == b.number) : (tx_idx  += 1) tx_cnt  += 1;
+            while (log_idx < ent.logs.items.len          and ent.logs.items[log_idx].block_number        == b.number) : (log_idx += 1) log_cnt += 1;
+            while (itx_idx < ent.internal_txs.items.len and ent.internal_txs.items[itx_idx].block_number == b.number) : (itx_idx += 1) itx_cnt += 1;
+            while (con_idx < ent.contracts.items.len     and ent.contracts.items[con_idx].block_number   == b.number) : (con_idx += 1) con_cnt += 1;
+
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            try valInt32(&v, A, b.chunk);
+            try valBigint(&v, A, b.number);
+            try valInt32(&v, A, tx_cnt);
+            try valInt32(&v, A, log_cnt);
+            try valInt32(&v, A, itx_cnt);
+            try valInt32(&v, A, con_cnt);
+            try bd.appendSlice(A, v.items);
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prep_ids.block_completions, 6, ptrs[0..enc]);
+        i = batch_end;
+    }
+}
+
+// ─── Redis cursor update with exponential-backoff retry ───────────────────────
+
+pub fn redisSetWithRetry(redis: *RedisConn, key: []const u8, value: []const u8) !void {
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        redis.setStr(key, value) catch |err| {
+            if (attempt < 4) {
+                std.debug.print("[WARN] Redis SET failed ({s}), retry {d}/4\n",
+                    .{ @errorName(err), attempt + 1 });
+                const delay_ns: u64 = @as(u64, 50_000_000) << @as(u6, @intCast(attempt)); // 50ms, 100ms, 200ms, 400ms
+                const ts = linux.timespec{
+                    .sec  = @intCast(delay_ns / 1_000_000_000),
+                    .nsec = @intCast(delay_ns % 1_000_000_000),
+                };
+                _ = linux.nanosleep(&ts, null);
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
+}
+
 // ─── saveBatch ───────────────────────────────────────────────────────────────
 
 pub const SaveArgs = struct {
@@ -1135,14 +1229,17 @@ pub fn saveBatch(args: SaveArgs) !void {
 
     for (threads[0..spawned]) |t| t.join();
 
-    args.result_ms.* = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
-
     if (had_error.load(.monotonic)) return error.SaveFailed;
     const n_dropped = dropped.load(.monotonic);
     if (n_dropped > 0) {
         std.debug.print("[ERROR] {d} rows dropped due to encoding errors\n", .{n_dropped});
         return error.RowEncodingFailed;
     }
+
+    // Write completion markers last — presence means all 6 tables are saved.
+    try writeBlockCompletions(args.pool, args.ent);
+
+    args.result_ms.* = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
 }
 
 // ─── Dump mode: write encoded CQL rows to a binary file ──────────────────────

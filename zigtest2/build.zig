@@ -87,6 +87,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ws",        .module = ws_mod },
         },
     });
+    const verify_mod = b.createModule(.{
+        .root_source_file = b.path("src/verify.zig"),
+        .target = target, .optimize = optimize,
+        .imports = &.{
+            .{ .name = "db",     .module = db_mod },
+            .{ .name = "config", .module = config_mod },
+        },
+    });
 
     const exe = b.addExecutable(.{
         .name = "indexer",
@@ -100,6 +108,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "metrics",   .module = metrics_mod },
                 .{ .name = "pipeline",  .module = pipeline_mod },
                 .{ .name = "realtime",  .module = realtime_mod },
+                .{ .name = "verify",    .module = verify_mod },
             },
         }),
     });

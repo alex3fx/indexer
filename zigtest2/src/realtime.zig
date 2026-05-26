@@ -152,7 +152,7 @@ fn processWsBlock(
     cursor.* = block_num;
     var buf: [20]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}", .{block_num}) catch unreachable;
-    try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
+    try db.redisSetWithRetry(redis, "LATEST_PROCESSED_BLOCK_NUMBER", s);
 }
 
 /// Realtime loop: poll for new blocks, process each immediately.
@@ -198,7 +198,7 @@ pub fn runRealtime(
 
         var cursor_buf: [20]u8 = undefined;
         const s = std.fmt.bufPrint(&cursor_buf, "{d}", .{block_num}) catch unreachable;
-        try redis.setStr("LATEST_PROCESSED_BLOCK_NUMBER", s);
+        try db.redisSetWithRetry(redis, "LATEST_PROCESSED_BLOCK_NUMBER", s);
         block_num += 1;
     }
 

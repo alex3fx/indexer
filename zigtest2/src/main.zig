@@ -18,6 +18,7 @@ const cfg_mod   = @import("config");
 const met       = @import("metrics");
 const pipe      = @import("pipeline");
 const rt        = @import("realtime");
+const verify    = @import("verify");
 
 const parseConfig    = cfg_mod.parseConfig;
 const fetch_mode_names = cfg_mod.fetch_mode_names;
@@ -46,6 +47,12 @@ pub fn main(init: std.process.Init) !void {
     try redis.selectDb(cfg.redis_db);
 
     var from: u64 = cfg.from_block;
+
+    // ── Verify mode (VERIFY=1) — uses explicit FROM_BLOCK, not cursor ─────────
+    if (cfg.verify) {
+        return verify.runVerify(io, gpa, &cfg, from, cfg.to_block);
+    }
+
     if (try redis.get("LATEST_PROCESSED_BLOCK_NUMBER")) |val| {
         defer gpa.free(val);
         from = (std.fmt.parseInt(u64, val, 10) catch 0) + 1;
