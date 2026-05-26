@@ -1,4 +1,4 @@
-// zigparser2 — EVM blockchain parser. Entry point.
+// indexer — EVM blockchain parser. Entry point.
 // Reads blocks from a JSON-RPC node, transforms them, writes to ScyllaDB + Redis.
 //
 // Modes:
@@ -30,11 +30,11 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try parseConfig(gpa, io, init.environ_map);
 
     if (cfg.remap_mod > 0) {
-        std.debug.print("Zig2 EVM Parser [{d}] {s}\nRPC: {s}  to={d}  batch={d}  chunk=block%{d} (remap)\n",
+        std.debug.print("EVM Indexer [{d}] {s}\nRPC: {s}  to={d}  batch={d}  chunk=block%{d} (remap)\n",
             .{ cfg.fetch_mode, fetch_mode_names[cfg.fetch_mode],
                cfg.rpc_url, cfg.to_block, cfg.batch_size, cfg.remap_mod });
     } else {
-        std.debug.print("Zig2 EVM Parser [{d}] {s}\nRPC: {s}  to={d}  batch={d}  chunk=block/{d}\n",
+        std.debug.print("EVM Indexer [{d}] {s}\nRPC: {s}  to={d}  batch={d}  chunk=block/{d}\n",
             .{ cfg.fetch_mode, fetch_mode_names[cfg.fetch_mode],
                cfg.rpc_url, cfg.to_block, cfg.batch_size, cfg.chunk_size });
     }

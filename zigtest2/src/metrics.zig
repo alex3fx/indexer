@@ -81,7 +81,7 @@ pub const Metrics = struct {
 
     pub fn print(self: *Metrics) void {
         const a = self.aggregate();
-        std.debug.print("\n📊 Zig2 Parser Results ({d} blocks, {d} batches)\n",
+        std.debug.print("\n📊 Indexer Results ({d} blocks, {d} batches)\n",
             .{ self.blocks.items.len, self.batches.items.len });
         std.debug.print("  FBDR avg/block  : {d:.1} ms\n", .{a.fbdr_avg});
         std.debug.print("  FBDR max        : {d:.1} ms\n", .{a.fbdr_max});
@@ -117,7 +117,7 @@ pub const Metrics = struct {
              a.fbdr_avg, a.fbdr_max, a.http_avg, a.tpt_total, a.tpt_avg, a.save_total, a.total_rows });
 
         const json_data = aw.written();
-        const filename = try std.fmt.allocPrint(gpa, "zigtest2_{d}.json", .{ts_ms});
+        const filename = try std.fmt.allocPrint(gpa, "indexer_{d}.json", .{ts_ms});
         defer gpa.free(filename);
         const path = try std.fs.path.join(gpa, &.{ results_dir, filename });
         defer gpa.free(path);
