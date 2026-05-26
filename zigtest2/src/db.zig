@@ -300,6 +300,33 @@ pub const CqlConn = struct {
         return r.body;
     }
 
+    /// Send a paged CQL query, return raw RESULT frame body (caller owns slice).
+    /// page_size: max rows per page; paging_state: null for first page, continuation token otherwise.
+    pub fn queryRawPaged(self: *CqlConn, query: []const u8, page_size: i32, paging_state: ?[]const u8) ![]u8 {
+        try self.sendQueryPaged(query, page_size, paging_state);
+        const r = try self.recvFrame();
+        if (r.opcode == CQL_OPCODE_ERROR) {
+            self.gpa.free(r.body);
+            return error.CqlQueryError;
+        }
+        return r.body;
+    }
+
+    fn sendQueryPaged(self: *CqlConn, query: []const u8, page_size: i32, paging_state: ?[]const u8) !void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.gpa);
+        try appendLongString(&body, self.gpa, query);
+        try appendShort(&body, self.gpa, CQL_CONSISTENCY_ONE);
+        // flags: 0x04 = PAGE_SIZE, 0x08 = WITH_PAGING_STATE
+        const flags: u8 = if (paging_state != null) 0x04 | 0x08 else 0x04;
+        try appendByte(&body, self.gpa, flags);
+        var ps_bytes: [4]u8 = undefined;
+        std.mem.writeInt(i32, &ps_bytes, page_size, .big);
+        try body.appendSlice(self.gpa, &ps_bytes);
+        if (paging_state) |ps| try appendBytes(&body, self.gpa, ps);
+        try self.sendFrame(CQL_OPCODE_QUERY, body.items);
+    }
+
     // Send a CQL frame with a body (stream=1, for handshake/prepare/query)
     fn sendFrame(self: *CqlConn, opcode: u8, body: []const u8) !void {
         var header: [9]u8 = undefined;
