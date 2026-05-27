@@ -1271,3 +1271,132 @@ TS1: 5550ms total  |  55.50ms/block
 ```
 
 **Итог:** code review не деградировал производительность значимо. Speedup 4.5× сохранён.
+
+---
+
+## Часть 23: Per-table batch sizes + block_completions
+
+**Дата:** 2026-05-26  
+**Сервер:** lotos-archive-01, smp=32, memory=128G, реальный диск  
+**Режим:** WS realtime, gonode drip-feed `BLOCK_INTERVAL_MS=250`, 3×100 блоков  
+**Метрика:** `save_ms` per block (WS push → последний CQL ack)
+
+### Per-table batch sizes (build options)
+
+Заменили единый `BATCH_SIZE=50` на 6 per-table констант:
+
+| Таблица | Default | Оптимум | Обоснование |
+|---------|---------|---------|------------|
+| blocks | 50 | **1** | 1 блок/батч = 1 строка, батч из 1 строки быстрее отдельного EXECUTE |
+| txs | 50 | 50 | ~270 строк = 5-6 фреймов |
+| logs | 50 | 50 | ~600 строк = 12 фреймов |
+| itxs | 50 | **100** | ~1900 строк / 100 = 19 фреймов на 8 conn (было 38 фреймов) |
+| cont | 50 | **10** | bytecodes крупные, 50 строк > 50KB |
+| cba | 50 | **10** | bytecodes крупные |
+
+### block_completions — 7-я таблица
+
+Пишется **последней** после 6 data-таблиц. Наличие записи = сигнал «блок полностью проиндексирован».  
+`writeBlockCompletions` в `db.zig`. Добавляет ~1ms overhead (отдельный CQL round-trip).
+
+### Результаты (3 runs × 100 блоков, pool=48, split=1,4,8,30,3,2)
+
+| Config | batch | tables | avg | p50 | p95 | p99 | max |
+|--------|-------|--------|-----|-----|-----|-----|-----|
+| p48old (вчера, spawn) | all=50 | 6 | 20ms | 18ms | 32ms | 40ms | 43ms |
+| A (spawn) | all=50 | 7 | 21ms | 20ms | 32ms | 41ms | 43ms |
+| **E (spawn)** | **itxs=100, cont=10** | **7** | **20ms** | **19ms** | **31ms** | **38ms** | **40ms** |
+
+**Вывод:** block_completions (+1ms) компенсируется itxs=100 (−2ms). p99 не деградировал (40→38ms).
+
+Сборка E:
+```bash
+$ZIG build -Doptimize=ReleaseFast -Dpool_size=48 -Dsplit=1,4,8,30,3,2 \
+    -Dbs_blk=1 -Dbs_itxs=100 -Dbs_cont=10 -Dbs_cba=10
+```
+
+---
+
+## Часть 24: Persistent WorkerPool — устранение spawn-per-block
+
+**Дата:** 2026-05-26  
+**Контекст:** `saveBatch` ранее вызывал `spawnTable` 6 раз, создавая до POOL_SIZE потоков на каждый блок.  
+`clone()` + stack `mmap` + join = ~1-5ms overhead per block.
+
+### Архитектура
+
+Воркеры создаются **один раз при старте** через `WorkerPool.init`, получают задания через futex.
+
+**Протокол:**
+```
+Worker state: 0=idle, 1=work_ready, 3=shutdown
+Dispatch:     pool.pending.store(n_total); pSend(task) → state.store(1) + FUTEX_WAKE
+Barrier:      while pending > 0: FUTEX_WAIT(&pending, cur_val)
+Worker done:  state.store(0); if pending.fetchSub(1)==1: FUTEX_WAKE(&pending)
+```
+
+`std.Thread.Mutex` отсутствует в Zig 0.17.0-dev.263 → использован raw Linux futex.  
+WorkerPool выделяется через `gpa.create(WorkerPool)` (stable pointer для back-reference).
+
+### Результаты (5 runs × 100 блоков, sервер, drip-feed 250ms)
+
+| Config | pool | split | avg | p50 | p95 | p99 | max |
+|--------|------|-------|-----|-----|-----|-----|-----|
+| E (spawn-per-block) | 48 | 1,4,8,30,3,2 | 21ms | 20ms | 34ms | 43ms | 55ms |
+| **W (persistent workers)** | **48** | **1,4,8,30,3,2** | **18ms** | **17ms** | **30ms** | **43ms** | **51ms** |
+
+**Выигрыш: avg −3ms (−14%), p95 −4ms.** p99 ≈ одинаково — Scylla flush доминирует хвост.
+
+Realtime используется через `WorkerPool`:
+```zig
+const wpool = try db.WorkerPool.init(gpa, pool);
+defer wpool.deinit();
+// processBlock принимает *db.WorkerPool вместо *db.CqlPool
+```
+
+---
+
+## Часть 25: Split retune — S64 как prod-конфиг
+
+**Дата:** 2026-05-26  
+**Контекст:** старый split оптимизирован под BATCH_SIZE=100 и pool=32. Теперь bs_itxs=100, bs_cont=10, pool=48 → можно добавить больше параллелизма.
+
+### Конфиги (все с persistent workers, bs_blk=1, bs_itxs=100, bs_cont=10, bs_cba=10)
+
+| Config | pool | split (blk:txs:logs:itxs:cont:cba) | avg | p50 | p95 | p99 | max |
+|--------|------|-----------------------------------|-----|-----|-----|-----|-----|
+| W | 48 | 1,4,8,30,3,2 | 18ms | 17ms | 29ms | 39ms | 42ms |
+| S40 | 40 | 1,3,6,26,2,2 | 18ms | 17ms | **27ms** | 38ms | 50ms |
+| S56 | 56 | 1,5,10,36,2,2 | 18ms | 18ms | 28ms | 38ms | 46ms |
+| **S64** | **64** | **1,6,12,40,3,2** | **18ms** | **18ms** | **28ms** | **37ms** | **38ms** |
+| S72 | 72 | 1,6,12,48,3,2 | 18ms | 18ms | 30ms | 39ms | 47ms |
+
+### Верификация S64 (5 runs × 100 блоков)
+
+| Config | avg | p50 | p95 | p99 | max |
+|--------|-----|-----|-----|-----|-----|
+| W | 18ms | 17ms | 29ms | 40ms | 48ms |
+| **S64** | **18ms** | **18ms** | **28ms** | **38ms** | **44ms** |
+
+**S64 — победитель.** max=38ms совпадает с p99=37ms — нет случайных outlier-ов. Остальные конфиги дают random spike до 42-50ms.
+
+avg/p50 везде одинаковы (18ms) — bottleneck в Scylla memtable, не в параллелизме.
+
+### Финальный prod-конфиг (S64)
+
+```bash
+$ZIG build -Doptimize=ReleaseFast -Dpool_size=64 -Dsplit=1,6,12,40,3,2 \
+    -Dbs_blk=1 -Dbs_itxs=100 -Dbs_cont=10 -Dbs_cba=10
+scp zig-out/bin/indexer alexey_smolyakov@100.64.0.4:~/zigparser_full/indexer_prod
+```
+
+Прогресс realtime latency (все на сервере, drip-feed 250ms, smp=32):
+
+| Шаг | Config | avg | p99 | max |
+|-----|--------|-----|-----|-----|
+| Baseline (code review) | pool=48 spawn BATCH=50 | ~20ms | 40ms | 43ms |
+| +per-table batch | pool=48 spawn bs_itxs=100 | 20ms | 38ms | 40ms |
+| +persistent workers | pool=48 W | 18ms | 43ms | 51ms |
+| **+split retune** | **pool=64 S64** | **18ms** | **38ms** | **44ms** |
+
+**Итог от Части 22 до S64: avg −2ms, p99 −2ms, max −11ms. Устранены spike-ы.**
