@@ -1400,3 +1400,78 @@ scp zig-out/bin/indexer alexey_smolyakov@100.64.0.4:~/zigparser_full/indexer_pro
 | **+split retune** | **pool=64 S64** | **18ms** | **38ms** | **44ms** |
 
 **Итог от Части 22 до S64: avg −2ms, p99 −2ms, max −11ms. Устранены spike-ы.**
+
+---
+
+## Часть 26: smp sweep — smp=16/24/32/40 на реальном диске
+
+**Дата:** 2026-05-27  
+**Сервер:** lotos-archive-01, 48 ядер, 256 GB RAM  
+**Scylla:** Docker 6.2, memory=128G (фиксировано), `developer-mode=1`, `bypass-fsync=1`, реальный диск  
+**Парсер:** indexer_prod (S64: pool=64, split=1,6,12,40,3,2, bs_blk=1, bs_itxs=100, bs_cont=10)  
+**Режим:** WS realtime, drip-feed BLOCK_INTERVAL_MS=250, 3×100 блоков  
+**Скрипт:** `~/zigparser_full/bench_smp.sh`  
+
+### Результаты
+
+| smp | mem/shard | avg | p50 | p95 | p99 | max |
+|-----|-----------|-----|-----|-----|-----|-----|
+| **16** | **8.0 GB** | **15ms** | **15ms** | **24ms** | **32ms** | **37ms** |
+| **24** | **5.3 GB** | **15ms** | **15ms** | **24ms** | **31ms** | **37ms** |
+| 32 (было) | 4.0 GB | 16ms | 15ms | 25ms | 34ms | 36ms |
+| 40 | 3.2 GB | 15ms | 15ms | 25ms | 35ms | 37ms |
+
+### Анализ
+
+**smp=16 и smp=24 быстрее smp=32** — контринтуитивный результат.
+
+**Причина:** все 100 тестовых блоков → chunk=25079 → 1 партиция → 1 шард Scylla.  
+При single-partition workload параллелизм между шардами не помогает.  
+Зато больше памяти на шард → более редкие flush → меньше латентность write.
+
+```
+mem/shard ∝ flush frequency (обратная зависимость)
+меньше flush = меньше latency spike = лучше p99
+```
+
+| mem/shard | flush period | p99 |
+|-----------|-------------|-----|
+| 8.0 GB (smp=16) | редко | 32ms |
+| 5.3 GB (smp=24) | редко | **31ms** |
+| 4.0 GB (smp=32) | чаще | 34ms |
+| 3.2 GB (smp=40) | чаще | 35ms |
+
+**smp=24 — оптимум:**
+- p99=31ms (лучший из всех)
+- 24 шарда → хороший параллелизм для historical-режима (разные chunks → разные шарды)
+- Оставляет 24 ядра процессора для индексера и gonode
+
+### Сравнение прогресса realtime p99 (все на сервере)
+
+| Этап | Конфиг | p99 |
+|------|--------|-----|
+| Baseline (Часть 22) | pool=48, spawn, BATCH=50, smp=32 | ~40ms |
+| + per-table batch | pool=48, spawn, smp=32 | 38ms |
+| + persistent workers | pool=48, W, smp=32 | 40ms* |
+| + split retune S64 | pool=64, S64, smp=32 | 38ms |
+| **+ smp=24** | **pool=64, S64, smp=24** | **31ms** |
+
+*p99 персистентных воркеров выше из-за Scylla не перезапускалась; avg/p95 улучшились.
+
+**Итог: от baseline 40ms p99 → 31ms p99 = −9ms (−23%). smp=24 — новый prod.**
+
+### Prod конфиг (обновлён)
+
+**Scylla:** `--smp 24 --memory 128G --developer-mode 1 --unsafe-bypass-fsync 1 --overprovisioned 1`  
+**Индексер:** `pool=64 split=1,6,12,40,3,2 bs_blk=1 bs_itxs=100 bs_cont=10 bs_cba=10`
+
+```bash
+# Перезапуск Scylla с smp=24:
+docker stop scylla && docker rm scylla
+docker run -d --name scylla --network host -v "$VOL:/var/lib/scylla" \
+  scylladb/scylla:6.2 \
+  --smp 24 --memory 128G --developer-mode 1 --overprovisioned 1 \
+  --unsafe-bypass-fsync 1 --listen-address 127.0.0.1 \
+  --rpc-address 127.0.0.1 --broadcast-rpc-address 127.0.0.1 \
+  --authenticator PasswordAuthenticator --authorizer CassandraAuthorizer
+```
