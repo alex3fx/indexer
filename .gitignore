@@ -1,0 +1,7 @@
+# DEFAULT
+**/.DS_Store*
+.zig*
+
+# SECURITY
+**.env*
+!.env.example

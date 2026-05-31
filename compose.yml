@@ -1,0 +1,24 @@
+services:
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        ZIG_VERSION: "0.16.0"
+    image: lotos-indexer:production
+    env_file:
+      - .env
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pidof raw >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
