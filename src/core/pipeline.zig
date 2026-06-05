@@ -84,10 +84,10 @@ fn nowNs() i64 {
 // Matches production SAVE_EVERY=24: keeps batches small → low Scylla latency.
 const SAVE_EVERY: usize = 24;
 
-// Scylla partition spread: chunk = blockNum % SCYLLA_SHARDS.
-// Must match the cluster's SMP (CPU shard) count so that partition keys land
-// evenly on all shards.  Not user-configurable — change only with cluster topology.
-const SCYLLA_SHARDS: u64 = 24;
+// Logical chunk bucket count: chunk = blockNum % SCYLLA_CHUNK_BUCKETS.
+// Distributes rows across Scylla partitions; set to match the cluster's SMP count.
+// Override via env SCYLLA_CHUNK_BUCKETS (default 24).
+const SCYLLA_CHUNK_BUCKETS_DEFAULT: u64 = 24;
 
 // Connection split matching production SPLIT=1,3,6,20,1,1.
 const TXS_LANES: usize = scylla.ACCUM_TXS_LANES;
@@ -98,12 +98,15 @@ const ITX_LANES: usize = scylla.ACCUM_ITX_LANES;
 // Heap-allocated per block.  Worker fills it and pushes the pointer to the channel.
 // Arena outlives the save: freed by AccumState.deinit after save completes.
 
+// ok=true:              save candidate.
+// err!=null:            fatal fetch/parse/transform — historical aborts.
+// ok=false && err=null: missing/empty block marker — skipped by AccumState.
 const BlockResult = struct {
     arena:    std.heap.ArenaAllocator,
     ent:      transform.Entities,
     blockNum: u64,
     ok:       bool,
-    err:      ?anyerror,  // non-null = hard fetch/parse/transform failure
+    err:      ?anyerror,
 
     fn init() BlockResult {
         return .{
@@ -163,33 +166,38 @@ const ResultChan = struct {
 // then pushes a *BlockResult to the channel.  Never touches Scylla.
 
 const WorkerArgs = struct {
-    io:    std.Io,
-    gpa:   Allocator,
-    chain: *const EvmChainConfig,
-    next:  *std.atomic.Value(u64),
-    to:    u64,
-    chan:  *ResultChan,
+    io:           std.Io,
+    gpa:          Allocator,
+    chain:        *const EvmChainConfig,
+    next:         *std.atomic.Value(u64),
+    to:           u64,
+    chan:          *ResultChan,
+    chunkBuckets: u64,
+};
+
+const FetchTransformStatus = union(enum) {
+    ok,
+    retry_later,    // null RPC response — block not yet available
+    skip_missing,   // block parsed as null/empty — no data to save
+    fatal: anyerror,
 };
 
 // Fetch, parse and transform one block into result.ent.
-// Retries indefinitely on null RPC response (block not yet available).
-// Hard errors (fetch IO, parse, transform) set result.err and return immediately.
+// Returns the outcome as an explicit tagged union; caller decides how to handle each case.
 fn fetchAndTransform(
-    gpa:       Allocator,
-    rpcNode:   EvmRpcNodeConfig,
-    blockNum:  u64,
-    chunkSize: u64,
-    bClient:   *FetchClient,
-    rClient:   *FetchClient,
-    tClient:   *FetchClient,
-    result:    *BlockResult,
-) void {
+    gpa:          Allocator,
+    rpcNode:      EvmRpcNodeConfig,
+    blockNum:     u64,
+    chunkSize:    u64,
+    chunkBuckets: u64,
+    bClient:      *FetchClient,
+    rClient:      *FetchClient,
+    tClient:      *FetchClient,
+    result:       *BlockResult,
+) FetchTransformStatus {
     while (true) {
-        const maybeData = fetchBlock(gpa, rpcNode, blockNum, bClient, rClient, tClient) catch |e| {
-            result.err = e;
-            std.debug.print("[worker] block={d} fetch error: {s}\n", .{ blockNum, @errorName(e) });
-            return;
-        };
+        const maybeData = fetchBlock(gpa, rpcNode, blockNum, bClient, rClient, tClient) catch |e|
+            return .{ .fatal = e };
         var data = maybeData orelse {
             const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
             _ = linux.nanosleep(&ts, null);
@@ -197,32 +205,24 @@ fn fetchAndTransform(
         };
         defer data.deinit(gpa);
 
-        const aa  = result.arena.allocator();
-        const block = rpcSpec.parseBlockResp(data.blockBody, aa) catch |e| {
-            result.err = e;
-            std.debug.print("[worker] block={d} parse_block error: {s}\n", .{ blockNum, @errorName(e) });
-            return;
-        };
-        if (block == null) return; // null result = empty/missing block, skip silently
+        const aa    = result.arena.allocator();
+        const block = rpcSpec.parseBlockResp(data.blockBody, aa) catch |e|
+            return .{ .fatal = e };
+        if (block == null) return .skip_missing;
         const receipts = (rpcSpec.parseReceiptsResp(data.receiptsBody, aa) catch null) orelse &.{};
         const traces   = (rpcSpec.parseTracesResp(data.tracesBody, aa)     catch null) orelse &.{};
 
         transform.transformBlockWithRemap(
-            aa, block.?, receipts, traces, chunkSize, SCYLLA_SHARDS, &result.ent,
-        ) catch |e| {
-            result.err = e;
-            std.debug.print("[worker] block={d} transform error: {s}\n", .{ blockNum, @errorName(e) });
-            return;
-        };
+            aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
+        ) catch |e| return .{ .fatal = e };
 
-        result.ok = true;
         std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
             blockNum,
             result.ent.txs.items.len,
             result.ent.logs.items.len,
             result.ent.internalTxs.items.len,
         });
-        return;
+        return .ok;
     }
 }
 
@@ -236,10 +236,11 @@ fn workerEntry(args: *WorkerArgs) void {
 }
 
 fn worker(args: *WorkerArgs) !void {
-    const gpa       = args.gpa;
-    const chain     = args.chain;
-    const rpcNode   = chain.rpcNodes.lotosArchiveNode;
-    const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
+    const gpa          = args.gpa;
+    const chain        = args.chain;
+    const rpcNode      = chain.rpcNodes.lotosArchiveNode;
+    const chunkSize    = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
+    const chunkBuckets = args.chunkBuckets;
 
     var bClient = FetchClient.init(gpa, args.io);
     var rClient = FetchClient.init(gpa, args.io);
@@ -256,9 +257,15 @@ fn worker(args: *WorkerArgs) !void {
         result.* = BlockResult.init();
         result.blockNum = blockNum;
 
-        fetchAndTransform(gpa, rpcNode, blockNum, chunkSize, &bClient, &rClient, &tClient, result);
-        // result.ok=false means fetch/parse failed; AccumState skips it but it still
-        // flows through the channel so the main loop tracks worker progress correctly.
+        switch (fetchAndTransform(gpa, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
+            .ok           => result.ok = true,
+            .skip_missing => {}, // ok=false, err=null: AccumState skips, channel tracks progress
+            .retry_later  => unreachable, // loop inside fetchAndTransform handles retries
+            .fatal        => |e| {
+                result.err = e;
+                std.debug.print("[worker] block={d} fatal: {s}\n", .{ blockNum, @errorName(e) });
+            },
+        }
         args.chan.push(result);
     }
 }
@@ -395,17 +402,18 @@ const PrevSave = struct {
 // ─── runHistorical ────────────────────────────────────────────────────────────
 
 pub fn runHistorical(
-    io:         std.Io,
-    gpa:        Allocator,
-    chain:      *const EvmChainConfig,
-    from:       u64,
-    to:         u64,
-    scyllaHost: []const u8,
-    scyllaPort: u16,
-    scyllaKs:   []const u8,
-    scyllaUser: []const u8,
-    scyllaPass: []const u8,
-    redisUrl:   []const u8,
+    io:           std.Io,
+    gpa:          Allocator,
+    chain:        *const EvmChainConfig,
+    from:         u64,
+    to:           u64,
+    scyllaHost:   []const u8,
+    scyllaPort:   u16,
+    scyllaKs:     []const u8,
+    scyllaUser:   []const u8,
+    scyllaPass:   []const u8,
+    redisUrl:     []const u8,
+    chunkBuckets: u64,
 ) !void {
     if (from > to) return;
 
@@ -413,8 +421,9 @@ pub fn runHistorical(
     const bs          = scylla.BatchSizes.fromChain(chain.indexingOptions);
     const rUrl        = redis.parseUrl(redisUrl);
 
-    std.debug.print("Historical: blocks {d}→{d}  workers={d}  save_every={d}\n\n",
-        .{ from, to, workerCount, SAVE_EVERY });
+    std.debug.print(
+        "Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,3,6,20,1,1\n\n",
+        .{ from, to, workerCount, SAVE_EVERY, chunkBuckets });
 
     // Open 32 persistent CQL connections: split 1,3,6,20,1,1 (blocks,txs,contracts,logs,itxs,comp).
     // Arrays are init one-at-a-time; cXxxN tracks how many succeeded so the
@@ -468,12 +477,13 @@ pub fn runHistorical(
     for (0..workerCount) |w| {
         const wargs = try gpa.create(WorkerArgs);
         wargs.* = .{
-            .io    = io,
-            .gpa   = gpa,
-            .chain = chain,
-            .next  = &next,
-            .to    = to,
-            .chan  = &chan,
+            .io           = io,
+            .gpa          = gpa,
+            .chain        = chain,
+            .next         = &next,
+            .to           = to,
+            .chan         = &chan,
+            .chunkBuckets = chunkBuckets,
         };
         threads[w] = try std.Thread.spawn(
             .{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
@@ -493,6 +503,14 @@ pub fn runHistorical(
                 .{ result.blockNum, @errorName(e) });
             result.deinit();
             gpa.destroy(result);
+            accum.deinit();
+            gpa.destroy(accum);
+            if (prevSave) |*ps| {
+                ps.thread.join();
+                gpa.destroy(ps.args);
+                ps.accum.deinit();
+                gpa.destroy(ps.accum);
+            }
             return e;
         }
         try accum.add(result);
@@ -567,20 +585,29 @@ pub fn processBlock(
     const getConsistentBlockData = core.getConsistentBlockData;
     const maybeData = getConsistentBlockData(gpa, io, .{
         .rpcNode = rpcNode, .blockNumber = blockNum,
-    }) catch return false;
+    }) catch |e| {
+        std.debug.print("[realtime] block={d} stage=fetch error: {s}\n", .{ blockNum, @errorName(e) });
+        return false;
+    };
 
-    var data = maybeData orelse return false;
+    var data = maybeData orelse return false; // retryable: block not yet available
     defer data.deinit(gpa);
 
     _ = arena.reset(.retain_capacity);
     const arenaAlloc = arena.allocator();
 
-    const block    = (try rpcSpec.parseBlockRespZC(data.block.body, arenaAlloc))    orelse return false;
+    const block = (try rpcSpec.parseBlockRespZC(data.block.body, arenaAlloc)) orelse {
+        std.debug.print("[realtime] block={d} stage=parse_block: null result\n", .{blockNum});
+        return false;
+    };
     const receipts = (try rpcSpec.parseReceiptsRespZC(data.receipts.body, arenaAlloc)) orelse &.{};
-    const traces   = (try rpcSpec.parseTracesRespZC(data.traces.body, arenaAlloc))  orelse &.{};
+    const traces   = (try rpcSpec.parseTracesRespZC(data.traces.body, arenaAlloc))     orelse &.{};
 
     var ent = transform.initEntities();
-    transform.transformBlock(arenaAlloc, block, receipts, traces, chunkSize, &ent) catch return false;
+    transform.transformBlock(arenaAlloc, block, receipts, traces, chunkSize, &ent) catch |e| {
+        std.debug.print("[realtime] block={d} stage=transform error: {s}\n", .{ blockNum, @errorName(e) });
+        return false;
+    };
 
     try scylla.saveBlock(cql, &ent, bs);
 

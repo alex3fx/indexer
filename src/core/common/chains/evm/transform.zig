@@ -108,6 +108,7 @@ pub const Entities = struct {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Invalid or missing numeric RPC values intentionally become 0.
 pub fn hexToI64(s: []const u8) i64 {
     var p = s;
     if (p.len >= 2 and p[0] == '0' and (p[1] == 'x' or p[1] == 'X')) p = p[2..];

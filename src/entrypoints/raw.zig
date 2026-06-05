@@ -102,6 +102,10 @@ pub fn main(init: Init) !void {
     );
 
     // ── Historical sync ───────────────────────────────────────────────────────
+    const chunkBuckets: u64 = if (init.environ_map.get("SCYLLA_CHUNK_BUCKETS")) |v|
+        std.fmt.parseInt(u64, v, 10) catch 24
+    else 24;
+
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
             io, gpa, &chain,
@@ -110,6 +114,7 @@ pub fn main(init: Init) !void {
             env.SCYLLA_DB_KEYSPACE,
             env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD,
             redisUrl,
+            chunkBuckets,
         );
     }
 

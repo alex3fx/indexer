@@ -484,30 +484,30 @@ pub fn saveBlock(conn: *CqlConn, ent: *const transform.Entities, bs: BatchSizes)
 }
 
 // ─── Parallel save: N entities over 32 CQL connections ───────────────────────
-// EntSliceGroup: blocks or contracts (sequential over all entities on one conn).
-// EntSliceLaneGroup: txs/logs/itxs (each lane handles 1/N of the rows).
+// TableSave: blocks or contracts — sequential over all entities on one connection.
+// TableLaneSave: txs/logs/itxs — each lane handles 1/N of the rows in parallel.
 
-const EntSliceGroup = struct {
+const TableSave = struct {
     conn: *CqlConn,
     ents: []*const transform.Entities,
     bs:   BatchSizes,
     err:  ?anyerror = null,
 };
 
-fn saveEntSliceGroupA(g: *EntSliceGroup) void {
+fn saveBlockRowsForEntities(g: *TableSave) void {
     for (g.ents) |ent| {
         saveBlocks(g.conn, ent.blocks.items, g.bs.blocks) catch |e| { g.err = e; return; };
     }
 }
 
-fn saveEntSliceGroupContracts(g: *EntSliceGroup) void {
+fn saveContractRowsForEntities(g: *TableSave) void {
     for (g.ents) |ent| {
         saveContracts(g.conn, ent.contracts.items, g.bs.contracts) catch |e| { g.err = e; return; };
         saveContractsByAddr(g.conn, ent.contractsByAddr.items, g.bs.contracts) catch |e| { g.err = e; return; };
     }
 }
 
-const EntSliceLaneGroup = struct {
+const TableLaneSave = struct {
     conn:   *CqlConn,
     ents:   []*const transform.Entities,
     bs:     BatchSizes,
@@ -516,7 +516,7 @@ const EntSliceLaneGroup = struct {
     err:    ?anyerror = null,
 };
 
-fn saveEntSliceLogsLane(g: *EntSliceLaneGroup) void {
+fn saveEntSliceLogsLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(transform.LogRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -528,7 +528,7 @@ fn saveEntSliceLogsLane(g: *EntSliceLaneGroup) void {
     saveLogs(g.conn, rows.items, g.bs.logs) catch |e| { g.err = e; return; };
 }
 
-fn saveEntSliceItxsLane(g: *EntSliceLaneGroup) void {
+fn saveEntSliceItxsLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(transform.InternalTxRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -540,7 +540,7 @@ fn saveEntSliceItxsLane(g: *EntSliceLaneGroup) void {
     saveInternalTxs(g.conn, rows.items, g.bs.itxs) catch |e| { g.err = e; return; };
 }
 
-fn saveEntSliceTxsLane(g: *EntSliceLaneGroup) void {
+fn saveEntSliceTxsLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(transform.TxRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -584,7 +584,7 @@ fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const transform.Entities) 
         if (enc > 0) {
             starts[enc] = batchBuf.items.len;
             for (0..enc) |k| ptrs[k] = batchBuf.items[starts[k]..starts[k + 1]];
-            try conn.batchSendRows(conn.prepIds.blockCompletions, 6, ptrs[0..enc]);
+            try conn.batchSendRows(conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
         }
         i = end;
     }
@@ -609,11 +609,11 @@ pub fn saveEntitiesParallel(
 ) !void {
     if (ents.len == 0) return;
 
-    var gBlocks    = EntSliceGroup{ .conn = connBlocks,    .ents = ents, .bs = bs };
-    var gContracts = EntSliceGroup{ .conn = connContracts, .ents = ents, .bs = bs };
-    var gTxs:  [ACCUM_TXS_LANES]EntSliceLaneGroup = undefined;
-    var gLogs: [ACCUM_LOG_LANES]EntSliceLaneGroup = undefined;
-    var gItxs: [ACCUM_ITX_LANES]EntSliceLaneGroup = undefined;
+    var gBlocks    = TableSave{ .conn = connBlocks,    .ents = ents, .bs = bs };
+    var gContracts = TableSave{ .conn = connContracts, .ents = ents, .bs = bs };
+    var gTxs:  [ACCUM_TXS_LANES]TableLaneSave = undefined;
+    var gLogs: [ACCUM_LOG_LANES]TableLaneSave = undefined;
+    var gItxs: [ACCUM_ITX_LANES]TableLaneSave = undefined;
 
     for (0..ACCUM_TXS_LANES) |i|
         gTxs[i]  = .{ .conn = &connTxs[i],  .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_TXS_LANES };
@@ -641,10 +641,10 @@ pub fn saveEntitiesParallel(
         threads[spawned] = try std.Thread.spawn(.{}, saveEntSliceItxsLane, .{&gItxs[i]});
         spawned += 1;
     }
-    threads[spawned] = try std.Thread.spawn(.{}, saveEntSliceGroupA, .{&gBlocks});
+    threads[spawned] = try std.Thread.spawn(.{}, saveBlockRowsForEntities, .{&gBlocks});
     spawned += 1;
 
-    saveEntSliceGroupContracts(&gContracts);
+    saveContractRowsForEntities(&gContracts);
 
     for (threads[0..spawned]) |t| t.join();
 
@@ -658,6 +658,14 @@ pub fn saveEntitiesParallel(
 }
 
 // ─── Low-level table writers ──────────────────────────────────────────────────
+// Column counts match the prepared statement parameter counts (schema order).
+const BLOCK_COLS:        u16 = 5;
+const TX_COLS:           u16 = 21;
+const LOG_COLS:          u16 = 15;
+const ITX_COLS:          u16 = 10;
+const CONTRACT_COLS:     u16 = 13;
+const CONTRACT_CBA_COLS: u16 = 8;
+const COMPLETION_COLS:   u16 = 6;
 
 fn saveBlocks(conn: *CqlConn, rows: []const transform.BlockRow, bs: usize) !void {
     if (rows.len == 0) return;
@@ -679,7 +687,7 @@ fn saveBlocks(conn: *CqlConn, rows: []const transform.BlockRow, bs: usize) !void
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.blocks, 5, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.blocks, BLOCK_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -712,7 +720,7 @@ fn saveTxs(conn: *CqlConn, rows: []const transform.TxRow, bs: usize) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.transactions, 21, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.transactions, TX_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -742,7 +750,7 @@ fn saveLogs(conn: *CqlConn, rows: []const transform.LogRow, bs: usize) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.logs, 15, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.logs, LOG_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -770,7 +778,7 @@ fn saveInternalTxs(conn: *CqlConn, rows: []const transform.InternalTxRow, bs: us
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.internalTxs, 10, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -799,7 +807,7 @@ fn saveContracts(conn: *CqlConn, rows: []const transform.ContractRow, bs: usize)
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.contracts, 13, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -825,7 +833,7 @@ fn saveContractsByAddr(conn: *CqlConn, rows: []const transform.ContractByAddrRow
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.contractsByAddr, 8, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -859,7 +867,7 @@ fn saveBlockCompletions(conn: *CqlConn, ent: *const transform.Entities) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.blockCompletions, 6, ptrs[0..enc]);
+        try conn.batchSendRows(conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
         i = bEnd;
     }
 }
