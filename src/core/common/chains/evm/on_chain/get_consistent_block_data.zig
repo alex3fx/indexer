@@ -9,8 +9,12 @@ const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
 const FetchClient = core.fetch.Client;
 
 pub const Options = struct {
-    rpcNode: EvmRpcNodeConfig,
-    blockNumber: u64,
+    rpcNode:        EvmRpcNodeConfig,
+    blockNumber:    u64,
+    blockClient:    ?*FetchClient = null,
+    receiptsClient: ?*FetchClient = null,
+    tracesClient:   ?*FetchClient = null,
+    skipLogs:       bool = false,  // skip flattenReceiptLogs (workers don't use data.logs)
 };
 
 pub const Response = struct {
@@ -53,35 +57,34 @@ pub fn getConsistentBlockData(
     const block_number = try utils.toHex(allocator, options.blockNumber);
     defer allocator.free(block_number);
 
-    if (try fetchResponseSet(allocator, io, options.rpcNode, block_number)) |set| {
-        return try buildResponse(allocator, options.blockNumber, set);
+    if (try fetchResponseSet(allocator, io, options.rpcNode, block_number,
+        options.blockClient, options.receiptsClient, options.tracesClient)) |set| {
+        return try buildResponse(allocator, options.blockNumber, set, options.skipLogs);
     }
 
-    if (try fetchResponseSet(allocator, io, options.rpcNode, block_number)) |set| {
-        return try buildResponse(allocator, options.blockNumber, set);
+    if (try fetchResponseSet(allocator, io, options.rpcNode, block_number,
+        options.blockClient, options.receiptsClient, options.tracesClient)) |set| {
+        return try buildResponse(allocator, options.blockNumber, set, options.skipLogs);
     }
 
     return null;
 }
 
-fn buildResponse(allocator: Allocator, height: u64, set: ResponseSet) !Response {
+fn buildResponse(allocator: Allocator, height: u64, set: ResponseSet, skipLogs: bool) !Response {
     var responses = set;
     errdefer responses.deinit(allocator);
 
-    const transactions = try rpc.jsonObjectFieldSlice(
-        allocator,
-        responses.block.result,
-        "transactions",
-    ) orelse return error.BlockTransactionsMissing;
-
-    const logs = try flattenReceiptLogs(allocator, responses.receipts.result);
-    errdefer allocator.free(logs);
+    const logs: []u8 = if (skipLogs) &.{} else blk: {
+        const l = try flattenReceiptLogs(allocator, responses.receipts.result);
+        errdefer allocator.free(l);
+        break :blk l;
+    };
 
     return .{
         .height = height,
         .parallelFetchElapsedNs = responses.parallelFetchElapsedNs,
         .block = responses.block,
-        .transactions = transactions,
+        .transactions = &.{},
         .receipts = responses.receipts,
         .logs = logs,
         .traces = responses.traces,
@@ -89,37 +92,42 @@ fn buildResponse(allocator: Allocator, height: u64, set: ResponseSet) !Response 
 }
 
 fn fetchResponseSet(
-    allocator: Allocator,
-    io: std.Io,
-    rpcNode: EvmRpcNodeConfig,
-    blockNumber: []const u8,
+    allocator:    Allocator,
+    io:           std.Io,
+    rpcNode:      EvmRpcNodeConfig,
+    blockNumber:  []const u8,
+    ext_block:    ?*FetchClient,
+    ext_receipts: ?*FetchClient,
+    ext_traces:   ?*FetchClient,
 ) !?ResponseSet {
     const started_at_ns = monotonicNs();
 
-    var block_client = FetchClient.init(allocator, io);
-    defer block_client.deinit();
+    var tmp_block    = FetchClient.init(allocator, io);
+    var tmp_receipts = FetchClient.init(allocator, io);
+    var tmp_traces   = FetchClient.init(allocator, io);
+    defer if (ext_block    == null) tmp_block.deinit();
+    defer if (ext_receipts == null) tmp_receipts.deinit();
+    defer if (ext_traces   == null) tmp_traces.deinit();
 
-    var receipts_client = FetchClient.init(allocator, io);
-    defer receipts_client.deinit();
+    const block_client    = ext_block    orelse &tmp_block;
+    const receipts_client = ext_receipts orelse &tmp_receipts;
+    const traces_client   = ext_traces   orelse &tmp_traces;
 
-    var traces_client = FetchClient.init(allocator, io);
-    defer traces_client.deinit();
-
-    var block_task = try rpc.requestWithRpcNode(allocator, &block_client, .getBlockWithTransactionsByNumber, .{
+    var block_task = try rpc.requestWithRpcNode(allocator, block_client, .getBlockWithTransactionsByNumber, .{
         .rpcNode = rpcNode,
         .number = blockNumber,
     });
     var block_task_pending = true;
     errdefer if (block_task_pending) discardTask(&block_task, allocator);
 
-    var receipts_task = try rpc.requestWithRpcNode(allocator, &receipts_client, .getBlockReceipts, .{
+    var receipts_task = try rpc.requestWithRpcNode(allocator, receipts_client, .getBlockReceipts, .{
         .rpcNode = rpcNode,
         .number = blockNumber,
     });
     var receipts_task_pending = true;
     errdefer if (receipts_task_pending) discardTask(&receipts_task, allocator);
 
-    var traces_task = try rpc.requestWithRpcNode(allocator, &traces_client, .getBlockTraces, .{
+    var traces_task = try rpc.requestWithRpcNode(allocator, traces_client, .getBlockTraces, .{
         .rpcNode = rpcNode,
         .number = blockNumber,
     });

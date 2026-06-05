@@ -140,7 +140,7 @@ fn requestSync(
         return null;
     }
 
-    const result = try jsonRpcResultSlice(allocator, response.body) orelse {
+    const result = jsonRpcResultSlice(response.body) orelse {
         response.deinit(allocator);
         return null;
     };
@@ -184,8 +184,19 @@ fn makePayload(
     };
 }
 
-fn jsonRpcResultSlice(allocator: Allocator, body: []const u8) !?[]const u8 {
-    return jsonObjectFieldSlice(allocator, body, "result");
+fn jsonRpcResultSlice(body: []const u8) ?[]const u8 {
+    const needle = "\"result\":";
+    const pos = std.mem.indexOf(u8, body, needle) orelse return null;
+    var i = pos + needle.len;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ' ', '\t', '\n', '\r' => {},
+            else => break,
+        }
+    }
+    if (i >= body.len) return null;
+    if (body[i] == 'n') return null; // null result → block not yet available
+    return body[i..];
 }
 
 pub fn jsonObjectFieldSlice(allocator: Allocator, body: []const u8, field: []const u8) !?[]const u8 {
