@@ -516,7 +516,7 @@ const TableLaneSave = struct {
     err:    ?anyerror = null,
 };
 
-fn saveEntSliceLogsLane(g: *TableLaneSave) void {
+fn saveLogRowsForLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(transform.LogRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -528,7 +528,7 @@ fn saveEntSliceLogsLane(g: *TableLaneSave) void {
     saveLogs(g.conn, rows.items, g.bs.logs) catch |e| { g.err = e; return; };
 }
 
-fn saveEntSliceItxsLane(g: *TableLaneSave) void {
+fn saveItxRowsForLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(transform.InternalTxRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -540,7 +540,7 @@ fn saveEntSliceItxsLane(g: *TableLaneSave) void {
     saveInternalTxs(g.conn, rows.items, g.bs.itxs) catch |e| { g.err = e; return; };
 }
 
-fn saveEntSliceTxsLane(g: *TableLaneSave) void {
+fn saveTxRowsForLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(transform.TxRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -630,15 +630,15 @@ pub fn saveEntitiesParallel(
     errdefer for (threads[0..spawned]) |t| t.join();
 
     for (0..ACCUM_TXS_LANES) |i| {
-        threads[spawned] = try std.Thread.spawn(.{}, saveEntSliceTxsLane, .{&gTxs[i]});
+        threads[spawned] = try std.Thread.spawn(.{}, saveTxRowsForLane, .{&gTxs[i]});
         spawned += 1;
     }
     for (0..ACCUM_LOG_LANES) |i| {
-        threads[spawned] = try std.Thread.spawn(.{}, saveEntSliceLogsLane, .{&gLogs[i]});
+        threads[spawned] = try std.Thread.spawn(.{}, saveLogRowsForLane, .{&gLogs[i]});
         spawned += 1;
     }
     for (0..ACCUM_ITX_LANES) |i| {
-        threads[spawned] = try std.Thread.spawn(.{}, saveEntSliceItxsLane, .{&gItxs[i]});
+        threads[spawned] = try std.Thread.spawn(.{}, saveItxRowsForLane, .{&gItxs[i]});
         spawned += 1;
     }
     threads[spawned] = try std.Thread.spawn(.{}, saveBlockRowsForEntities, .{&gBlocks});

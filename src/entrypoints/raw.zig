@@ -103,8 +103,11 @@ pub fn main(init: Init) !void {
 
     // ── Historical sync ───────────────────────────────────────────────────────
     const chunkBuckets: u64 = if (init.environ_map.get("SCYLLA_CHUNK_BUCKETS")) |v|
-        std.fmt.parseInt(u64, v, 10) catch 24
-    else 24;
+        std.fmt.parseInt(u64, v, 10) catch {
+            std.debug.print("Invalid SCYLLA_CHUNK_BUCKETS: {s}\n", .{v});
+            return error.InvalidEnv;
+        }
+    else pipeline.SCYLLA_CHUNK_BUCKETS_DEFAULT;
 
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
@@ -159,11 +162,17 @@ pub fn main(init: Init) !void {
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                const ok = try pipeline.processBlock(io, gpa, &chain, &cql, &realtimeRedis,
-                                                      blk, &arena);
-                if (ok) break;
-                const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
-                _ = std.os.linux.nanosleep(&ts, null);
+                switch (pipeline.processBlock(io, gpa, &chain, &cql, &realtimeRedis, blk, &arena)) {
+                    .saved       => break,
+                    .retry_later => {
+                        const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
+                        _ = std.os.linux.nanosleep(&ts, null);
+                    },
+                    .fatal => |e| {
+                        std.debug.print("[realtime] block={d} fatal: {s}\n", .{ blk, @errorName(e) });
+                        break;
+                    },
+                }
             }
             if (attempts == 5) {
                 std.debug.print("[realtime] block {d}: skipped after 5 attempts\n", .{blk});

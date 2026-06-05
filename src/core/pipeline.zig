@@ -1,7 +1,7 @@
 // Historical pipeline: MPSC work-queue, accumulator + double-buffer save.
 //
 // N persistent workers atomically claim blocks, fetch+transform, push *BlockResult
-// to a pipe channel.  Workers never touch Scylla — no hang on heavy blocks.
+// to a pipe channel.  Workers never touch Scylla; heavy writes are isolated in the save stage.
 //
 // Main thread accumulates SAVE_EVERY results, then saves in a background thread
 // while workers keep fetching the next batch (fetch and save overlap).
@@ -54,9 +54,16 @@ fn fetchBlock(
     var tTask = try rpcApi.requestWithRpcNode(gpa, tClient, .getBlockTraces, .{
         .rpcNode = rpcNode, .number = numHex });
 
-    const bRes = bTask.join() catch null;
-    const rRes = rTask.join() catch null;
-    const tRes = tTask.join() catch null;
+    const bRes = bTask.join() catch |e| {
+        _ = rTask.join() catch {};
+        _ = tTask.join() catch {};
+        return e;
+    };
+    const rRes = rTask.join() catch |e| {
+        _ = tTask.join() catch {};
+        return e;
+    };
+    const tRes = try tTask.join();
 
     if (bRes == null or rRes == null or tRes == null) {
         if (bRes) |r| { var x = r; x.deinit(gpa); }
@@ -87,7 +94,7 @@ const SAVE_EVERY: usize = 24;
 // Logical chunk bucket count: chunk = blockNum % SCYLLA_CHUNK_BUCKETS.
 // Distributes rows across Scylla partitions; set to match the cluster's SMP count.
 // Override via env SCYLLA_CHUNK_BUCKETS (default 24).
-const SCYLLA_CHUNK_BUCKETS_DEFAULT: u64 = 24;
+pub const SCYLLA_CHUNK_BUCKETS_DEFAULT: u64 = 24;
 
 // Connection split matching production SPLIT=1,3,6,20,1,1.
 const TXS_LANES: usize = scylla.ACCUM_TXS_LANES;
@@ -173,6 +180,7 @@ const WorkerArgs = struct {
     to:           u64,
     chan:          *ResultChan,
     chunkBuckets: u64,
+    cancel:       *std.atomic.Value(bool),
 };
 
 const FetchTransformStatus = union(enum) {
@@ -184,6 +192,7 @@ const FetchTransformStatus = union(enum) {
 
 // Fetch, parse and transform one block into result.ent.
 // Returns the outcome as an explicit tagged union; caller decides how to handle each case.
+// retry_later: null RPC response — caller is responsible for sleep/backoff/cancel checks.
 fn fetchAndTransform(
     gpa:          Allocator,
     rpcNode:      EvmRpcNodeConfig,
@@ -195,35 +204,29 @@ fn fetchAndTransform(
     tClient:      *FetchClient,
     result:       *BlockResult,
 ) FetchTransformStatus {
-    while (true) {
-        const maybeData = fetchBlock(gpa, rpcNode, blockNum, bClient, rClient, tClient) catch |e|
-            return .{ .fatal = e };
-        var data = maybeData orelse {
-            const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
-            _ = linux.nanosleep(&ts, null);
-            continue;
-        };
-        defer data.deinit(gpa);
+    const maybeData = fetchBlock(gpa, rpcNode, blockNum, bClient, rClient, tClient) catch |e|
+        return .{ .fatal = e };
+    var data = maybeData orelse return .retry_later;
+    defer data.deinit(gpa);
 
-        const aa    = result.arena.allocator();
-        const block = rpcSpec.parseBlockResp(data.blockBody, aa) catch |e|
-            return .{ .fatal = e };
-        if (block == null) return .skip_missing;
-        const receipts = (rpcSpec.parseReceiptsResp(data.receiptsBody, aa) catch null) orelse &.{};
-        const traces   = (rpcSpec.parseTracesResp(data.tracesBody, aa)     catch null) orelse &.{};
+    const aa    = result.arena.allocator();
+    const block = rpcSpec.parseBlockResp(data.blockBody, aa) catch |e|
+        return .{ .fatal = e };
+    if (block == null) return .skip_missing;
+    const receipts = (rpcSpec.parseReceiptsResp(data.receiptsBody, aa) catch null) orelse &.{};
+    const traces   = (rpcSpec.parseTracesResp(data.tracesBody, aa)     catch null) orelse &.{};
 
-        transform.transformBlockWithRemap(
-            aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
-        ) catch |e| return .{ .fatal = e };
+    transform.transformBlockWithRemap(
+        aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
+    ) catch |e| return .{ .fatal = e };
 
-        std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
-            blockNum,
-            result.ent.txs.items.len,
-            result.ent.logs.items.len,
-            result.ent.internalTxs.items.len,
-        });
-        return .ok;
-    }
+    std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
+        blockNum,
+        result.ent.txs.items.len,
+        result.ent.logs.items.len,
+        result.ent.internalTxs.items.len,
+    });
+    return .ok;
 }
 
 fn workerEntry(args: *WorkerArgs) void {
@@ -250,6 +253,7 @@ fn worker(args: *WorkerArgs) !void {
     defer tClient.deinit();
 
     while (true) {
+        if (args.cancel.load(.acquire)) break;
         const blockNum = args.next.fetchAdd(1, .monotonic);
         if (blockNum > args.to) break;
 
@@ -257,14 +261,29 @@ fn worker(args: *WorkerArgs) !void {
         result.* = BlockResult.init();
         result.blockNum = blockNum;
 
-        switch (fetchAndTransform(gpa, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
-            .ok           => result.ok = true,
-            .skip_missing => {}, // ok=false, err=null: AccumState skips, channel tracks progress
-            .retry_later  => unreachable, // loop inside fetchAndTransform handles retries
-            .fatal        => |e| {
-                result.err = e;
-                std.debug.print("[worker] block={d} fatal: {s}\n", .{ blockNum, @errorName(e) });
-            },
+        retry: while (true) {
+            switch (fetchAndTransform(gpa, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
+                .ok           => { result.ok = true; break :retry; },
+                .skip_missing => {
+                    // ok=false, err=null: AccumState skips, channel tracks progress
+                    std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
+                    break :retry;
+                },
+                .retry_later  => {
+                    if (args.cancel.load(.acquire)) break :retry;
+                    const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
+                    _ = linux.nanosleep(&ts, null);
+                    // Reset arena and entities for next attempt
+                    result.arena.deinit();
+                    result.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    result.ent = transform.initEntities();
+                },
+                .fatal        => |e| {
+                    result.err = e;
+                    std.debug.print("[worker] block={d} fatal: {s}\n", .{ blockNum, @errorName(e) });
+                    break :retry;
+                },
+            }
         }
         args.chan.push(result);
     }
@@ -468,8 +487,9 @@ pub fn runHistorical(
     if (rUrl.db > 0) rdb.selectDb(rUrl.db) catch {};
 
     // Spawn N persistent workers.
-    var next = std.atomic.Value(u64).init(from);
-    var chan  = try ResultChan.init(@intCast(workerCount));
+    var next   = std.atomic.Value(u64).init(from);
+    var cancel = std.atomic.Value(bool).init(false);
+    var chan    = try ResultChan.init(@intCast(workerCount));
     defer chan.deinit();
 
     const threads = try gpa.alloc(std.Thread, workerCount);
@@ -484,6 +504,7 @@ pub fn runHistorical(
             .to           = to,
             .chan         = &chan,
             .chunkBuckets = chunkBuckets,
+            .cancel       = &cancel,
         };
         threads[w] = try std.Thread.spawn(
             .{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
@@ -503,6 +524,10 @@ pub fn runHistorical(
                 .{ result.blockNum, @errorName(e) });
             result.deinit();
             gpa.destroy(result);
+            // Signal workers to stop, drain remaining results, then join all threads.
+            cancel.store(true, .release);
+            while (chan.pop()) |r| { r.deinit(); gpa.destroy(r); }
+            for (threads) |t| t.join();
             accum.deinit();
             gpa.destroy(accum);
             if (prevSave) |*ps| {
@@ -569,6 +594,12 @@ pub fn runHistorical(
 
 // ─── processBlock (realtime) ──────────────────────────────────────────────────
 
+pub const ProcessBlockStatus = union(enum) {
+    saved,
+    retry_later,  // block not yet available — caller should retry
+    fatal: anyerror,
+};
+
 pub fn processBlock(
     io:       std.Io,
     gpa:      Allocator,
@@ -577,7 +608,7 @@ pub fn processBlock(
     rdb:      *redis.Conn,
     blockNum: u64,
     arena:    *std.heap.ArenaAllocator,
-) !bool {
+) ProcessBlockStatus {
     const rpcNode   = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
     const bs = scylla.BatchSizes.fromChain(chain.indexingOptions);
@@ -587,33 +618,36 @@ pub fn processBlock(
         .rpcNode = rpcNode, .blockNumber = blockNum,
     }) catch |e| {
         std.debug.print("[realtime] block={d} stage=fetch error: {s}\n", .{ blockNum, @errorName(e) });
-        return false;
+        return .{ .fatal = e };
     };
 
-    var data = maybeData orelse return false; // retryable: block not yet available
+    var data = maybeData orelse return .retry_later;
     defer data.deinit(gpa);
 
     _ = arena.reset(.retain_capacity);
     const arenaAlloc = arena.allocator();
 
-    const block = (try rpcSpec.parseBlockRespZC(data.block.body, arenaAlloc)) orelse {
+    const block = (rpcSpec.parseBlockRespZC(data.block.body, arenaAlloc) catch |e| {
+        std.debug.print("[realtime] block={d} stage=parse_block error: {s}\n", .{ blockNum, @errorName(e) });
+        return .{ .fatal = e };
+    }) orelse {
         std.debug.print("[realtime] block={d} stage=parse_block: null result\n", .{blockNum});
-        return false;
+        return .retry_later;
     };
-    const receipts = (try rpcSpec.parseReceiptsRespZC(data.receipts.body, arenaAlloc)) orelse &.{};
-    const traces   = (try rpcSpec.parseTracesRespZC(data.traces.body, arenaAlloc))     orelse &.{};
+    const receipts = (rpcSpec.parseReceiptsRespZC(data.receipts.body, arenaAlloc) catch null) orelse &.{};
+    const traces   = (rpcSpec.parseTracesRespZC(data.traces.body, arenaAlloc)     catch null) orelse &.{};
 
     var ent = transform.initEntities();
     transform.transformBlock(arenaAlloc, block, receipts, traces, chunkSize, &ent) catch |e| {
         std.debug.print("[realtime] block={d} stage=transform error: {s}\n", .{ blockNum, @errorName(e) });
-        return false;
+        return .{ .fatal = e };
     };
 
-    try scylla.saveBlock(cql, &ent, bs);
+    scylla.saveBlock(cql, &ent, bs) catch |e| return .{ .fatal = e };
 
     var cursorBuf: [20]u8 = undefined;
     const cursorStr = std.fmt.bufPrint(&cursorBuf, "{d}", .{blockNum}) catch unreachable;
-    try rdb.setWithRetry("LATEST_PROCESSED_BLOCK_NUMBER", cursorStr);
+    rdb.setWithRetry("LATEST_PROCESSED_BLOCK_NUMBER", cursorStr) catch |e| return .{ .fatal = e };
 
-    return true;
+    return .saved;
 }
