@@ -31,9 +31,8 @@ fn nowNs() i64 {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-// Accumulate this many blocks before each Scylla flush.
-// Matches production SAVE_EVERY=24: keeps batches small → low Scylla latency.
-const SAVE_EVERY: usize = 24;
+// Default accumulator batch size; override via env SAVE_EVERY.
+pub const SAVE_EVERY_DEFAULT: usize = 24;
 
 // Logical chunk bucket count: chunk = blockNum % SCYLLA_CHUNK_BUCKETS.
 // Distributes rows across Scylla partitions; set to match the cluster's SMP count.
@@ -359,6 +358,7 @@ pub fn runHistorical(
     scyllaPass:   []const u8,
     redisUrl:     []const u8,
     chunkBuckets: u64,
+    saveEvery:    usize,
 ) !void {
     if (from > to) return;
 
@@ -368,7 +368,7 @@ pub fn runHistorical(
 
     std.debug.print(
         "Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,3,6,20,1,1\n\n",
-        .{ from, to, workerCount, SAVE_EVERY, chunkBuckets });
+        .{ from, to, workerCount, saveEvery, chunkBuckets });
 
     var cBlocks = try pool.CqlConn.init(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
     defer cBlocks.deinit();
@@ -460,7 +460,7 @@ pub fn runHistorical(
         }
         try accum.add(result);
 
-        if (accum.entPtrs.items.len >= SAVE_EVERY) {
+        if (accum.entPtrs.items.len >= saveEvery) {
             if (prevSave) |*ps| {
                 try ps.finish(gpa, &blocksDone, t0);
                 prevSave = null;

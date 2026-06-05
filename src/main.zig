@@ -113,6 +113,13 @@ pub fn main(init: Init) !void {
         }
     else pipeline.SCYLLA_CHUNK_BUCKETS_DEFAULT;
 
+    const saveEvery: usize = if (init.environ_map.get("SAVE_EVERY")) |v|
+        std.fmt.parseInt(usize, v, 10) catch {
+            std.debug.print("Invalid SAVE_EVERY: {s}\n", .{v});
+            return error.InvalidEnv;
+        }
+    else pipeline.SAVE_EVERY_DEFAULT;
+
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
             io, gpa, &chain,
@@ -122,6 +129,7 @@ pub fn main(init: Init) !void {
             env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD,
             redisUrl,
             chunkBuckets,
+            saveEvery,
         );
     }
 
