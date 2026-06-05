@@ -450,6 +450,54 @@ pub const CqlConn = struct {
     }
 };
 
+// ─── RealtimeConns ────────────────────────────────────────────────────────────
+// 32 persistent CQL connections for parallel per-table writes in realtime mode.
+// Split matches historical: 1 blk + 3 txs + 6 logs + 20 itxs + 1 contracts + 1 comp.
+
+pub const RealtimeConns = struct {
+    blk:       CqlConn,
+    txs:       [ACCUM_TXS_LANES]CqlConn,
+    logs:      [ACCUM_LOG_LANES]CqlConn,
+    itxs:      [ACCUM_ITX_LANES]CqlConn,
+    contracts: CqlConn,
+    comp:      CqlConn,
+
+    pub fn init(
+        gpa:  std.mem.Allocator,
+        host: []const u8, port: u16,
+        ks:   []const u8,
+        user: []const u8, pass: []const u8,
+    ) !RealtimeConns {
+        var self: RealtimeConns = undefined;
+        self.blk       = try CqlConn.init(gpa, host, port, ks, user, pass);
+        for (&self.txs)  |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
+        for (&self.logs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
+        for (&self.itxs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
+        self.contracts = try CqlConn.init(gpa, host, port, ks, user, pass);
+        self.comp      = try CqlConn.init(gpa, host, port, ks, user, pass);
+        return self;
+    }
+
+    pub fn deinit(self: *RealtimeConns) void {
+        self.blk.deinit();
+        for (&self.txs)  |*c| c.deinit();
+        for (&self.logs) |*c| c.deinit();
+        for (&self.itxs) |*c| c.deinit();
+        self.contracts.deinit();
+        self.comp.deinit();
+    }
+};
+
+pub fn saveBlockRt(conns: *RealtimeConns, ent: *const transform.Entities, bs: BatchSizes) !void {
+    const ents = [1]*const transform.Entities{ent};
+    try saveEntitiesParallel(
+        &conns.blk, &conns.txs, &conns.contracts,
+        &conns.logs, &conns.itxs, &conns.comp,
+        @constCast(&ents),
+        bs,
+    );
+}
+
 fn prepareAll(conn: *CqlConn) !PreparedIds {
     return .{
         .blocks           = try conn.prepare(INSERT_BLOCKS),

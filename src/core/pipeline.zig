@@ -22,63 +22,6 @@ const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
 const FetchClient      = core.fetch.Client;
 const Allocator        = std.mem.Allocator;
 
-// ─── Fetch ────────────────────────────────────────────────────────────────────
-
-const FetchedBlock = struct {
-    blockBody:    []u8,
-    receiptsBody: []u8,
-    tracesBody:   []u8,
-
-    fn deinit(self: *FetchedBlock, gpa: Allocator) void {
-        gpa.free(self.blockBody);
-        gpa.free(self.receiptsBody);
-        gpa.free(self.tracesBody);
-    }
-};
-
-fn fetchBlock(
-    gpa:      Allocator,
-    rpcNode:  EvmRpcNodeConfig,
-    blockNum: u64,
-    bClient:  *FetchClient,
-    rClient:  *FetchClient,
-    tClient:  *FetchClient,
-) !?FetchedBlock {
-    const numHex = try utils.toHex(gpa, blockNum);
-    defer gpa.free(numHex);
-
-    var bTask = try rpcApi.requestWithRpcNode(gpa, bClient, .getBlockWithTransactionsByNumber, .{
-        .rpcNode = rpcNode, .number = numHex });
-    var rTask = try rpcApi.requestWithRpcNode(gpa, rClient, .getBlockReceipts, .{
-        .rpcNode = rpcNode, .number = numHex });
-    var tTask = try rpcApi.requestWithRpcNode(gpa, tClient, .getBlockTraces, .{
-        .rpcNode = rpcNode, .number = numHex });
-
-    const bRes = bTask.join() catch |e| {
-        _ = rTask.join() catch {};
-        _ = tTask.join() catch {};
-        return e;
-    };
-    const rRes = rTask.join() catch |e| {
-        _ = tTask.join() catch {};
-        return e;
-    };
-    const tRes = try tTask.join();
-
-    if (bRes == null or rRes == null or tRes == null) {
-        if (bRes) |r| { var x = r; x.deinit(gpa); }
-        if (rRes) |r| { var x = r; x.deinit(gpa); }
-        if (tRes) |r| { var x = r; x.deinit(gpa); }
-        return null;
-    }
-
-    return .{
-        .blockBody    = bRes.?.body,
-        .receiptsBody = rRes.?.body,
-        .tracesBody   = tRes.?.body,
-    };
-}
-
 fn nowNs() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
@@ -195,6 +138,7 @@ const FetchTransformStatus = union(enum) {
 // retry_later: null RPC response — caller is responsible for sleep/backoff/cancel checks.
 fn fetchAndTransform(
     gpa:          Allocator,
+    io:           std.Io,
     rpcNode:      EvmRpcNodeConfig,
     blockNum:     u64,
     chunkSize:    u64,
@@ -204,17 +148,23 @@ fn fetchAndTransform(
     tClient:      *FetchClient,
     result:       *BlockResult,
 ) FetchTransformStatus {
-    const maybeData = fetchBlock(gpa, rpcNode, blockNum, bClient, rClient, tClient) catch |e|
-        return .{ .fatal = e };
+    const maybeData = core.getConsistentBlockData(gpa, io, .{
+        .rpcNode        = rpcNode,
+        .blockNumber    = blockNum,
+        .blockClient    = bClient,
+        .receiptsClient = rClient,
+        .tracesClient   = tClient,
+        .skipLogs       = true,
+    }) catch |e| return .{ .fatal = e };
     var data = maybeData orelse return .retry_later;
     defer data.deinit(gpa);
 
     const aa    = result.arena.allocator();
-    const block = rpcSpec.parseBlockResp(data.blockBody, aa) catch |e|
+    const block = rpcSpec.parseBlockResp(data.block.body, aa) catch |e|
         return .{ .fatal = e };
     if (block == null) return .skip_missing;
-    const receipts = (rpcSpec.parseReceiptsResp(data.receiptsBody, aa) catch null) orelse &.{};
-    const traces   = (rpcSpec.parseTracesResp(data.tracesBody, aa)     catch null) orelse &.{};
+    const receipts = (rpcSpec.parseReceiptsResp(data.receipts.body, aa) catch null) orelse &.{};
+    const traces   = (rpcSpec.parseTracesResp(data.traces.body, aa)     catch null) orelse &.{};
 
     transform.transformBlockWithRemap(
         aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
@@ -262,7 +212,7 @@ fn worker(args: *WorkerArgs) !void {
         result.blockNum = blockNum;
 
         retry: while (true) {
-            switch (fetchAndTransform(gpa, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
+            switch (fetchAndTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
                 .ok           => { result.ok = true; break :retry; },
                 .skip_missing => {
                     // ok=false, err=null: AccumState skips, channel tracks progress
@@ -604,8 +554,11 @@ pub fn processBlock(
     io:       std.Io,
     gpa:      Allocator,
     chain:    *const EvmChainConfig,
-    cql:      *scylla.CqlConn,
+    rtConns:  *scylla.RealtimeConns,
     rdb:      *redis.Conn,
+    bClient:  *FetchClient,
+    rClient:  *FetchClient,
+    tClient:  *FetchClient,
     blockNum: u64,
     arena:    *std.heap.ArenaAllocator,
 ) ProcessBlockStatus {
@@ -613,13 +566,19 @@ pub fn processBlock(
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
     const bs = scylla.BatchSizes.fromChain(chain.indexingOptions);
 
-    const getConsistentBlockData = core.getConsistentBlockData;
-    const maybeData = getConsistentBlockData(gpa, io, .{
-        .rpcNode = rpcNode, .blockNumber = blockNum,
+    const t_fetch = nowNs();
+    const maybeData = core.getConsistentBlockData(gpa, io, .{
+        .rpcNode        = rpcNode,
+        .blockNumber    = blockNum,
+        .blockClient    = bClient,
+        .receiptsClient = rClient,
+        .tracesClient   = tClient,
+        .skipLogs       = true,
     }) catch |e| {
         std.debug.print("[realtime] block={d} stage=fetch error: {s}\n", .{ blockNum, @errorName(e) });
         return .{ .fatal = e };
     };
+    const fetch_ms = @as(f64, @floatFromInt(nowNs() - t_fetch)) / 1e6;
 
     var data = maybeData orelse return .retry_later;
     defer data.deinit(gpa);
@@ -627,6 +586,7 @@ pub fn processBlock(
     _ = arena.reset(.retain_capacity);
     const arenaAlloc = arena.allocator();
 
+    const t_parse = nowNs();
     const block = (rpcSpec.parseBlockRespZC(data.block.body, arenaAlloc) catch |e| {
         std.debug.print("[realtime] block={d} stage=parse_block error: {s}\n", .{ blockNum, @errorName(e) });
         return .{ .fatal = e };
@@ -636,18 +596,31 @@ pub fn processBlock(
     };
     const receipts = (rpcSpec.parseReceiptsRespZC(data.receipts.body, arenaAlloc) catch null) orelse &.{};
     const traces   = (rpcSpec.parseTracesRespZC(data.traces.body, arenaAlloc)     catch null) orelse &.{};
+    const parse_ms = @as(f64, @floatFromInt(nowNs() - t_parse)) / 1e6;
 
+    const t_transform = nowNs();
     var ent = transform.initEntities();
     transform.transformBlock(arenaAlloc, block, receipts, traces, chunkSize, &ent) catch |e| {
         std.debug.print("[realtime] block={d} stage=transform error: {s}\n", .{ blockNum, @errorName(e) });
         return .{ .fatal = e };
     };
+    const transform_ms = @as(f64, @floatFromInt(nowNs() - t_transform)) / 1e6;
 
-    scylla.saveBlock(cql, &ent, bs) catch |e| return .{ .fatal = e };
+    const t_save = nowNs();
+    scylla.saveBlockRt(rtConns, &ent, bs) catch |e| return .{ .fatal = e };
+    const save_ms = @as(f64, @floatFromInt(nowNs() - t_save)) / 1e6;
 
+    const t_cursor = nowNs();
     var cursorBuf: [20]u8 = undefined;
     const cursorStr = std.fmt.bufPrint(&cursorBuf, "{d}", .{blockNum}) catch unreachable;
     rdb.setWithRetry("LATEST_PROCESSED_BLOCK_NUMBER", cursorStr) catch |e| return .{ .fatal = e };
+    const cursor_ms = @as(f64, @floatFromInt(nowNs() - t_cursor)) / 1e6;
+
+    const total_ms = fetch_ms + parse_ms + transform_ms + save_ms + cursor_ms;
+    std.debug.print(
+        "[rt] blk={d} tx={d} log={d} itx={d} | fetch={d:.0} parse={d:.0} xform={d:.0} save={d:.0} cursor={d:.0} | total={d:.0}ms\n",
+        .{ blockNum, ent.txs.items.len, ent.logs.items.len, ent.internalTxs.items.len,
+           fetch_ms, parse_ms, transform_ms, save_ms, cursor_ms, total_ms });
 
     return .saved;
 }

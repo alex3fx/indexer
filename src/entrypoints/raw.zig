@@ -15,6 +15,7 @@ const pipeline    = core.pipeline;
 const redis       = core.redis;
 const ws          = core.ws;
 const scylla      = core.scylla;
+const FetchClient = core.fetch.Client;
 
 pub fn main(init: Init) !void {
     const gpa = init.gpa;
@@ -127,13 +128,14 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     std.debug.print("\nRealtime mode — listening for new blocks via WSS...\n\n", .{});
 
-    // Per-realtime connections.
-    var cql = try scylla.CqlConn.init(gpa,
+    // Per-realtime connections: 32 parallel CQL conns (split 1+3+6+20+1+1).
+    std.debug.print("Connecting realtime CQL (32 conns)...\n", .{});
+    var rtConns = try scylla.RealtimeConns.init(gpa,
         env.SCYLLA_DB_HOST, env.SCYLLA_DB_PORT,
         env.SCYLLA_DB_KEYSPACE,
         env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD,
     );
-    defer cql.deinit();
+    defer rtConns.deinit();
 
     var realtimeRedis = try redis.Conn.init(gpa, rUrl.host, rUrl.port);
     defer realtimeRedis.deinit();
@@ -142,6 +144,13 @@ pub fn main(init: Init) !void {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
+
+    var rtBClient = FetchClient.init(gpa, io);
+    var rtRClient = FetchClient.init(gpa, io);
+    var rtTClient = FetchClient.init(gpa, io);
+    defer rtBClient.deinit();
+    defer rtRClient.deinit();
+    defer rtTClient.deinit();
 
     var cursor = toBlock;
 
@@ -157,12 +166,16 @@ pub fn main(init: Init) !void {
 
         if (blockNum <= cursor) continue;
 
+        // Wait for node to index traces before fetching.
+        const ws_delay_ns = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
+        _ = std.os.linux.nanosleep(&ws_delay_ns, null);
+
         // Process any skipped blocks (gap fill).
         var blk = cursor + 1;
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                switch (pipeline.processBlock(io, gpa, &chain, &cql, &realtimeRedis, blk, &arena)) {
+                switch (pipeline.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena)) {
                     .saved       => break,
                     .retry_later => {
                         const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
