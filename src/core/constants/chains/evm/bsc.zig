@@ -17,7 +17,12 @@ pub const bsc: EvmChainConfig = .{
         .symbol = "BNB",
     },
     .indexingOptions = .{
-        .batchSize = 10,
+        .workerCount = 64,
+        .batchSizeBlocks   = 50,
+        .batchSizeTxs      = 100,
+        .batchSizeLogs     = 200,
+        .batchSizeItxs     = 500,
+        .batchSizeContracts = 50,
         .minifiedChunkSize = 200,
     },
     .rpcNodes = .{

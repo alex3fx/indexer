@@ -13,7 +13,12 @@ pub const EvmNativeCurrency = struct {
 };
 
 pub const EvmIndexingOptions = struct {
-    batchSize: u64,
+    workerCount: u32,
+    batchSizeBlocks: u32,
+    batchSizeTxs: u32,
+    batchSizeLogs: u32,
+    batchSizeItxs: u32,
+    batchSizeContracts: u32,
     minifiedChunkSize: u64,
 };
 
@@ -125,7 +130,8 @@ pub fn makeEvmWellKnownBurnAddressesConfig(comptime addresses: anytype) EvmWellK
         @setEvalBranchQuota(10_000);
 
         const capacity = nextPowerOfTwo(@max(1, addresses.len * 2));
-        var buckets = [_]?[]const u8{null} ** capacity;
+        var buckets: [capacity]?[]const u8 = undefined;
+        @memset(&buckets, null);
 
         for (addresses) |address| {
             const normalized = validateEvmAddress(address);

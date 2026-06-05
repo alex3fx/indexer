@@ -54,11 +54,12 @@ pub const EnvVariable = enum {
     SCYLLA_DB_HOST,
     SCYLLA_DB_PORT,
     SCYLLA_DB_LOCAL_DATACENTER,
+    SCYLLA_DB_KEYSPACE,   // optional, default "eth"
     SCYLLA_DB_USERNAME,
     SCYLLA_DB_PASSWORD,
-    LOGS_GRAYLOG_HOST,
-    LOGS_GRAYLOG_PORT,
-    LOGS_GRAYLOG_APP,
+    LOGS_GRAYLOG_HOST,    // optional, default "127.0.0.1"
+    LOGS_GRAYLOG_PORT,    // optional, default 12201
+    LOGS_GRAYLOG_APP,     // optional, default "indexer"
 };
 
 pub const Mode = enum {

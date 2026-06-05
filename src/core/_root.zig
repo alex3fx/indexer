@@ -4,6 +4,12 @@ pub const enums = @import("enums.zig");
 pub const errors = @import("errors.zig");
 pub const structures = @import("structures.zig");
 pub const fetch = @import("common/fetch.zig");
+pub const scylla = @import("common/scylla.zig");
+pub const redis = @import("common/redis.zig");
+pub const ws = @import("common/ws.zig");
+pub const pipeline = @import("pipeline.zig");
+pub const rpcSpec = @import("common/chains/evm/on_chain/rpc_spec.zig");
+pub const transform = @import("common/chains/evm/transform.zig");
 
 const ethereum_chain = @import("constants/chains/evm/ethereum.zig");
 const get_block_receipts = @import("common/chains/evm/on_chain/get_block_receipts.zig");

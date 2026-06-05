@@ -17,7 +17,12 @@ pub const ethereum: EvmChainConfig = .{
         .symbol = "ETH",
     },
     .indexingOptions = .{
-        .batchSize = 10,
+        .workerCount = 64,
+        .batchSizeBlocks   = 50,
+        .batchSizeTxs      = 100,
+        .batchSizeLogs     = 200,
+        .batchSizeItxs     = 500,
+        .batchSizeContracts = 50,
         .minifiedChunkSize = 1_000,
     },
     .rpcNodes = .{
