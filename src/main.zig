@@ -169,9 +169,19 @@ pub fn main(init: Init) !void {
 
         if (blockNum <= cursorPos) continue;
 
-        // Wait for node to index traces before fetching.
-        const ws_delay_ns = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
-        _ = std.os.linux.nanosleep(&ws_delay_ns, null);
+        // Optional delay after WS newHead before fetching traces (default 100ms).
+        // Override: WS_DELAY_MS=0 to disable, WS_DELAY_MS=N for N milliseconds.
+        const ws_delay_ms: u64 = if (init.environ_map.get("WS_DELAY_MS")) |v|
+            std.fmt.parseInt(u64, v, 10) catch 100
+        else
+            100;
+        if (ws_delay_ms > 0) {
+            const ws_delay_ns = std.os.linux.timespec{
+                .sec  = @intCast(ws_delay_ms / 1000),
+                .nsec = @intCast((ws_delay_ms % 1000) * 1_000_000),
+            };
+            _ = std.os.linux.nanosleep(&ws_delay_ns, null);
+        }
 
         // Process any skipped blocks (gap fill).
         var blk = cursorPos + 1;

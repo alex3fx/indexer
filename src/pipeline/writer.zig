@@ -94,9 +94,13 @@ pub fn processBlock(
     const cursor_ms = @as(f64, @floatFromInt(nowNs() - t_cursor)) / 1e6;
 
     const total_ms = fetch_ms + parse_ms + transform_ms + save_ms + cursor_ms;
+    const kb_blk  = data.block.body.len    / 1024;
+    const kb_rcpt = data.receipts.body.len / 1024;
+    const kb_trc  = data.traces.body.len   / 1024;
     std.debug.print(
-        "[rt] blk={d} tx={d} log={d} itx={d} | fetch={d:.0} parse={d:.0} xform={d:.0} save={d:.0} cursor={d:.0} | total={d:.0}ms\n",
+        "[rt] blk={d} tx={d} log={d} itx={d} kb={d}+{d}+{d} | fetch={d:.0} parse={d:.0} xform={d:.0} save={d:.0} cursor={d:.0} | total={d:.0}ms\n",
         .{ blockNum, ent.txs.items.len, ent.logs.items.len, ent.internalTxs.items.len,
+           kb_blk, kb_rcpt, kb_trc,
            fetch_ms, parse_ms, transform_ms, save_ms, cursor_ms, total_ms });
 
     return .saved;
