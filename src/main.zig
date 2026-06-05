@@ -11,11 +11,14 @@ const core  = @import("indexer/core");
 const utils = @import("indexer/utils");
 
 const EnvVariable = core.enums.EnvVariable;
-const pipeline    = core.pipeline;
-const redis       = core.redis;
-const ws          = core.ws;
-const scylla      = core.scylla;
 const FetchClient = core.fetch.Client;
+
+const pipeline = @import("pipeline/pipeline.zig");
+const writer   = @import("pipeline/writer.zig");
+const ws       = @import("rpc/ws.zig");
+const cursor   = @import("db/cursor.zig");
+const pool     = @import("db/pool.zig");
+const batch    = @import("db/batch.zig");
 
 pub fn main(init: Init) !void {
     const gpa = init.gpa;
@@ -52,8 +55,8 @@ pub fn main(init: Init) !void {
 
     // ── Redis: read cursor ────────────────────────────────────────────────────
     const redisUrl = env.CM_CONNECTION_URL;
-    const rUrl = redis.parseUrl(redisUrl);
-    var rdb = try redis.Conn.init(gpa, rUrl.host, rUrl.port);
+    const rUrl = cursor.parseUrl(redisUrl);
+    var rdb = try cursor.Conn.init(gpa, rUrl.host, rUrl.port);
     defer rdb.deinit();
     if (rUrl.password.len > 0) try rdb.auth(rUrl.password);
     if (rUrl.db > 0) try rdb.selectDb(rUrl.db);
@@ -130,14 +133,14 @@ pub fn main(init: Init) !void {
 
     // Per-realtime connections: 32 parallel CQL conns (split 1+3+6+20+1+1).
     std.debug.print("Connecting realtime CQL (32 conns)...\n", .{});
-    var rtConns = try scylla.RealtimeConns.init(gpa,
+    var rtConns = try batch.RealtimeConns.init(gpa,
         env.SCYLLA_DB_HOST, env.SCYLLA_DB_PORT,
         env.SCYLLA_DB_KEYSPACE,
         env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD,
     );
     defer rtConns.deinit();
 
-    var realtimeRedis = try redis.Conn.init(gpa, rUrl.host, rUrl.port);
+    var realtimeRedis = try cursor.Conn.init(gpa, rUrl.host, rUrl.port);
     defer realtimeRedis.deinit();
     if (rUrl.password.len > 0) try realtimeRedis.auth(rUrl.password);
     if (rUrl.db > 0) try realtimeRedis.selectDb(rUrl.db);
@@ -152,7 +155,7 @@ pub fn main(init: Init) !void {
     defer rtRClient.deinit();
     defer rtTClient.deinit();
 
-    var cursor = toBlock;
+    var cursorPos = toBlock;
 
     while (true) {
         const blockNum = wsConn.nextBlockNum() catch |err| {
@@ -164,18 +167,18 @@ pub fn main(init: Init) !void {
             continue;
         };
 
-        if (blockNum <= cursor) continue;
+        if (blockNum <= cursorPos) continue;
 
         // Wait for node to index traces before fetching.
         const ws_delay_ns = std.os.linux.timespec{ .sec = 0, .nsec = 100_000_000 };
         _ = std.os.linux.nanosleep(&ws_delay_ns, null);
 
         // Process any skipped blocks (gap fill).
-        var blk = cursor + 1;
+        var blk = cursorPos + 1;
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                switch (pipeline.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena)) {
+                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena)) {
                     .saved       => break,
                     .retry_later => {
                         const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
@@ -191,6 +194,6 @@ pub fn main(init: Init) !void {
                 std.debug.print("[realtime] block {d}: skipped after 5 attempts\n", .{blk});
             }
         }
-        cursor = blockNum;
+        cursorPos = blockNum;
     }
 }

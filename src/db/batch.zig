@@ -1,0 +1,470 @@
+// ScyllaDB batch write functions — save* per table, parallel save, realtime connections.
+const std = @import("std");
+
+const schema = @import("schema.zig");
+const pool = @import("pool.zig");
+
+const CqlConn = pool.CqlConn;
+const BatchSizes = pool.BatchSizes;
+const tempAllocator = pool.tempAllocator;
+
+const Entities = schema.Entities;
+const BlockRow = schema.BlockRow;
+const TxRow = schema.TxRow;
+const LogRow = schema.LogRow;
+const InternalTxRow = schema.InternalTxRow;
+const ContractRow = schema.ContractRow;
+const ContractByAddrRow = schema.ContractByAddrRow;
+
+// ─── RealtimeConns ────────────────────────────────────────────────────────────
+// 32 persistent CQL connections for parallel per-table writes in realtime mode.
+// Split matches historical: 1 blk + 3 txs + 6 logs + 20 itxs + 1 contracts + 1 comp.
+
+pub const ACCUM_TXS_LANES: usize = 3;
+pub const ACCUM_LOG_LANES: usize = 6;
+pub const ACCUM_ITX_LANES: usize = 20;
+
+pub const RealtimeConns = struct {
+    blk:       CqlConn,
+    txs:       [ACCUM_TXS_LANES]CqlConn,
+    logs:      [ACCUM_LOG_LANES]CqlConn,
+    itxs:      [ACCUM_ITX_LANES]CqlConn,
+    contracts: CqlConn,
+    comp:      CqlConn,
+
+    pub fn init(
+        gpa:  std.mem.Allocator,
+        host: []const u8, port: u16,
+        ks:   []const u8,
+        user: []const u8, pass: []const u8,
+    ) !RealtimeConns {
+        var self: RealtimeConns = undefined;
+        self.blk       = try CqlConn.init(gpa, host, port, ks, user, pass);
+        for (&self.txs)  |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
+        for (&self.logs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
+        for (&self.itxs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
+        self.contracts = try CqlConn.init(gpa, host, port, ks, user, pass);
+        self.comp      = try CqlConn.init(gpa, host, port, ks, user, pass);
+        return self;
+    }
+
+    pub fn deinit(self: *RealtimeConns) void {
+        self.blk.deinit();
+        for (&self.txs)  |*c| c.deinit();
+        for (&self.logs) |*c| c.deinit();
+        for (&self.itxs) |*c| c.deinit();
+        self.contracts.deinit();
+        self.comp.deinit();
+    }
+};
+
+pub fn saveBlockRt(conns: *RealtimeConns, ent: *const Entities, bs: BatchSizes) !void {
+    const ents = [1]*const Entities{ent};
+    try saveEntitiesParallel(
+        &conns.blk, &conns.txs, &conns.contracts,
+        &conns.logs, &conns.itxs, &conns.comp,
+        @constCast(&ents),
+        bs,
+    );
+}
+
+fn preallocBuf(est: usize) std.ArrayList(u8) {
+    var v: std.ArrayList(u8) = .empty;
+    v.ensureTotalCapacity(tempAllocator, est) catch {};
+    return v;
+}
+
+// Max rows per batch — stack arrays sized to this to avoid heap allocs.
+const MAX_BS: usize = 512;
+
+// ─── Save a single block's entities ──────────────────────────────────────────
+
+pub fn saveBlock(conn: *CqlConn, ent: *const Entities, bs: BatchSizes) !void {
+    try saveBlocks(conn, ent.blocks.items, bs.blocks);
+    try saveTxs(conn, ent.txs.items, bs.txs);
+    try saveLogs(conn, ent.logs.items, bs.logs);
+    try saveInternalTxs(conn, ent.internalTxs.items, bs.itxs);
+    try saveContracts(conn, ent.contracts.items, bs.contracts);
+    try saveContractsByAddr(conn, ent.contractsByAddr.items, bs.contracts);
+    try saveBlockCompletions(conn, ent);
+}
+
+// ─── Parallel save: N entities over 32 CQL connections ───────────────────────
+
+const TableSave = struct {
+    conn: *CqlConn,
+    ents: []*const Entities,
+    bs:   BatchSizes,
+    err:  ?anyerror = null,
+};
+
+fn saveBlockRowsForEntities(g: *TableSave) void {
+    for (g.ents) |ent| {
+        saveBlocks(g.conn, ent.blocks.items, g.bs.blocks) catch |e| { g.err = e; return; };
+    }
+}
+
+fn saveContractRowsForEntities(g: *TableSave) void {
+    for (g.ents) |ent| {
+        saveContracts(g.conn, ent.contracts.items, g.bs.contracts) catch |e| { g.err = e; return; };
+        saveContractsByAddr(g.conn, ent.contractsByAddr.items, g.bs.contracts) catch |e| { g.err = e; return; };
+    }
+}
+
+const TableLaneSave = struct {
+    conn:   *CqlConn,
+    ents:   []*const Entities,
+    bs:     BatchSizes,
+    lane:   usize,
+    nLanes: usize,
+    err:    ?anyerror = null,
+};
+
+fn saveLogRowsForLane(g: *TableLaneSave) void {
+    var rows: std.ArrayList(LogRow) = .empty;
+    defer rows.deinit(tempAllocator);
+    for (g.ents) |ent| {
+        const all   = ent.logs.items;
+        const start = all.len * g.lane / g.nLanes;
+        const end   = all.len * (g.lane + 1) / g.nLanes;
+        rows.appendSlice(tempAllocator, all[start..end]) catch |e| { g.err = e; return; };
+    }
+    saveLogs(g.conn, rows.items, g.bs.logs) catch |e| { g.err = e; return; };
+}
+
+fn saveItxRowsForLane(g: *TableLaneSave) void {
+    var rows: std.ArrayList(InternalTxRow) = .empty;
+    defer rows.deinit(tempAllocator);
+    for (g.ents) |ent| {
+        const all   = ent.internalTxs.items;
+        const start = all.len * g.lane / g.nLanes;
+        const end   = all.len * (g.lane + 1) / g.nLanes;
+        rows.appendSlice(tempAllocator, all[start..end]) catch |e| { g.err = e; return; };
+    }
+    saveInternalTxs(g.conn, rows.items, g.bs.itxs) catch |e| { g.err = e; return; };
+}
+
+fn saveTxRowsForLane(g: *TableLaneSave) void {
+    var rows: std.ArrayList(TxRow) = .empty;
+    defer rows.deinit(tempAllocator);
+    for (g.ents) |ent| {
+        const all   = ent.txs.items;
+        const start = all.len * g.lane / g.nLanes;
+        const end   = all.len * (g.lane + 1) / g.nLanes;
+        rows.appendSlice(tempAllocator, all[start..end]) catch |e| { g.err = e; return; };
+    }
+    saveTxs(g.conn, rows.items, g.bs.txs) catch |e| { g.err = e; return; };
+}
+
+// Batch-write all completion rows for a slice of entities in one CQL round-trip.
+fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const Entities) !void {
+    if (ents.len == 0) return;
+    const BATCH: usize = 50;
+    var rowBuf:   std.ArrayList(u8) = preallocBuf(64); defer rowBuf.deinit(tempAllocator);
+    var batchBuf: std.ArrayList(u8) = .empty;          defer batchBuf.deinit(tempAllocator);
+    var starts: [BATCH + 1]usize = undefined;
+    var ptrs:   [BATCH][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < ents.len) {
+        const end = @min(i + BATCH, ents.len);
+        batchBuf.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            const ent = ents[j];
+            if (ent.blocks.items.len == 0) continue;
+            const b = ent.blocks.items[0];
+            rowBuf.items.len = 0;
+            starts[enc] = batchBuf.items.len;
+            try pool.valInt32(&rowBuf, b.chunk);
+            try pool.valBigint(&rowBuf, b.number);
+            try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.txs.items.len)));
+            try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.logs.items.len)));
+            try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.internalTxs.items.len)));
+            try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.contracts.items.len)));
+            try batchBuf.appendSlice(tempAllocator, rowBuf.items);
+            enc += 1;
+        }
+        if (enc > 0) {
+            starts[enc] = batchBuf.items.len;
+            for (0..enc) |k| ptrs[k] = batchBuf.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
+        }
+        i = end;
+    }
+}
+
+// ─── saveEntitiesParallel ─────────────────────────────────────────────────────
+
+pub fn saveEntitiesParallel(
+    connBlocks:    *CqlConn,
+    connTxs:       *[ACCUM_TXS_LANES]CqlConn,
+    connContracts: *CqlConn,
+    connLogs:      *[ACCUM_LOG_LANES]CqlConn,
+    connItxs:      *[ACCUM_ITX_LANES]CqlConn,
+    connComp:      *CqlConn,
+    ents:          []*const Entities,
+    bs:            BatchSizes,
+) !void {
+    if (ents.len == 0) return;
+
+    var gBlocks    = TableSave{ .conn = connBlocks,    .ents = ents, .bs = bs };
+    var gContracts = TableSave{ .conn = connContracts, .ents = ents, .bs = bs };
+    var gTxs:  [ACCUM_TXS_LANES]TableLaneSave = undefined;
+    var gLogs: [ACCUM_LOG_LANES]TableLaneSave = undefined;
+    var gItxs: [ACCUM_ITX_LANES]TableLaneSave = undefined;
+
+    for (0..ACCUM_TXS_LANES) |i|
+        gTxs[i]  = .{ .conn = &connTxs[i],  .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_TXS_LANES };
+    for (0..ACCUM_LOG_LANES) |i|
+        gLogs[i] = .{ .conn = &connLogs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_LOG_LANES };
+    for (0..ACCUM_ITX_LANES) |i|
+        gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_ITX_LANES };
+
+    // Spawns 30 threads: 1 (blocks) + 3 (txs) + 6 (logs) + 20 (itxs).
+    // Contracts run inline on the caller's thread (few rows, fast path).
+    const nSpawn = 1 + ACCUM_TXS_LANES + ACCUM_LOG_LANES + ACCUM_ITX_LANES;
+    var threads: [nSpawn]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (threads[0..spawned]) |t| t.join();
+
+    for (0..ACCUM_TXS_LANES) |i| {
+        threads[spawned] = try std.Thread.spawn(.{}, saveTxRowsForLane, .{&gTxs[i]});
+        spawned += 1;
+    }
+    for (0..ACCUM_LOG_LANES) |i| {
+        threads[spawned] = try std.Thread.spawn(.{}, saveLogRowsForLane, .{&gLogs[i]});
+        spawned += 1;
+    }
+    for (0..ACCUM_ITX_LANES) |i| {
+        threads[spawned] = try std.Thread.spawn(.{}, saveItxRowsForLane, .{&gItxs[i]});
+        spawned += 1;
+    }
+    threads[spawned] = try std.Thread.spawn(.{}, saveBlockRowsForEntities, .{&gBlocks});
+    spawned += 1;
+
+    saveContractRowsForEntities(&gContracts);
+
+    for (threads[0..spawned]) |t| t.join();
+
+    if (gBlocks.err)    |e| return e;
+    if (gContracts.err) |e| return e;
+    for (gTxs)  |g| if (g.err) |e| return e;
+    for (gLogs) |g| if (g.err) |e| return e;
+    for (gItxs) |g| if (g.err) |e| return e;
+
+    try saveBlockCompletionsBatch(connComp, ents);
+}
+
+// ─── Low-level table writers ──────────────────────────────────────────────────
+const BLOCK_COLS:        u16 = 5;
+const TX_COLS:           u16 = 21;
+const LOG_COLS:          u16 = 15;
+const ITX_COLS:          u16 = 10;
+const CONTRACT_COLS:     u16 = 13;
+const CONTRACT_CBA_COLS: u16 = 8;
+const COMPLETION_COLS:   u16 = 6;
+
+fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v  = preallocBuf(96);           defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 96);  defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs:   [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len); bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valInt32(&v, r.chunk); try pool.valBigint(&v, r.number);
+            try pool.valBigint(&v, r.timestampS); try pool.valBigint(&v, r.timestampMs);
+            try pool.valTextRequired(&v, r.miner);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.blocks, BLOCK_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveTxs(conn: *CqlConn, rows: []const TxRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v  = preallocBuf(512);           defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 512);  defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs:   [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len); bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valInt32(&v, r.chunk); try pool.valBigint(&v, r.blockNumber);
+            try pool.valInt32(&v, r.transactionIndex); try pool.valTextRequired(&v, r.hash);
+            try pool.valBigint(&v, r.blockTimestampS); try pool.valBigint(&v, r.blockTimestampMs);
+            try pool.valText(&v, r.methodId); try pool.valText(&v, r.input);
+            try pool.valTextRequired(&v, r.fromAddress); try pool.valText(&v, r.toAddress);
+            try pool.valVarint(&v, r.value);
+            try pool.valBigint(&v, r.gasLimit); try pool.valBigint(&v, r.gasPrice);
+            try pool.valBigint(&v, r.gasUsed); try pool.valBigint(&v, r.maxPriorityFee);
+            try pool.valBigint(&v, r.maxFee); try pool.valBigint(&v, r.cumulativeGasUsed);
+            try pool.valBigint(&v, r.effectiveGasPrice); try pool.valText(&v, r.contractAddress);
+            try pool.valTinyint(&v, r.status); try pool.valTinyint(&v, r.txType);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.transactions, TX_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveLogs(conn: *CqlConn, rows: []const LogRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v  = preallocBuf(512);           defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 512);  defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs:   [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len); bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valInt32(&v, r.chunk); try pool.valBigint(&v, r.blockNumber);
+            try pool.valInt32(&v, r.transactionIndex); try pool.valInt32(&v, r.logIndex);
+            try pool.valBigint(&v, r.blockTimestampS); try pool.valBigint(&v, r.blockTimestampMs);
+            try pool.valTextRequired(&v, r.address); try pool.valTextRequired(&v, r.data);
+            try pool.valText(&v, r.topicZeroth); try pool.valText(&v, r.topicFirst);
+            try pool.valText(&v, r.topicSecond); try pool.valText(&v, r.topicThird);
+            try pool.valListText(&v, r.restTopics); try pool.valTextRequired(&v, r.transactionHash);
+            try pool.valBool(&v, r.removed);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.logs, LOG_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v  = preallocBuf(192);           defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 192);  defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs:   [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len); bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valInt32(&v, r.chunk); try pool.valBigint(&v, r.blockNumber);
+            try pool.valBigint(&v, r.blockTimestampS); try pool.valBigint(&v, r.blockTimestampMs);
+            try pool.valInt32(&v, r.transactionIndex); try pool.valTextRequired(&v, r.transactionHash);
+            try pool.valInt32(&v, r.traceIndex);
+            try pool.valTextRequired(&v, r.fromAddress); try pool.valTextRequired(&v, r.toAddress);
+            try pool.valVarint(&v, r.value);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveContracts(conn: *CqlConn, rows: []const ContractRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v  = preallocBuf(1024);                        defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% @as(usize, 1024));   defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs:   [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len); bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valInt32(&v, r.chunk); try pool.valBigint(&v, r.blockNumber);
+            try pool.valInt32(&v, r.transactionIndex); try pool.valTextRequired(&v, r.transactionHash);
+            try pool.valInt32(&v, r.traceIndex);
+            try pool.valBigint(&v, r.blockTimestampS); try pool.valBigint(&v, r.blockTimestampMs);
+            try pool.valTextRequired(&v, r.address); try pool.valTinyint(&v, r.creationMethod);
+            try pool.valTextRequired(&v, r.creatorAddress); try pool.valText(&v, r.contractFactory);
+            try pool.valTextRequired(&v, r.creationBytecode); try pool.valTextRequired(&v, r.deployedBytecode);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v  = preallocBuf(512);           defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 512);  defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs:   [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len); bd.items.len = 0; var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0; starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valTextRequired(&v, r.address); try pool.valTextRequired(&v, r.creator);
+            try pool.valTextRequired(&v, r.txHash); try pool.valBigint(&v, r.blockNumber);
+            try pool.valBigint(&v, r.timestamp); try pool.valText(&v, r.contractFactory);
+            try pool.valTextRequired(&v, r.creationBytecode); try pool.valTextRequired(&v, r.deployedBytecode);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveBlockCompletions(conn: *CqlConn, ent: *const Entities) !void {
+    if (ent.blocks.items.len == 0) return;
+    const bs = 50;
+    var v  = preallocBuf(64); defer v.deinit(tempAllocator);
+    var bd: std.ArrayList(u8) = .empty; defer bd.deinit(tempAllocator);
+    var starts: [bs + 1]usize = undefined;
+    var ptrs:   [bs][]const u8 = undefined;
+    var txIdx: usize = 0; var logIdx: usize = 0;
+    var itxIdx: usize = 0; var conIdx: usize = 0;
+    var i: usize = 0;
+    while (i < ent.blocks.items.len) {
+        const bEnd = @min(i + bs, ent.blocks.items.len);
+        bd.items.len = 0; var enc: usize = 0;
+        for (i..bEnd) |j| {
+            const b = ent.blocks.items[j];
+            var txCnt: i32 = 0; var logCnt: i32 = 0;
+            var itxCnt: i32 = 0; var conCnt: i32 = 0;
+            while (txIdx  < ent.txs.items.len         and ent.txs.items[txIdx].blockNumber         == b.number) : (txIdx  += 1) txCnt  += 1;
+            while (logIdx < ent.logs.items.len         and ent.logs.items[logIdx].blockNumber       == b.number) : (logIdx += 1) logCnt += 1;
+            while (itxIdx < ent.internalTxs.items.len  and ent.internalTxs.items[itxIdx].blockNumber == b.number) : (itxIdx += 1) itxCnt += 1;
+            while (conIdx < ent.contracts.items.len    and ent.contracts.items[conIdx].blockNumber  == b.number) : (conIdx += 1) conCnt += 1;
+            v.items.len = 0; starts[enc] = bd.items.len;
+            try pool.valInt32(&v, b.chunk); try pool.valBigint(&v, b.number);
+            try pool.valInt32(&v, txCnt); try pool.valInt32(&v, logCnt);
+            try pool.valInt32(&v, itxCnt); try pool.valInt32(&v, conCnt);
+            try bd.appendSlice(tempAllocator, v.items); enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
+        i = bEnd;
+    }
+}

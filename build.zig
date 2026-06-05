@@ -2,7 +2,7 @@ const std = @import("std");
 const Build = std.Build;
 
 const executables = .{
-    .{ "start", "raw", "src/entrypoints/raw.zig" },
+    .{ "start", "raw", "src/main.zig" },
 };
 
 const modules = .{

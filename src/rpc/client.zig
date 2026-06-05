@@ -184,7 +184,7 @@ fn makePayload(
     };
 }
 
-fn jsonRpcResultSlice(body: []const u8) ?[]const u8 {
+pub fn jsonRpcResultSlice(body: []const u8) ?[]const u8 {
     const needle = "\"result\":";
     const pos = std.mem.indexOf(u8, body, needle) orelse return null;
     var i = pos + needle.len;

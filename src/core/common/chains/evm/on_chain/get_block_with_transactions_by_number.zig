@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const core = @import("indexer/core");
-const rpc = @import("rpc.zig");
+const rpc = @import("../../../../../rpc/client.zig");
 
 const Allocator = std.mem.Allocator;
 const FetchClient = core.fetch.Client;

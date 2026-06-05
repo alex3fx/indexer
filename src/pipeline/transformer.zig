@@ -2,109 +2,21 @@
 // Uses arena allocator for all allocations — no per-string heap allocation.
 // lowerInPlace: modifies arena-owned strings in-place, SIMD 16 bytes/iter.
 const std = @import("std");
-const rpc_spec = @import("on_chain/rpc_spec.zig");
 
-// ─── DB row types ─────────────────────────────────────────────────────────────
+const types = @import("../rpc/types.zig");
+const schema = @import("../db/schema.zig");
 
-pub const BlockRow = struct {
-    chunk: i32,
-    number: i64,
-    timestampS: i64,
-    timestampMs: i64,
-    miner: []const u8,
-};
+const RpcBlock = types.RpcBlock;
+const RpcReceipt = types.RpcReceipt;
+const RpcTrace = types.RpcTrace;
 
-pub const TxRow = struct {
-    chunk: i32,
-    blockNumber: i64,
-    transactionIndex: i32,
-    hash: []const u8,
-    blockTimestampS: i64,
-    blockTimestampMs: i64,
-    methodId: []const u8,
-    input: []const u8,
-    fromAddress: []const u8,
-    toAddress: []const u8,
-    value: []const u8,
-    gasLimit: i64,
-    gasPrice: i64,
-    gasUsed: i64,
-    maxPriorityFee: i64,
-    maxFee: i64,
-    cumulativeGasUsed: i64,
-    effectiveGasPrice: i64,
-    contractAddress: []const u8,
-    status: i8,
-    txType: i8,
-};
-
-pub const LogRow = struct {
-    chunk: i32,
-    blockNumber: i64,
-    transactionIndex: i32,
-    logIndex: i32,
-    blockTimestampS: i64,
-    blockTimestampMs: i64,
-    address: []const u8,
-    data: []const u8,
-    topicZeroth: []const u8,
-    topicFirst: []const u8,
-    topicSecond: []const u8,
-    topicThird: []const u8,
-    restTopics: [][]const u8,
-    transactionHash: []const u8,
-    removed: bool,
-};
-
-pub const InternalTxRow = struct {
-    chunk: i32,
-    blockNumber: i64,
-    blockTimestampS: i64,
-    blockTimestampMs: i64,
-    transactionIndex: i32,
-    transactionHash: []const u8,
-    traceIndex: i32,
-    fromAddress: []const u8,
-    toAddress: []const u8,
-    value: []const u8,
-};
-
-pub const ContractRow = struct {
-    chunk: i32,
-    blockNumber: i64,
-    transactionIndex: i32,
-    transactionHash: []const u8,
-    traceIndex: i32,
-    blockTimestampS: i64,
-    blockTimestampMs: i64,
-    address: []const u8,
-    creationMethod: i8,
-    creatorAddress: []const u8,
-    contractFactory: []const u8,
-    creationBytecode: []const u8,
-    deployedBytecode: []const u8,
-};
-
-pub const ContractByAddrRow = struct {
-    address: []const u8,
-    creator: []const u8,
-    txHash: []const u8,
-    blockNumber: i64,
-    timestamp: i64,
-    contractFactory: []const u8,
-    creationBytecode: []const u8,
-    deployedBytecode: []const u8,
-};
-
-pub const Entities = struct {
-    blocks: std.ArrayList(BlockRow),
-    txs: std.ArrayList(TxRow),
-    logs: std.ArrayList(LogRow),
-    internalTxs: std.ArrayList(InternalTxRow),
-    contracts: std.ArrayList(ContractRow),
-    contractsByAddr: std.ArrayList(ContractByAddrRow),
-    lastBlock: u64,
-};
+pub const BlockRow = schema.BlockRow;
+pub const TxRow = schema.TxRow;
+pub const LogRow = schema.LogRow;
+pub const InternalTxRow = schema.InternalTxRow;
+pub const ContractRow = schema.ContractRow;
+pub const ContractByAddrRow = schema.ContractByAddrRow;
+pub const Entities = schema.Entities;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -179,9 +91,9 @@ pub fn initEntities() Entities {
 /// Otherwise: chunk = block_number / chunkSize.
 pub fn transformBlock(
     arena: std.mem.Allocator,
-    block: rpc_spec.RpcBlock,
-    receipts: []const rpc_spec.RpcReceipt,
-    traces: []const rpc_spec.RpcTrace,
+    block: RpcBlock,
+    receipts: []const RpcReceipt,
+    traces: []const RpcTrace,
     chunkSize: u64,
     ent: *Entities,
 ) !void {
@@ -190,9 +102,9 @@ pub fn transformBlock(
 
 pub fn transformBlockWithRemap(
     arena: std.mem.Allocator,
-    block: rpc_spec.RpcBlock,
-    receipts: []const rpc_spec.RpcReceipt,
-    traces: []const rpc_spec.RpcTrace,
+    block: RpcBlock,
+    receipts: []const RpcReceipt,
+    traces: []const RpcTrace,
     chunkSize: u64,
     remapMod: u64,
     ent: *Entities,

@@ -2,7 +2,7 @@ const std = @import("std");
 
 const core = @import("indexer/core");
 const utils = @import("indexer/utils");
-const rpc = @import("rpc.zig");
+const rpc = @import("../rpc/client.zig");
 
 const Allocator = std.mem.Allocator;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
@@ -34,6 +34,9 @@ pub const Response = struct {
         self.* = undefined;
     }
 };
+
+/// BlockBundle is an alias for Response (same data, clearer name in context).
+pub const BlockBundle = Response;
 
 const ResponseSet = struct {
     parallelFetchElapsedNs: u128,
