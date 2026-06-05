@@ -1,6 +1,7 @@
 # DEFAULT
 **/.DS_Store*
 .zig*
+zig-out/
 
 # SECURITY
 **.env*
