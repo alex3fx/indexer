@@ -20,6 +20,7 @@ const Work = struct {
     method:    Method,
     rpcNode:   EvmRpcNodeConfig,
     number:    []const u8,
+    gzip:      bool,
 };
 
 // Result: worker → main. Main frees via allocator + destroy.
@@ -118,6 +119,7 @@ pub const HttpPool = struct {
         methods:   [3]Method,
         rpcNode:   EvmRpcNodeConfig,
         number:    []const u8,
+        gzip:      bool,
     ) ![3](anyerror!?Response) {
         // Submit work to all 3 slots.
         for (&self.slots, 0..) |*slot, i| {
@@ -130,6 +132,7 @@ pub const HttpPool = struct {
                 .method    = methods[i],
                 .rpcNode   = rpcNode,
                 .number    = num_copy,
+                .gzip      = gzip,
             };
             pipeWrite8(slot.work_wr, @intFromPtr(work));
         }
@@ -165,6 +168,7 @@ fn slotWorkerFn(slot: *Slot, _gpa: Allocator, _io: std.Io) void {
         const r = client_mod.requestSync(alloc, work.client, work.method, .{
             .rpcNode = work.rpcNode,
             .number  = work.number,
+            .gzip    = work.gzip,
         });
         alloc.free(work.number);
         alloc.destroy(work);

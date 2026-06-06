@@ -24,6 +24,7 @@ pub const Options = struct {
     extraHeaders: []const std.http.Header = &.{},
     keepAlive: bool = true,
     responseInitialCapacity: usize = 64 * 1024,
+    gzip: bool = false,
 };
 
 pub const Client = struct {
@@ -64,6 +65,7 @@ pub fn fetchWithHttpClient(client: *std.http.Client, allocator: Allocator, optio
         .response_writer = &body.writer,
         .headers = .{
             .content_type = if (options.contentType) |value| .{ .override = value } else .default,
+            .accept_encoding = if (!options.gzip) .{ .override = "identity" } else .default,
         },
         .extra_headers = options.extraHeaders,
         .keep_alive = options.keepAlive,
