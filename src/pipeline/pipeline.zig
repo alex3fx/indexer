@@ -15,6 +15,7 @@ const fetcher     = @import("fetcher.zig");
 const parser      = @import("parser.zig");
 const transformer = @import("transformer.zig");
 const pool        = @import("../db/pool.zig");
+const http_pool   = @import("../rpc/pool.zig");
 const batch       = @import("../db/batch.zig");
 const cursor      = @import("../db/cursor.zig");
 
@@ -46,7 +47,7 @@ const ITX_LANES: usize = batch.ACCUM_ITX_LANES;
 
 // ─── BlockResult ──────────────────────────────────────────────────────────────
 
-const BlockResult = struct {
+pub const BlockResult = struct {
     gpa:      Allocator,
     arena:    std.heap.ArenaAllocator,
     // Owns the raw HTTP response buffers (block.body, receipts.body, traces.body).
@@ -57,20 +58,27 @@ const BlockResult = struct {
     blockNum: u64,
     ok:       bool,
     err:      ?anyerror,
+    // Per-stage timings set by fetchParseTransform; callers may read for logging.
+    fetchNs:     i64,
+    parseNs:     i64,
+    transformNs: i64,
 
-    fn init(gpa: Allocator) BlockResult {
+    pub fn init(gpa: Allocator) BlockResult {
         return .{
-            .gpa     = gpa,
-            .arena   = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .rawData = null,
-            .ent     = transformer.initEntities(),
-            .blockNum = 0,
-            .ok       = false,
-            .err      = null,
+            .gpa         = gpa,
+            .arena       = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .rawData     = null,
+            .ent         = transformer.initEntities(),
+            .blockNum    = 0,
+            .ok          = false,
+            .err         = null,
+            .fetchNs     = 0,
+            .parseNs     = 0,
+            .transformNs = 0,
         };
     }
 
-    fn deinit(self: *BlockResult) void {
+    pub fn deinit(self: *BlockResult) void {
         self.arena.deinit();
         if (self.rawData) |*d| d.deinit(self.gpa);
     }
@@ -127,14 +135,18 @@ const WorkerArgs = struct {
     cancel:       *std.atomic.Value(bool),
 };
 
-const FetchTransformStatus = union(enum) {
+pub const FetchTransformStatus = union(enum) {
     ok,
     retry_later,    // null RPC response — block not yet available
     skip_missing,   // block parsed as null/empty — no data to save
     fatal: anyerror,
 };
 
-fn fetchAndTransform(
+/// Shared fetch+parse+transform core used by both historical and realtime pipelines.
+/// Stores raw HTTP buffers in result.rawData (ZC ownership).
+/// Sets result.fetchNs / parseNs / transformNs for caller logging.
+/// Does NOT save, does NOT advance cursor — callers handle that differently.
+pub fn fetchParseTransform(
     gpa:          Allocator,
     io:           std.Io,
     rpcNode:      EvmRpcNodeConfig,
@@ -144,39 +156,39 @@ fn fetchAndTransform(
     bClient:      *FetchClient,
     rClient:      *FetchClient,
     tClient:      *FetchClient,
+    httpPool:     ?*http_pool.HttpPool,
     result:       *BlockResult,
 ) FetchTransformStatus {
+    const t0 = nowNs();
     const maybeData = fetcher.getConsistentBlockData(gpa, io, .{
         .rpcNode        = rpcNode,
         .blockNumber    = blockNum,
         .blockClient    = bClient,
         .receiptsClient = rClient,
         .tracesClient   = tClient,
+        .httpPool       = httpPool,
         .skipLogs       = true,
     }) catch |e| return .{ .fatal = e };
     const data = maybeData orelse return .retry_later;
-    // Transfer ownership to result: rawData.block/receipts/traces.body buffers
-    // stay alive until BlockResult.deinit() is called after save completes.
-    // ZC strings in `ent` are slices into these buffers — no memcpy of string bytes.
+    result.fetchNs = nowNs() - t0;
+    // Transfer ownership: buffers live until BlockResult.deinit() after save.
     result.rawData = data;
 
+    const t1 = nowNs();
     const aa    = result.arena.allocator();
     const block = parser.parseBlockRespZC(data.block.body, aa) catch |e|
         return .{ .fatal = e };
     if (block == null) return .skip_missing;
     const receipts = (parser.parseReceiptsRespZC(data.receipts.body, aa) catch null) orelse &.{};
     const traces   = (parser.parseTracesRespZC(data.traces.body, aa)     catch null) orelse &.{};
+    result.parseNs = nowNs() - t1;
 
+    const t2 = nowNs();
     transformer.transformBlockWithRemap(
         aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
     ) catch |e| return .{ .fatal = e };
+    result.transformNs = nowNs() - t2;
 
-    std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
-        blockNum,
-        result.ent.txs.items.len,
-        result.ent.logs.items.len,
-        result.ent.internalTxs.items.len,
-    });
     return .ok;
 }
 
@@ -213,8 +225,17 @@ fn worker(args: *WorkerArgs) !void {
         result.blockNum = blockNum;
 
         retry: while (true) {
-            switch (fetchAndTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
-                .ok           => { result.ok = true; break :retry; },
+            switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result)) {
+                .ok           => {
+                    result.ok = true;
+                    std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
+                        blockNum,
+                        result.ent.txs.items.len,
+                        result.ent.logs.items.len,
+                        result.ent.internalTxs.items.len,
+                    });
+                    break :retry;
+                },
                 .skip_missing => {
                     std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
                     break :retry;

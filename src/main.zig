@@ -162,9 +162,6 @@ pub fn main(init: Init) !void {
     if (rUrl.password.len > 0) try realtimeRedis.auth(rUrl.password);
     if (rUrl.db > 0) try realtimeRedis.selectDb(rUrl.db);
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
     var rtBClient = FetchClient.init(gpa, io);
     var rtRClient = FetchClient.init(gpa, io);
     var rtTClient = FetchClient.init(gpa, io);
@@ -205,7 +202,7 @@ pub fn main(init: Init) !void {
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena, &hPool, chunkBuckets)) {
+                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &hPool, chunkBuckets)) {
                     .saved       => break,
                     .retry_later => {
                         const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
