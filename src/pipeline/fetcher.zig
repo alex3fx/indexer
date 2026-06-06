@@ -17,7 +17,6 @@ pub const Options = struct {
     tracesClient:   ?*FetchClient = null,
     httpPool:       ?*pool.HttpPool = null,  // if set, use pool instead of thread spawn
     skipLogs:       bool = false,
-    gzip:           bool = false,
 };
 
 pub const Response = struct {
@@ -67,10 +66,10 @@ pub fn getConsistentBlockData(
     for (0..2) |_| {
         const maybe_set = if (options.httpPool) |p|
             try fetchResponseSetPooled(allocator, p, options.rpcNode, block_number,
-                options.blockClient, options.receiptsClient, options.tracesClient, options.gzip)
+                options.blockClient, options.receiptsClient, options.tracesClient)
         else
             try fetchResponseSet(allocator, io, options.rpcNode, block_number,
-                options.blockClient, options.receiptsClient, options.tracesClient, options.gzip);
+                options.blockClient, options.receiptsClient, options.tracesClient);
 
         if (maybe_set) |set| return try buildResponse(allocator, options.blockNumber, set, options.skipLogs);
     }
@@ -106,7 +105,6 @@ fn fetchResponseSetPooled(
     ext_block:    ?*FetchClient,
     ext_receipts: ?*FetchClient,
     ext_traces:   ?*FetchClient,
-    gzip:         bool,
 ) !?ResponseSet {
     var tmp_block    = FetchClient.init(allocator, undefined);
     var tmp_receipts = FetchClient.init(allocator, undefined);
@@ -131,7 +129,6 @@ fn fetchResponseSetPooled(
         },
         rpcNode,
         blockNumber,
-        gzip,
     );
 
     const parallel_fetch_elapsed_ns = elapsedNs(started_at_ns);
@@ -175,7 +172,6 @@ fn fetchResponseSet(
     ext_block:    ?*FetchClient,
     ext_receipts: ?*FetchClient,
     ext_traces:   ?*FetchClient,
-    gzip:         bool,
 ) !?ResponseSet {
     const started_at_ns = monotonicNs();
 
@@ -193,7 +189,6 @@ fn fetchResponseSet(
     var block_task = try rpc.requestWithRpcNode(allocator, block_client, .getBlockWithTransactionsByNumber, .{
         .rpcNode = rpcNode,
         .number = blockNumber,
-        .gzip = gzip,
     });
     var block_task_pending = true;
     errdefer if (block_task_pending) discardTask(&block_task, allocator);
@@ -201,7 +196,6 @@ fn fetchResponseSet(
     var receipts_task = try rpc.requestWithRpcNode(allocator, receipts_client, .getBlockReceipts, .{
         .rpcNode = rpcNode,
         .number = blockNumber,
-        .gzip = gzip,
     });
     var receipts_task_pending = true;
     errdefer if (receipts_task_pending) discardTask(&receipts_task, allocator);
@@ -209,7 +203,6 @@ fn fetchResponseSet(
     var traces_task = try rpc.requestWithRpcNode(allocator, traces_client, .getBlockTraces, .{
         .rpcNode = rpcNode,
         .number = blockNumber,
-        .gzip = gzip,
     });
     var traces_task_pending = true;
     errdefer if (traces_task_pending) discardTask(&traces_task, allocator);

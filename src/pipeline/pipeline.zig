@@ -115,7 +115,6 @@ const WorkerArgs = struct {
     chan:          *ResultChan,
     chunkBuckets: u64,
     cancel:       *std.atomic.Value(bool),
-    gzip:         bool,
 };
 
 const FetchTransformStatus = union(enum) {
@@ -136,7 +135,6 @@ fn fetchAndTransform(
     rClient:      *FetchClient,
     tClient:      *FetchClient,
     result:       *BlockResult,
-    gzip:         bool,
 ) FetchTransformStatus {
     const maybeData = fetcher.getConsistentBlockData(gpa, io, .{
         .rpcNode        = rpcNode,
@@ -145,7 +143,6 @@ fn fetchAndTransform(
         .receiptsClient = rClient,
         .tracesClient   = tClient,
         .skipLogs       = true,
-        .gzip           = gzip,
     }) catch |e| return .{ .fatal = e };
     var data = maybeData orelse return .retry_later;
     defer data.deinit(gpa);
@@ -203,7 +200,7 @@ fn worker(args: *WorkerArgs) !void {
         result.blockNum = blockNum;
 
         retry: while (true) {
-            switch (fetchAndTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result, args.gzip)) {
+            switch (fetchAndTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, result)) {
                 .ok           => { result.ok = true; break :retry; },
                 .skip_missing => {
                     std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
@@ -362,7 +359,6 @@ pub fn runHistorical(
     redisUrl:     []const u8,
     chunkBuckets: u64,
     saveEvery:    usize,
-    gzip:         bool,
 ) !void {
     if (from > to) return;
 
@@ -431,7 +427,6 @@ pub fn runHistorical(
             .chan         = &chan,
             .chunkBuckets = chunkBuckets,
             .cancel       = &cancel,
-            .gzip         = gzip,
         };
         threads[w] = try std.Thread.spawn(
             .{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});

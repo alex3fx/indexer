@@ -121,11 +121,6 @@ pub fn main(init: Init) !void {
         }
     else pipeline.SAVE_EVERY_DEFAULT;
 
-    const useGzip: bool = if (init.environ_map.get("GZIP")) |v|
-        !std.mem.eql(u8, v, "0")
-    else
-        false;
-
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
             io, gpa, &chain,
@@ -136,7 +131,6 @@ pub fn main(init: Init) !void {
             redisUrl,
             chunkBuckets,
             saveEvery,
-            useGzip,
         );
     }
 
@@ -211,7 +205,7 @@ pub fn main(init: Init) !void {
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena, &hPool, useGzip)) {
+                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena, &hPool)) {
                     .saved       => break,
                     .retry_later => {
                         const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };

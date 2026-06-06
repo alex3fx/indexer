@@ -40,7 +40,6 @@ pub fn processBlock(
     blockNum: u64,
     arena:    *std.heap.ArenaAllocator,
     hPool:    ?*http_pool.HttpPool,
-    gzip:     bool,
 ) ProcessBlockStatus {
     const rpcNode   = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
@@ -55,7 +54,6 @@ pub fn processBlock(
         .tracesClient   = tClient,
         .httpPool       = hPool,
         .skipLogs       = true,
-        .gzip           = gzip,
     }) catch |e| {
         std.debug.print("[realtime] block={d} stage=fetch error: {s}\n", .{ blockNum, @errorName(e) });
         return .{ .fatal = e };

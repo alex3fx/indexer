@@ -16,7 +16,6 @@ pub const Options = struct {
 pub const NodeOptions = struct {
     rpcNode: EvmRpcNodeConfig,
     number: []const u8,
-    gzip: bool = false,
 };
 
 pub const Response = struct {
@@ -62,7 +61,6 @@ const ThreadContext = struct {
 pub const WorkerOptions = struct {
     rpcNode: EvmRpcNodeConfig,
     number: []const u8,
-    gzip: bool = false,
 };
 
 pub fn request(
@@ -96,7 +94,6 @@ pub fn requestWithRpcNode(
         .options = .{
             .rpcNode = options.rpcNode,
             .number = number,
-            .gzip = options.gzip,
         },
     };
 
@@ -135,7 +132,6 @@ pub fn requestSync(
         .body = payload,
         .contentType = "application/json",
         .responseInitialCapacity = 512 * 1024,
-        .gzip = options.gzip,
     });
     errdefer response.deinit(allocator);
 
