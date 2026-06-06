@@ -8,6 +8,7 @@ const fetcher     = @import("fetcher.zig");
 const parser      = @import("parser.zig");
 const transformer = @import("transformer.zig");
 const pool        = @import("../db/pool.zig");
+const http_pool   = @import("../rpc/pool.zig");
 const batch       = @import("../db/batch.zig");
 const cursor      = @import("../db/cursor.zig");
 
@@ -38,6 +39,7 @@ pub fn processBlock(
     tClient:  *FetchClient,
     blockNum: u64,
     arena:    *std.heap.ArenaAllocator,
+    hPool:    ?*http_pool.HttpPool,
 ) ProcessBlockStatus {
     const rpcNode   = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
@@ -50,6 +52,7 @@ pub fn processBlock(
         .blockClient    = bClient,
         .receiptsClient = rClient,
         .tracesClient   = tClient,
+        .httpPool       = hPool,
         .skipLogs       = true,
     }) catch |e| {
         std.debug.print("[realtime] block={d} stage=fetch error: {s}\n", .{ blockNum, @errorName(e) });

@@ -58,9 +58,9 @@ const ThreadContext = struct {
     result: ?(anyerror!?Response) = null,
 };
 
-const WorkerOptions = struct {
+pub const WorkerOptions = struct {
     rpcNode: EvmRpcNodeConfig,
-    number: []u8,
+    number: []const u8,
 };
 
 pub fn request(
@@ -114,7 +114,7 @@ fn runRequest(context: *ThreadContext) void {
     );
 }
 
-fn requestSync(
+pub fn requestSync(
     allocator: Allocator,
     client: *FetchClient,
     method: Method,

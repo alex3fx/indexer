@@ -13,12 +13,13 @@ const utils = @import("indexer/utils");
 const EnvVariable = core.enums.EnvVariable;
 const FetchClient = core.fetch.Client;
 
-const pipeline = @import("pipeline/pipeline.zig");
-const writer   = @import("pipeline/writer.zig");
-const ws       = @import("rpc/ws.zig");
-const cursor   = @import("db/cursor.zig");
-const pool     = @import("db/pool.zig");
-const batch    = @import("db/batch.zig");
+const pipeline  = @import("pipeline/pipeline.zig");
+const writer    = @import("pipeline/writer.zig");
+const ws        = @import("rpc/ws.zig");
+const cursor    = @import("db/cursor.zig");
+const pool      = @import("db/pool.zig");
+const batch     = @import("db/batch.zig");
+const http_pool = @import("rpc/pool.zig");
 
 pub fn main(init: Init) !void {
     const gpa = init.gpa;
@@ -148,6 +149,14 @@ pub fn main(init: Init) !void {
     );
     defer rtConns.deinit();
 
+    // Pre-created 3-thread pool for parallel RPC requests.
+    // Eliminates std.Thread.spawn overhead per block (~6ms).
+    // init() only creates pipes; startThreads() is called here so self is stable.
+    std.debug.print("Starting HTTP thread pool (3 persistent threads)...\n", .{});
+    var hPool = try http_pool.HttpPool.init(gpa, io);
+    try hPool.startThreads();
+    defer hPool.deinit();
+
     var realtimeRedis = try cursor.Conn.init(gpa, rUrl.host, rUrl.port);
     defer realtimeRedis.deinit();
     if (rUrl.password.len > 0) try realtimeRedis.auth(rUrl.password);
@@ -196,7 +205,7 @@ pub fn main(init: Init) !void {
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena)) {
+                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena, &hPool)) {
                     .saved       => break,
                     .retry_later => {
                         const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
