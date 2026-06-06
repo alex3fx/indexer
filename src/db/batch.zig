@@ -8,7 +8,7 @@ const CqlConn = pool.CqlConn;
 const BatchSizes = pool.BatchSizes;
 const tempAllocator = pool.tempAllocator;
 
-const Entities = schema.Entities;
+pub const Entities = schema.Entities;
 const BlockRow = schema.BlockRow;
 const TxRow = schema.TxRow;
 const LogRow = schema.LogRow;
@@ -91,27 +91,27 @@ pub fn saveBlock(conn: *CqlConn, ent: *const Entities, bs: BatchSizes) !void {
 
 // ─── Parallel save: N entities over 32 CQL connections ───────────────────────
 
-const TableSave = struct {
+pub const TableSave = struct {
     conn: *CqlConn,
     ents: []*const Entities,
     bs:   BatchSizes,
     err:  ?anyerror = null,
 };
 
-fn saveBlockRowsForEntities(g: *TableSave) void {
+pub fn saveBlockRowsForEntities(g: *TableSave) void {
     for (g.ents) |ent| {
         saveBlocks(g.conn, ent.blocks.items, g.bs.blocks) catch |e| { g.err = e; return; };
     }
 }
 
-fn saveContractRowsForEntities(g: *TableSave) void {
+pub fn saveContractRowsForEntities(g: *TableSave) void {
     for (g.ents) |ent| {
         saveContracts(g.conn, ent.contracts.items, g.bs.contracts) catch |e| { g.err = e; return; };
         saveContractsByAddr(g.conn, ent.contractsByAddr.items, g.bs.contracts) catch |e| { g.err = e; return; };
     }
 }
 
-const TableLaneSave = struct {
+pub const TableLaneSave = struct {
     conn:   *CqlConn,
     ents:   []*const Entities,
     bs:     BatchSizes,
@@ -120,7 +120,7 @@ const TableLaneSave = struct {
     err:    ?anyerror = null,
 };
 
-fn saveLogRowsForLane(g: *TableLaneSave) void {
+pub fn saveLogRowsForLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(LogRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -132,7 +132,7 @@ fn saveLogRowsForLane(g: *TableLaneSave) void {
     saveLogs(g.conn, rows.items, g.bs.logs) catch |e| { g.err = e; return; };
 }
 
-fn saveItxRowsForLane(g: *TableLaneSave) void {
+pub fn saveItxRowsForLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(InternalTxRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -144,7 +144,7 @@ fn saveItxRowsForLane(g: *TableLaneSave) void {
     saveInternalTxs(g.conn, rows.items, g.bs.itxs) catch |e| { g.err = e; return; };
 }
 
-fn saveTxRowsForLane(g: *TableLaneSave) void {
+pub fn saveTxRowsForLane(g: *TableLaneSave) void {
     var rows: std.ArrayList(TxRow) = .empty;
     defer rows.deinit(tempAllocator);
     for (g.ents) |ent| {
@@ -157,7 +157,7 @@ fn saveTxRowsForLane(g: *TableLaneSave) void {
 }
 
 // Batch-write all completion rows for a slice of entities in one CQL round-trip.
-fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const Entities) !void {
+pub fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const Entities) !void {
     if (ents.len == 0) return;
     const BATCH: usize = 50;
     var rowBuf:   std.ArrayList(u8) = preallocBuf(64); defer rowBuf.deinit(tempAllocator);

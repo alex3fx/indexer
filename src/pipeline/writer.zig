@@ -29,17 +29,18 @@ pub const ProcessBlockStatus = union(enum) {
 };
 
 pub fn processBlock(
-    io:       std.Io,
-    gpa:      Allocator,
-    chain:    *const EvmChainConfig,
-    rtConns:  *batch.RealtimeConns,
-    rdb:      *cursor.Conn,
-    bClient:  *FetchClient,
-    rClient:  *FetchClient,
-    tClient:  *FetchClient,
-    blockNum: u64,
-    arena:    *std.heap.ArenaAllocator,
-    hPool:    ?*http_pool.HttpPool,
+    io:           std.Io,
+    gpa:          Allocator,
+    chain:        *const EvmChainConfig,
+    rtConns:      *batch.RealtimeConns,
+    rdb:          *cursor.Conn,
+    bClient:      *FetchClient,
+    rClient:      *FetchClient,
+    tClient:      *FetchClient,
+    blockNum:     u64,
+    arena:        *std.heap.ArenaAllocator,
+    hPool:        ?*http_pool.HttpPool,
+    chunkBuckets: u64,
 ) ProcessBlockStatus {
     const rpcNode   = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
@@ -80,7 +81,7 @@ pub fn processBlock(
 
     const t_transform = nowNs();
     var ent = transformer.initEntities();
-    transformer.transformBlock(arenaAlloc, block, receipts, traces, chunkSize, &ent) catch |e| {
+    transformer.transformBlockWithRemap(arenaAlloc, block, receipts, traces, chunkSize, chunkBuckets, &ent) catch |e| {
         std.debug.print("[realtime] block={d} stage=transform error: {s}\n", .{ blockNum, @errorName(e) });
         return .{ .fatal = e };
     };

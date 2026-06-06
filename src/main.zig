@@ -205,7 +205,7 @@ pub fn main(init: Init) !void {
         while (blk <= blockNum) : (blk += 1) {
             var attempts: usize = 0;
             while (attempts < 5) : (attempts += 1) {
-                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena, &hPool)) {
+                switch (writer.processBlock(io, gpa, &chain, &rtConns, &realtimeRedis, &rtBClient, &rtRClient, &rtTClient, blk, &arena, &hPool, chunkBuckets)) {
                     .saved       => break,
                     .retry_later => {
                         const ts = std.os.linux.timespec{ .sec = 0, .nsec = 200_000_000 };
