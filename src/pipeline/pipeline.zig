@@ -47,23 +47,33 @@ const ITX_LANES: usize = batch.ACCUM_ITX_LANES;
 // ─── BlockResult ──────────────────────────────────────────────────────────────
 
 const BlockResult = struct {
+    gpa:      Allocator,
     arena:    std.heap.ArenaAllocator,
+    // Owns the raw HTTP response buffers (block.body, receipts.body, traces.body).
+    // ZC-parsed strings in `ent` point directly into these buffers — no copies.
+    // Must outlive saveEntitiesParallel; freed in deinit() after save completes.
+    rawData:  ?fetcher.Response,
     ent:      transformer.Entities,
     blockNum: u64,
     ok:       bool,
     err:      ?anyerror,
 
-    fn init() BlockResult {
+    fn init(gpa: Allocator) BlockResult {
         return .{
-            .arena    = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .ent      = transformer.initEntities(),
+            .gpa     = gpa,
+            .arena   = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .rawData = null,
+            .ent     = transformer.initEntities(),
             .blockNum = 0,
             .ok       = false,
             .err      = null,
         };
     }
 
-    fn deinit(self: *BlockResult) void { self.arena.deinit(); }
+    fn deinit(self: *BlockResult) void {
+        self.arena.deinit();
+        if (self.rawData) |*d| d.deinit(self.gpa);
+    }
 };
 
 // ─── MPSC result channel ──────────────────────────────────────────────────────
@@ -144,15 +154,18 @@ fn fetchAndTransform(
         .tracesClient   = tClient,
         .skipLogs       = true,
     }) catch |e| return .{ .fatal = e };
-    var data = maybeData orelse return .retry_later;
-    defer data.deinit(gpa);
+    const data = maybeData orelse return .retry_later;
+    // Transfer ownership to result: rawData.block/receipts/traces.body buffers
+    // stay alive until BlockResult.deinit() is called after save completes.
+    // ZC strings in `ent` are slices into these buffers — no memcpy of string bytes.
+    result.rawData = data;
 
     const aa    = result.arena.allocator();
-    const block = parser.parseBlockResp(data.block.body, aa) catch |e|
+    const block = parser.parseBlockRespZC(data.block.body, aa) catch |e|
         return .{ .fatal = e };
     if (block == null) return .skip_missing;
-    const receipts = (parser.parseReceiptsResp(data.receipts.body, aa) catch null) orelse &.{};
-    const traces   = (parser.parseTracesResp(data.traces.body, aa)     catch null) orelse &.{};
+    const receipts = (parser.parseReceiptsRespZC(data.receipts.body, aa) catch null) orelse &.{};
+    const traces   = (parser.parseTracesRespZC(data.traces.body, aa)     catch null) orelse &.{};
 
     transformer.transformBlockWithRemap(
         aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
@@ -196,7 +209,7 @@ fn worker(args: *WorkerArgs) !void {
         if (blockNum > args.to) break;
 
         const result = try gpa.create(BlockResult);
-        result.* = BlockResult.init();
+        result.* = BlockResult.init(gpa);
         result.blockNum = blockNum;
 
         retry: while (true) {
