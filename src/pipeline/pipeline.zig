@@ -133,6 +133,7 @@ const WorkerArgs = struct {
     chan:          *ResultChan,
     chunkBuckets: u64,
     cancel:       *std.atomic.Value(bool),
+    backupNode:   ?EvmRpcNodeConfig,
 };
 
 pub const FetchTransformStatus = union(enum) {
@@ -201,6 +202,13 @@ fn workerEntry(args: *WorkerArgs) void {
         std.debug.print("[worker] fatal: {s}\n", .{@errorName(e)});
 }
 
+pub fn resetResult(result: *BlockResult) void {
+    if (result.rawData) |*d| { d.deinit(result.gpa); result.rawData = null; }
+    result.arena.deinit();
+    result.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    result.ent = transformer.initEntities();
+}
+
 fn worker(args: *WorkerArgs) !void {
     const gpa          = args.gpa;
     const chain        = args.chain;
@@ -237,20 +245,52 @@ fn worker(args: *WorkerArgs) !void {
                     break :retry;
                 },
                 .skip_missing => {
-                    std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
+                    // Block null on primary — try backup before giving up.
+                    if (args.backupNode) |backup| {
+                        resetResult(result);
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets,
+                                &bClient, &rClient, &tClient, null, result) == .ok)
+                        {
+                            result.ok = true;
+                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
+                                blockNum, result.ent.txs.items.len,
+                                result.ent.logs.items.len, result.ent.internalTxs.items.len,
+                            });
+                        } else {
+                            std.debug.print("[worker] block={d} skip_missing on primary and backup\n", .{blockNum});
+                        }
+                    } else {
+                        std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
+                    }
                     break :retry;
                 },
                 .retry_later  => {
                     if (args.cancel.load(.acquire)) break :retry;
                     const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
                     _ = linux.nanosleep(&ts, null);
-                    result.arena.deinit();
-                    result.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                    result.ent = transformer.initEntities();
+                    resetResult(result);
                 },
                 .fatal        => |e| {
-                    result.err = e;
-                    std.debug.print("[worker] block={d} fatal: {s}\n", .{ blockNum, @errorName(e) });
+                    // Try backup node before marking as skipped.
+                    if (args.backupNode) |backup| {
+                        std.debug.print("[worker] block={d} primary error: {s} — trying backup\n",
+                            .{ blockNum, @errorName(e) });
+                        resetResult(result);
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets,
+                                &bClient, &rClient, &tClient, null, result) == .ok)
+                        {
+                            result.ok = true;
+                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
+                                blockNum, result.ent.txs.items.len,
+                                result.ent.logs.items.len, result.ent.internalTxs.items.len,
+                            });
+                        } else {
+                            std.debug.print("[worker] block={d} unavailable on all nodes — skipping\n", .{blockNum});
+                        }
+                    } else {
+                        std.debug.print("[worker] block={d} error: {s} — no backup, skipping\n",
+                            .{ blockNum, @errorName(e) });
+                    }
                     break :retry;
                 },
             }
@@ -465,6 +505,7 @@ fn spawnHistoricalWorkers(
     cancel:       *std.atomic.Value(bool),
     next:         *std.atomic.Value(u64),
     threads:      []std.Thread,
+    backupNode:   ?EvmRpcNodeConfig,
 ) !void {
     for (0..threads.len) |w| {
         const wargs = try gpa.create(WorkerArgs);
@@ -477,6 +518,7 @@ fn spawnHistoricalWorkers(
             .chan         = chan,
             .chunkBuckets = chunkBuckets,
             .cancel       = cancel,
+            .backupNode   = backupNode,
         };
         _ = from; // from is encoded in next (already set to from by caller)
         threads[w] = try std.Thread.spawn(
@@ -508,6 +550,94 @@ fn abortAndDrain(
     }
 }
 
+// ─── retryMissingBlocks ───────────────────────────────────────────────────────
+
+// After historical sync: retry blocks that all workers couldn't fetch.
+// Tries primary, then backup. Saves recovered blocks directly (no AccumState).
+// Returns error.MissingHistoricalBlocks if any remain unresolved — caller must
+// not proceed to realtime mode in that case.
+fn retryMissingBlocks(
+    gpa:          Allocator,
+    io:           std.Io,
+    chain:        *const EvmChainConfig,
+    backupNode:   ?EvmRpcNodeConfig,
+    skipped:      []const u64,
+    conns:        *HistoricalConns,
+    bs:           pool.BatchSizes,
+    chunkBuckets: u64,
+) !void {
+    if (skipped.len == 0) return;
+    std.debug.print("\n[historical] {d} skipped block(s) — retrying...\n", .{skipped.len});
+
+    const rpcNode   = chain.rpcNodes.lotosArchiveNode;
+    const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
+
+    var bClient = FetchClient.init(gpa, io);
+    var rClient = FetchClient.init(gpa, io);
+    var tClient = FetchClient.init(gpa, io);
+    defer bClient.deinit();
+    defer rClient.deinit();
+    defer tClient.deinit();
+
+    var stillMissing: usize = 0;
+
+    for (skipped) |blockNum| {
+        var result = BlockResult.init(gpa);
+        defer result.deinit();
+        result.blockNum = blockNum;
+
+        // Try primary.
+        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets,
+                &bClient, &rClient, &tClient, null, &result)) {
+            .ok => true,
+            else => false,
+        };
+
+        // Try backup if primary didn't deliver.
+        if (!found) {
+            if (backupNode) |backup| {
+                resetResult(&result);
+                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets,
+                        &bClient, &rClient, &tClient, null, &result)) {
+                    .ok => true,
+                    else => false,
+                };
+                if (!found) {
+                    std.debug.print("[historical-retry] block={d} unavailable on primary and backup\n",
+                        .{blockNum});
+                }
+            } else {
+                std.debug.print("[historical-retry] block={d} unavailable (no backup configured)\n",
+                    .{blockNum});
+            }
+        }
+
+        if (found) {
+            std.debug.print("[historical-retry] block={d} recovered — saving\n", .{blockNum});
+            var ents = [1]*const transformer.Entities{&result.ent};
+            batch.saveEntitiesParallel(
+                &conns.blocks, &conns.txs, &conns.contracts,
+                &conns.logs, &conns.itxs, &conns.comp,
+                ents[0..], bs,
+            ) catch |e| {
+                std.debug.print("[historical-retry] save error block={d}: {s}\n",
+                    .{ blockNum, @errorName(e) });
+                stillMissing += 1;
+            };
+        } else {
+            stillMissing += 1;
+        }
+    }
+
+    if (stillMissing > 0) {
+        std.debug.print(
+            "[historical] {d} block(s) permanently missing — cannot proceed to realtime\n",
+            .{stillMissing});
+        return error.MissingHistoricalBlocks;
+    }
+    std.debug.print("[historical] all skipped blocks recovered\n", .{});
+}
+
 // ─── runHistorical ────────────────────────────────────────────────────────────
 
 pub fn runHistorical(
@@ -524,6 +654,7 @@ pub fn runHistorical(
     redisUrl:     []const u8,
     chunkBuckets: u64,
     saveEvery:    usize,
+    backupNode:   ?EvmRpcNodeConfig,
 ) !void {
     if (from > to) return;
 
@@ -550,24 +681,22 @@ pub fn runHistorical(
 
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
-    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads);
+    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
     accum.* = AccumState.init(gpa);
 
+    // Collect block numbers that workers could not fetch from any node.
+    var skippedBlocks: std.ArrayList(u64) = .empty;
+    defer skippedBlocks.deinit(gpa);
+
     const t0         = nowNs();
     var blocksDone: u64 = 0;
 
     while (chan.pop()) |result| {
-        if (result.err) |e| {
-            std.debug.print("[historical] fatal error at block {d}: {s} — aborting\n",
-                .{ result.blockNum, @errorName(e) });
-            result.deinit();
-            gpa.destroy(result);
-            abortAndDrain(gpa, &chan, threads, accum, &prevSave, &cancel);
-            return e;
-        }
+        if (!result.ok) try skippedBlocks.append(gpa, result.blockNum);
+
         try accum.add(result);
 
         if (accum.entPtrs.items.len >= saveEvery) {
@@ -599,4 +728,8 @@ pub fn runHistorical(
     const elapsedMs = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
     std.debug.print("\nHistorical sync done: {d:.0}ms  saved_blocks={d}\n",
         .{ elapsedMs, blocksDone });
+
+    // Retry any blocks that were skipped during the main pass, then verify
+    // all are present before the caller transitions to realtime mode.
+    try retryMissingBlocks(gpa, io, chain, backupNode, skippedBlocks.items, &conns, bs, chunkBuckets);
 }

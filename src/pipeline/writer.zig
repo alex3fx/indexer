@@ -11,8 +11,9 @@ const http_pool  = @import("../rpc/pool.zig");
 const batch      = @import("../db/batch.zig");
 const cursor     = @import("../db/cursor.zig");
 
-const EvmChainConfig = core.structures.EvmChainConfig;
-const Allocator      = std.mem.Allocator;
+const EvmChainConfig   = core.structures.EvmChainConfig;
+const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
+const Allocator        = std.mem.Allocator;
 
 fn nowNs() i64 {
     var ts: linux.timespec = undefined;
@@ -38,6 +39,7 @@ pub fn processBlock(
     blockNum:     u64,
     hPool:        ?*http_pool.HttpPool,
     chunkBuckets: u64,
+    backupNode:   ?EvmRpcNodeConfig,
 ) ProcessBlockStatus {
     const rpcNode   = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
@@ -46,20 +48,33 @@ pub fn processBlock(
     var result = pipeline.BlockResult.init(gpa);
     defer result.deinit();
 
-    switch (pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets,
-        bClient, rClient, tClient, hPool, &result))
-    {
-        .ok          => {},
-        .retry_later => return .retry_later,
-        .skip_missing => {
-            std.debug.print("[realtime] block={d} stage=parse_block: null result\n", .{blockNum});
-            return .retry_later;
+    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets,
+        bClient, rClient, tClient, hPool, &result);
+
+    const fetched = switch (primaryStatus) {
+        .ok => true,
+        .retry_later, .skip_missing => blk: {
+            if (backupNode) |backup| {
+                pipeline.resetResult(&result);
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets,
+                    bClient, rClient, tClient, null, &result) == .ok;
+            }
+            break :blk false;
         },
-        .fatal => |e| {
-            std.debug.print("[realtime] block={d} stage=fpt error: {s}\n", .{ blockNum, @errorName(e) });
-            return .{ .fatal = e };
+        .fatal => |e| blk: {
+            std.debug.print("[realtime] block={d} primary error: {s}", .{ blockNum, @errorName(e) });
+            if (backupNode) |backup| {
+                std.debug.print(" — trying backup\n", .{});
+                pipeline.resetResult(&result);
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets,
+                    bClient, rClient, tClient, null, &result) == .ok;
+            }
+            std.debug.print("\n", .{});
+            break :blk false;
         },
-    }
+    };
+
+    if (!fetched) return .retry_later;
 
     const fetch_ms     = @as(f64, @floatFromInt(result.fetchNs))     / 1e6;
     const parse_ms     = @as(f64, @floatFromInt(result.parseNs))     / 1e6;

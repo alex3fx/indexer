@@ -10,8 +10,10 @@ const Init = std.process.Init;
 const core  = @import("indexer/core");
 const utils = @import("indexer/utils");
 
-const EnvVariable = core.enums.EnvVariable;
-const FetchClient = core.fetch.Client;
+const EnvVariable      = core.enums.EnvVariable;
+const FetchClient      = core.fetch.Client;
+const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
+const EvmRpcClientType = core.enums.EvmRpcClientType;
 
 const pipeline  = @import("pipeline/pipeline.zig");
 const writer    = @import("pipeline/writer.zig");
@@ -66,14 +68,16 @@ fn readCursorBlock(rdb: *cursor.Conn, gpa: std.mem.Allocator) ?u64 {
 // ─── Realtime loop ────────────────────────────────────────────────────────────
 
 const RealtimeContext = struct {
-    rtConns:      batch.RealtimeConns,
-    hPool:        http_pool.HttpPool,
-    redis:        cursor.Conn,
-    bClient:      FetchClient,
-    rClient:      FetchClient,
-    tClient:      FetchClient,
-    wsDelayMs:    u64,
-    chunkBuckets: u64,
+    rtConns:        batch.RealtimeConns,
+    hPool:          http_pool.HttpPool,
+    redis:          cursor.Conn,
+    bClient:        FetchClient,
+    rClient:        FetchClient,
+    tClient:        FetchClient,
+    wsDelayMs:      u64,
+    retryDelayMs:   u64,
+    chunkBuckets:   u64,
+    backupNode:     ?EvmRpcNodeConfig,
 
     fn init(
         gpa:          std.mem.Allocator,
@@ -83,6 +87,7 @@ const RealtimeContext = struct {
         redisUrl:     []const u8,
         chunkBuckets: u64,
         environ:      anytype,
+        backupNode:   ?EvmRpcNodeConfig,
     ) !RealtimeContext {
         std.debug.print("Connecting realtime CQL (32 conns)...\n", .{});
         var rtConns = try batch.RealtimeConns.init(gpa,
@@ -105,17 +110,24 @@ const RealtimeContext = struct {
         else
             100;
 
+        const retryDelayMs: u64 = if (environ.get("RT_RETRY_DELAY_MS")) |v|
+            std.fmt.parseInt(u64, v, 10) catch 2000
+        else
+            2000;
+
         _ = chain;
 
         return .{
-            .rtConns      = rtConns,
-            .hPool        = hPool,
-            .redis        = redis,
-            .bClient      = FetchClient.init(gpa, io),
-            .rClient      = FetchClient.init(gpa, io),
-            .tClient      = FetchClient.init(gpa, io),
-            .wsDelayMs    = wsDelayMs,
-            .chunkBuckets = chunkBuckets,
+            .rtConns        = rtConns,
+            .hPool          = hPool,
+            .redis          = redis,
+            .bClient        = FetchClient.init(gpa, io),
+            .rClient        = FetchClient.init(gpa, io),
+            .tClient        = FetchClient.init(gpa, io),
+            .wsDelayMs      = wsDelayMs,
+            .retryDelayMs   = retryDelayMs,
+            .chunkBuckets   = chunkBuckets,
+            .backupNode     = backupNode,
         };
     }
 
@@ -165,21 +177,29 @@ fn runRealtimeLoop(
         // Process this block and any skipped blocks (gap fill).
         var blk = cursorPos + 1;
         while (blk <= blockNum) : (blk += 1) {
-            var attempts: usize = 0;
-            while (attempts < 5) : (attempts += 1) {
+            // Infinite retry: keep trying until the block is saved.
+            // processBlock tries primary, then backup on any failure.
+            // Only returns .retry_later when both are unavailable.
+            while (true) {
                 switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis,
-                    &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets))
+                    &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets,
+                    ctx.backupNode))
                 {
-                    .saved       => break,
-                    .retry_later => delayMs(200),
+                    .saved => break,
+                    .retry_later => {
+                        std.debug.print(
+                            "[realtime] block={d} unavailable on all nodes — retry in {d}ms\n",
+                            .{ blk, ctx.retryDelayMs });
+                        delayMs(ctx.retryDelayMs);
+                    },
                     .fatal => |e| {
-                        std.debug.print("[realtime] block={d} fatal: {s}\n", .{ blk, @errorName(e) });
-                        break;
+                        std.debug.print(
+                            "[realtime] block={d} fatal: {s} — retry in {d}ms\n",
+                            .{ blk, @errorName(e), ctx.retryDelayMs });
+                        delayMs(ctx.retryDelayMs);
                     },
                 }
             }
-            if (attempts == 5)
-                std.debug.print("[realtime] block {d}: skipped after 5 attempts\n", .{blk});
         }
         cursorPos = blockNum;
     }
@@ -242,6 +262,20 @@ pub fn main(init: Init) !void {
         },
     );
 
+    // ── Backup RPC node (optional) ────────────────────────────────────────────
+    const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
+        if (url.len > 0) EvmRpcNodeConfig{
+            .type  = chain.rpcNodes.lotosArchiveNode.type,
+            .https = url,
+            .wss   = "",
+        } else null
+    else
+        null;
+
+    if (backupNode) |bn| {
+        std.debug.print("Backup RPC: {s}\n", .{bn.https});
+    }
+
     // ── Env overrides ─────────────────────────────────────────────────────────
     const chunkBuckets: u64 = if (init.environ_map.get("SCYLLA_CHUNK_BUCKETS")) |v|
         std.fmt.parseInt(u64, v, 10) catch {
@@ -268,6 +302,7 @@ pub fn main(init: Init) !void {
             redisUrl,
             chunkBuckets,
             saveEvery,
+            backupNode,
         );
     }
 
@@ -277,7 +312,7 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     std.debug.print("\nRealtime mode — listening for new blocks via WSS...\n\n", .{});
 
-    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map);
+    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode);
     defer ctx.deinit();
 
     try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock);
