@@ -302,6 +302,81 @@ const AccumState = struct {
     }
 };
 
+// ─── HistoricalConns — all CQL connections for a historical run ───────────────
+
+const HistoricalConns = struct {
+    gpa:       Allocator,
+    blocks:    pool.CqlConn,
+    txs:       [TXS_LANES]pool.CqlConn,
+    contracts: pool.CqlConn,
+    logs:      [LOG_LANES]pool.CqlConn,
+    itxs:      [ITX_LANES]pool.CqlConn,
+    comp:      pool.CqlConn,
+
+    fn open(
+        gpa:  Allocator,
+        host: []const u8, port: u16,
+        ks:   []const u8,
+        user: []const u8, pass: []const u8,
+    ) !HistoricalConns {
+        var self: HistoricalConns = undefined;
+        self.gpa = gpa;
+
+        self.blocks    = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer self.blocks.deinit();
+        self.contracts = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer self.contracts.deinit();
+        self.comp      = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer self.comp.deinit();
+
+        var txsN: usize = 0;
+        errdefer for (0..txsN) |i| self.txs[i].deinit();
+        for (0..TXS_LANES) |i| {
+            self.txs[i] = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+            txsN += 1;
+        }
+
+        var logsN: usize = 0;
+        errdefer for (0..logsN) |i| self.logs[i].deinit();
+        for (0..LOG_LANES) |i| {
+            self.logs[i] = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+            logsN += 1;
+        }
+
+        var itxsN: usize = 0;
+        errdefer for (0..itxsN) |i| self.itxs[i].deinit();
+        for (0..ITX_LANES) |i| {
+            self.itxs[i] = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+            itxsN += 1;
+        }
+
+        return self;
+    }
+
+    fn deinit(self: *HistoricalConns) void {
+        self.blocks.deinit();
+        self.contracts.deinit();
+        self.comp.deinit();
+        for (&self.txs)  |*c| c.deinit();
+        for (&self.logs) |*c| c.deinit();
+        for (&self.itxs) |*c| c.deinit();
+    }
+
+    fn saveArgs(self: *HistoricalConns, accum: *AccumState, rdb: *cursor.Conn, bs: pool.BatchSizes) SaveArgs {
+        return .{
+            .accum      = accum,
+            .cBlocks    = &self.blocks,
+            .cTxs       = &self.txs,
+            .cContracts = &self.contracts,
+            .cLogs      = &self.logs,
+            .cItxs      = &self.itxs,
+            .cComp      = &self.comp,
+            .rdb        = rdb,
+            .bs         = bs,
+        };
+    }
+};
+
 // ─── SaveArgs + save thread ───────────────────────────────────────────────────
 
 const SaveArgs = struct {
@@ -377,6 +452,62 @@ const PrevSave = struct {
     }
 };
 
+// ─── Worker spawn ─────────────────────────────────────────────────────────────
+
+fn spawnHistoricalWorkers(
+    gpa:          Allocator,
+    io:           std.Io,
+    chain:        *const EvmChainConfig,
+    from:         u64,
+    to:           u64,
+    chan:          *ResultChan,
+    chunkBuckets: u64,
+    cancel:       *std.atomic.Value(bool),
+    next:         *std.atomic.Value(u64),
+    threads:      []std.Thread,
+) !void {
+    for (0..threads.len) |w| {
+        const wargs = try gpa.create(WorkerArgs);
+        wargs.* = .{
+            .io           = io,
+            .gpa          = gpa,
+            .chain        = chain,
+            .next         = next,
+            .to           = to,
+            .chan         = chan,
+            .chunkBuckets = chunkBuckets,
+            .cancel       = cancel,
+        };
+        _ = from; // from is encoded in next (already set to from by caller)
+        threads[w] = try std.Thread.spawn(
+            .{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
+    }
+}
+
+// ─── Accumulator error path cleanup ───────────────────────────────────────────
+
+fn abortAndDrain(
+    gpa:      Allocator,
+    chan:      *ResultChan,
+    threads:  []std.Thread,
+    accum:    *AccumState,
+    prevSave: *?PrevSave,
+    cancel:   *std.atomic.Value(bool),
+) void {
+    cancel.store(true, .release);
+    while (chan.pop()) |r| { r.deinit(); gpa.destroy(r); }
+    for (threads) |t| t.join();
+    accum.deinit();
+    gpa.destroy(accum);
+    if (prevSave.*) |*ps| {
+        ps.thread.join();
+        gpa.destroy(ps.args);
+        ps.accum.deinit();
+        gpa.destroy(ps.accum);
+        prevSave.* = null;
+    }
+}
+
 // ─── runHistorical ────────────────────────────────────────────────────────────
 
 pub fn runHistorical(
@@ -404,39 +535,8 @@ pub fn runHistorical(
         "Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,3,6,20,1,1\n\n",
         .{ from, to, workerCount, saveEvery, chunkBuckets });
 
-    var cBlocks = try pool.CqlConn.init(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
-    defer cBlocks.deinit();
-    var cContracts = try pool.CqlConn.init(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
-    defer cContracts.deinit();
-    var cComp = try pool.CqlConn.init(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
-    defer cComp.deinit();
-
-    var cTxs:  [TXS_LANES]pool.CqlConn = undefined;
-    var cTxsN: usize = 0;
-    defer for (0..cTxsN) |i| cTxs[i].deinit();
-    for (0..TXS_LANES) |i| {
-        cTxs[i] = try pool.CqlConn.init(
-            gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
-        cTxsN += 1;
-    }
-
-    var cLogs:  [LOG_LANES]pool.CqlConn = undefined;
-    var cLogsN: usize = 0;
-    defer for (0..cLogsN) |i| cLogs[i].deinit();
-    for (0..LOG_LANES) |i| {
-        cLogs[i] = try pool.CqlConn.init(
-            gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
-        cLogsN += 1;
-    }
-
-    var cItxs:  [ITX_LANES]pool.CqlConn = undefined;
-    var cItxsN: usize = 0;
-    defer for (0..cItxsN) |i| cItxs[i].deinit();
-    for (0..ITX_LANES) |i| {
-        cItxs[i] = try pool.CqlConn.init(
-            gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
-        cItxsN += 1;
-    }
+    var conns = try HistoricalConns.open(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
+    defer conns.deinit();
 
     var rdb = try cursor.Conn.init(gpa, rUrl.host, rUrl.port);
     defer rdb.deinit();
@@ -450,21 +550,7 @@ pub fn runHistorical(
 
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
-    for (0..workerCount) |w| {
-        const wargs = try gpa.create(WorkerArgs);
-        wargs.* = .{
-            .io           = io,
-            .gpa          = gpa,
-            .chain        = chain,
-            .next         = &next,
-            .to           = to,
-            .chan         = &chan,
-            .chunkBuckets = chunkBuckets,
-            .cancel       = &cancel,
-        };
-        threads[w] = try std.Thread.spawn(
-            .{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
-    }
+    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
@@ -479,17 +565,7 @@ pub fn runHistorical(
                 .{ result.blockNum, @errorName(e) });
             result.deinit();
             gpa.destroy(result);
-            cancel.store(true, .release);
-            while (chan.pop()) |r| { r.deinit(); gpa.destroy(r); }
-            for (threads) |t| t.join();
-            accum.deinit();
-            gpa.destroy(accum);
-            if (prevSave) |*ps| {
-                ps.thread.join();
-                gpa.destroy(ps.args);
-                ps.accum.deinit();
-                gpa.destroy(ps.accum);
-            }
+            abortAndDrain(gpa, &chan, threads, accum, &prevSave, &cancel);
             return e;
         }
         try accum.add(result);
@@ -499,17 +575,7 @@ pub fn runHistorical(
                 try ps.finish(gpa, &blocksDone, t0);
                 prevSave = null;
             }
-            prevSave = try PrevSave.start(gpa, .{
-                .accum      = accum,
-                .cBlocks    = &cBlocks,
-                .cTxs       = &cTxs,
-                .cContracts = &cContracts,
-                .cLogs      = &cLogs,
-                .cItxs      = &cItxs,
-                .cComp      = &cComp,
-                .rdb        = &rdb,
-                .bs         = bs,
-            });
+            prevSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs));
             accum  = try gpa.create(AccumState);
             accum.* = AccumState.init(gpa);
         }
@@ -523,17 +589,7 @@ pub fn runHistorical(
     }
 
     if (accum.savedCount() > 0) {
-        var finalSave = try PrevSave.start(gpa, .{
-            .accum      = accum,
-            .cBlocks    = &cBlocks,
-            .cTxs       = &cTxs,
-            .cContracts = &cContracts,
-            .cLogs      = &cLogs,
-            .cItxs      = &cItxs,
-            .cComp      = &cComp,
-            .rdb        = &rdb,
-            .bs         = bs,
-        });
+        var finalSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs));
         try finalSave.finish(gpa, &blocksDone, t0);
     } else {
         accum.deinit();
