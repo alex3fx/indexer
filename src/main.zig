@@ -14,13 +14,14 @@ const EnvVariable      = core.enums.EnvVariable;
 const FetchClient      = core.fetch.Client;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
 
-const pipeline  = @import("pipeline/pipeline.zig");
-const writer    = @import("pipeline/writer.zig");
-const ws        = @import("rpc/ws.zig");
-const cursor    = @import("db/cursor.zig");
-const pool      = @import("db/pool.zig");
-const batch     = @import("db/batch.zig");
-const http_pool = @import("rpc/pool.zig");
+const pipeline   = @import("pipeline/pipeline.zig");
+const writer     = @import("pipeline/writer.zig");
+const ws         = @import("rpc/ws.zig");
+const cursor     = @import("db/cursor.zig");
+const pool       = @import("db/pool.zig");
+const batch      = @import("db/batch.zig");
+const http_pool  = @import("rpc/pool.zig");
+const node_probe = @import("rpc/node_probe.zig");
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 
@@ -272,6 +273,18 @@ pub fn main(init: Init) !void {
 
     if (backupNode) |bn| {
         std.debug.print("Backup RPC: {s}\n", .{bn.https});
+    }
+
+    // ── Pre-detect node type from main thread ─────────────────────────────────
+    // Must run before any worker threads or pool workers start, so all subsequent
+    // detect() calls are cache hits (no HTTP from thread-pool context).
+    {
+        var detectClient = FetchClient.init(gpa, io);
+        defer detectClient.deinit();
+        _ = node_probe.detect(gpa, &detectClient, chain.rpcNodes.lotosArchiveNode.https);
+        if (backupNode) |bn| {
+            _ = node_probe.detect(gpa, &detectClient, bn.https);
+        }
     }
 
     // ── Env overrides ─────────────────────────────────────────────────────────
