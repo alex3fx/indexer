@@ -1,6 +1,7 @@
-const enums = @import("indexer/core").enums;
-const structures = @import("indexer/core").structures;
-const utils = @import("indexer/utils");
+const core = @import("indexer/core");
+const enums = core.enums;
+const structures = core.structures;
+const utils = core.utils;
 const EvmChainConfig = structures.EvmChainConfig;
 const EvmCurrencySymbol = enums.EvmCurrencySymbol;
 const EvmSystemCurrency = enums.EvmSystemCurrency;
@@ -17,10 +18,10 @@ pub const bsc: EvmChainConfig = .{
     },
     .indexingOptions = .{
         .workerCount = 64,
-        .batchSizeBlocks   = 50,
-        .batchSizeTxs      = 100,
-        .batchSizeLogs     = 200,
-        .batchSizeItxs     = 500,
+        .batchSizeBlocks = 50,
+        .batchSizeTxs = 100,
+        .batchSizeLogs = 200,
+        .batchSizeItxs = 500,
         .batchSizeContracts = 50,
         .minifiedChunkSize = 200,
     },

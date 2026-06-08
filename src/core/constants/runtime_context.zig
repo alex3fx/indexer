@@ -2,7 +2,7 @@ const std = @import("std");
 const Init = std.process.Init;
 
 const core = @import("indexer/core");
-const utils = @import("indexer/utils");
+const utils = core.utils;
 const AppErrorCode = core.enums.AppErrorCode;
 const Env = utils.Env;
 const ParseEnvError = utils.ParseEnvError;

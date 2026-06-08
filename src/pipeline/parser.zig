@@ -3,7 +3,7 @@
 // ZC variants return slices directly into the raw buffer (zero copy, zero alloc per string).
 const std = @import("std");
 
-const types = @import("../rpc/types.zig");
+const types = @import("indexer/rpc").types;
 
 pub const RpcBlock = types.RpcBlock;
 pub const RpcTransaction = types.RpcTransaction;
@@ -21,7 +21,9 @@ const P = struct {
     s: []const u8,
     i: usize = 0,
 
-    fn init(s: []const u8) P { return .{ .s = s, .i = 0 }; }
+    fn init(s: []const u8) P {
+        return .{ .s = s, .i = 0 };
+    }
 
     inline fn ws(p: *P) void {
         while (p.i < p.s.len) : (p.i += 1) {
@@ -39,7 +41,10 @@ const P = struct {
 
     inline fn eat(p: *P, c: u8) bool {
         p.ws();
-        if (p.i < p.s.len and p.s[p.i] == c) { p.i += 1; return true; }
+        if (p.i < p.s.len and p.s[p.i] == c) {
+            p.i += 1;
+            return true;
+        }
         return false;
     }
 
@@ -65,7 +70,7 @@ const P = struct {
     fn optStr(p: *P) ?[]const u8 {
         p.ws();
         if (p.i + 3 < p.s.len and p.s[p.i] == 'n' and
-            p.s[p.i+1] == 'u' and p.s[p.i+2] == 'l' and p.s[p.i+3] == 'l')
+            p.s[p.i + 1] == 'u' and p.s[p.i + 2] == 'l' and p.s[p.i + 3] == 'l')
         {
             p.i += 4;
             return null;
@@ -76,8 +81,14 @@ const P = struct {
 
     fn boolean(p: *P) bool {
         p.ws();
-        if (p.i + 3 < p.s.len and p.s[p.i] == 't') { p.i += 4; return true; }
-        if (p.i + 4 < p.s.len and p.s[p.i] == 'f') { p.i += 5; return false; }
+        if (p.i + 3 < p.s.len and p.s[p.i] == 't') {
+            p.i += 4;
+            return true;
+        }
+        if (p.i + 4 < p.s.len and p.s[p.i] == 'f') {
+            p.i += 5;
+            return false;
+        }
         return false;
     }
 
@@ -90,8 +101,14 @@ const P = struct {
                 p.i += 1;
                 while (p.i < p.s.len) {
                     p.ws();
-                    if (p.s[p.i] == '}') { p.i += 1; return; }
-                    if (p.s[p.i] == ',') { p.i += 1; continue; }
+                    if (p.s[p.i] == '}') {
+                        p.i += 1;
+                        return;
+                    }
+                    if (p.s[p.i] == ',') {
+                        p.i += 1;
+                        continue;
+                    }
                     _ = p.str();
                     _ = p.eat(':');
                     p.skip();
@@ -101,8 +118,14 @@ const P = struct {
                 p.i += 1;
                 while (p.i < p.s.len) {
                     p.ws();
-                    if (p.s[p.i] == ']') { p.i += 1; return; }
-                    if (p.s[p.i] == ',') { p.i += 1; continue; }
+                    if (p.s[p.i] == ']') {
+                        p.i += 1;
+                        return;
+                    }
+                    if (p.s[p.i] == ',') {
+                        p.i += 1;
+                        continue;
+                    }
                     p.skip();
                 }
             },
@@ -135,8 +158,10 @@ fn readInt(p: *P) !usize {
     var found = false;
     while (p.i < p.s.len) : (p.i += 1) {
         const c = p.s[p.i];
-        if (c >= '0' and c <= '9') { n = n * 10 + (c - '0'); found = true; }
-        else break;
+        if (c >= '0' and c <= '9') {
+            n = n * 10 + (c - '0');
+            found = true;
+        } else break;
     }
     return if (found) n else error.NotAnInt;
 }
@@ -159,8 +184,14 @@ fn parseBlockObj(p: *P, arena: Al, comptime zc: bool) !RpcBlock {
     var txs_al: std.ArrayList(RpcTransaction) = .empty;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "number")) {
@@ -204,9 +235,18 @@ fn parseTxArray(p: *P, arena: Al, out: *std.ArrayList(RpcTransaction), comptime 
     try out.ensureTotalCapacity(arena, 256);
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') { p.i += 1; return; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
-        if (p.s[p.i] != '{') { p.skip(); continue; }
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            return;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
+        if (p.s[p.i] != '{') {
+            p.skip();
+            continue;
+        }
         try out.append(arena, try parseTx(p, arena, zc));
     }
 }
@@ -216,8 +256,14 @@ fn parseTx(p: *P, arena: Al, comptime zc: bool) !RpcTransaction {
     var tx = RpcTransaction{};
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "hash")) {
@@ -237,7 +283,7 @@ fn parseTx(p: *P, arena: Al, comptime zc: bool) !RpcTransaction {
         } else if (eql(key, "input")) {
             tx.input = try S(p, arena, zc);
         } else if (eql(key, "type")) {
-            tx.@"type" = try S(p, arena, zc);
+            tx.type = try S(p, arena, zc);
         } else if (eql(key, "maxPriorityFeePerGas")) {
             tx.maxPriorityFeePerGas = try OS(p, arena, zc);
         } else if (eql(key, "maxFeePerGas")) {
@@ -256,9 +302,18 @@ fn parseReceiptsArr(p: *P, arena: Al, comptime zc: bool) ![]RpcReceipt {
     var rcpts = try std.ArrayList(RpcReceipt).initCapacity(arena, 256);
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
-        if (p.s[p.i] != '{') { p.skip(); continue; }
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
+        if (p.s[p.i] != '{') {
+            p.skip();
+            continue;
+        }
         try rcpts.append(arena, try parseReceipt(p, arena, zc));
     }
     return try rcpts.toOwnedSlice(arena);
@@ -286,8 +341,14 @@ fn parseReceipt(p: *P, arena: Al, comptime zc: bool) !RpcReceipt {
     var logs_al: std.ArrayList(RpcLog) = .empty;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "transactionHash")) {
@@ -319,9 +380,18 @@ fn parseLogArray(p: *P, arena: Al, out: *std.ArrayList(RpcLog), comptime zc: boo
     if (!p.eat('[')) return;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') { p.i += 1; return; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
-        if (p.s[p.i] != '{') { p.skip(); continue; }
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            return;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
+        if (p.s[p.i] != '{') {
+            p.skip();
+            continue;
+        }
         try out.append(arena, try parseLog(p, arena, zc));
     }
 }
@@ -332,8 +402,14 @@ fn parseLog(p: *P, arena: Al, comptime zc: bool) !RpcLog {
     var topics_al: std.ArrayList([]const u8) = .empty;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "address")) {
@@ -364,8 +440,14 @@ fn parseTopics(p: *P, arena: Al, out: *std.ArrayList([]const u8), comptime zc: b
     try out.ensureTotalCapacity(arena, 4);
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') { p.i += 1; return; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            return;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         try out.append(arena, try S(p, arena, zc));
     }
 }
@@ -377,9 +459,18 @@ fn parseTracesArr(p: *P, arena: Al, comptime zc: bool) ![]RpcTrace {
     var traces = try std.ArrayList(RpcTrace).initCapacity(arena, 2048);
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
-        if (p.s[p.i] != '{') { p.skip(); continue; }
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
+        if (p.s[p.i] != '{') {
+            p.skip();
+            continue;
+        }
         try traces.append(arena, try parseTrace(p, arena, zc));
     }
     return try traces.toOwnedSlice(arena);
@@ -406,8 +497,14 @@ fn parseTrace(p: *P, arena: Al, comptime zc: bool) !RpcTrace {
     var trace = RpcTrace{};
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "transactionHash")) {
@@ -422,8 +519,11 @@ fn parseTrace(p: *P, arena: Al, comptime zc: bool) !RpcTrace {
             trace.action = try parseAction(p, arena, zc);
         } else if (eql(key, "result")) {
             p.ws();
-            if (p.s[p.i] == 'n') { p.skip(); }
-            else { trace.result = try parseResult(p, arena, zc); }
+            if (p.s[p.i] == 'n') {
+                p.skip();
+            } else {
+                trace.result = try parseResult(p, arena, zc);
+            }
         } else {
             p.skip();
         }
@@ -436,8 +536,14 @@ fn parseAction(p: *P, arena: Al, comptime zc: bool) !RpcAction {
     var action = RpcAction{};
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "from")) {
@@ -464,8 +570,14 @@ fn parseResult(p: *P, arena: Al, comptime zc: bool) !RpcResult {
     var res = RpcResult{};
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "address")) {
@@ -499,8 +611,14 @@ fn parseGethTracesArr(p: *P, arena: Al) ![]RpcTrace {
     var tx_pos: i32 = 0;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         if (p.s[p.i] == '{') {
             try parseGethTxEntry(p, arena, tx_pos, &out);
             tx_pos += 1;
@@ -519,8 +637,14 @@ fn parseGethTxEntry(p: *P, arena: Al, tx_pos: i32, out: *std.ArrayList(RpcTrace)
     var has_result = false;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "txHash") or eql(key, "transactionHash")) {
@@ -565,8 +689,14 @@ fn flattenCallFrame(
 
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == '}') { p.i += 1; break; }
-        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
         const key = p.str();
         _ = p.eat(':');
         if (eql(key, "from")) {
@@ -602,18 +732,18 @@ fn flattenCallFrame(
 
     if (!is_selfdestruct) {
         var trace = RpcTrace{
-            .transactionHash     = if (tx_hash.len > 0) tx_hash else null,
+            .transactionHash = if (tx_hash.len > 0) tx_hash else null,
             .transactionPosition = tx_pos,
         };
         if (is_create) {
-            trace.action.from          = from;
-            trace.action.value         = value;
-            trace.action.input         = input;
+            trace.action.from = from;
+            trace.action.value = value;
+            trace.action.input = input;
             trace.action.creationMethod = if (eql(frame_type, "CREATE2")) "create2" else "create";
             if (to) |addr| trace.result = .{ .address = addr };
         } else {
-            trace.action.from  = from;
-            trace.action.to    = to;
+            trace.action.from = from;
+            trace.action.to = to;
             trace.action.value = value;
         }
         try out.append(arena, trace);
@@ -625,8 +755,14 @@ fn flattenCallFrame(
         while (sp.i < sp.s.len) {
             sp.ws();
             if (sp.i >= sp.s.len) break;
-            if (sp.s[sp.i] == ']') { sp.i += 1; break; }
-            if (sp.s[sp.i] == ',') { sp.i += 1; continue; }
+            if (sp.s[sp.i] == ']') {
+                sp.i += 1;
+                break;
+            }
+            if (sp.s[sp.i] == ',') {
+                sp.i += 1;
+                continue;
+            }
             if (sp.s[sp.i] == '{') {
                 try flattenCallFrame(&sp, arena, tx_hash, tx_pos, out);
             } else {

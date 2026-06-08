@@ -6,24 +6,24 @@
 // Main thread accumulates SAVE_EVERY results, then saves in a background thread
 // while workers keep fetching the next batch (fetch and save overlap).
 // Cursor (Redis) advances only after save completes.
-const std    = @import("std");
-const linux  = std.os.linux;
+const std = @import("std");
+const linux = std.os.linux;
 
 const core = @import("indexer/core");
 
-const fetcher     = @import("fetcher.zig");
-const parser      = @import("parser.zig");
+const fetcher = @import("fetcher.zig");
+const parser = @import("parser.zig");
 const transformer = @import("transformer.zig");
-const pool        = @import("../db/pool.zig");
-const http_pool   = @import("../rpc/pool.zig");
-const batch       = @import("../db/batch.zig");
-const cursor      = @import("../db/cursor.zig");
-const node_probe  = @import("../rpc/node_probe.zig");
+const pool = @import("indexer/db").pool;
+const http_pool = @import("indexer/rpc").pool;
+const batch = @import("indexer/db").batch;
+const cursor = @import("indexer/db").cursor;
+const node_probe = @import("indexer/rpc").node_probe;
 
-const EvmChainConfig   = core.structures.EvmChainConfig;
+const EvmChainConfig = core.structures.EvmChainConfig;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
-const FetchClient      = core.fetch.Client;
-const Allocator        = std.mem.Allocator;
+const FetchClient = core.fetch.Client;
+const Allocator = std.mem.Allocator;
 
 fn nowNs() i64 {
     var ts: linux.timespec = undefined;
@@ -49,32 +49,32 @@ const ITX_LANES: usize = batch.ACCUM_ITX_LANES;
 // ─── BlockResult ──────────────────────────────────────────────────────────────
 
 pub const BlockResult = struct {
-    gpa:      Allocator,
-    arena:    std.heap.ArenaAllocator,
+    gpa: Allocator,
+    arena: std.heap.ArenaAllocator,
     // Owns the raw HTTP response buffers (block.body, receipts.body, traces.body).
     // ZC-parsed strings in `ent` point directly into these buffers — no copies.
     // Must outlive saveEntitiesParallel; freed in deinit() after save completes.
-    rawData:  ?fetcher.Response,
-    ent:      transformer.Entities,
+    rawData: ?fetcher.Response,
+    ent: transformer.Entities,
     blockNum: u64,
-    ok:       bool,
-    err:      ?anyerror,
+    ok: bool,
+    err: ?anyerror,
     // Per-stage timings set by fetchParseTransform; callers may read for logging.
-    fetchNs:     i64,
-    parseNs:     i64,
+    fetchNs: i64,
+    parseNs: i64,
     transformNs: i64,
 
     pub fn init(gpa: Allocator) BlockResult {
         return .{
-            .gpa         = gpa,
-            .arena       = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .rawData     = null,
-            .ent         = transformer.initEntities(),
-            .blockNum    = 0,
-            .ok          = false,
-            .err         = null,
-            .fetchNs     = 0,
-            .parseNs     = 0,
+            .gpa = gpa,
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .rawData = null,
+            .ent = transformer.initEntities(),
+            .blockNum = 0,
+            .ok = false,
+            .err = null,
+            .fetchNs = 0,
+            .parseNs = 0,
             .transformNs = 0,
         };
     }
@@ -88,8 +88,8 @@ pub const BlockResult = struct {
 // ─── MPSC result channel ──────────────────────────────────────────────────────
 
 const ResultChan = struct {
-    rd:           i32,
-    wr:           i32,
+    rd: i32,
+    wr: i32,
     workersAlive: std.atomic.Value(u32),
 
     fn init(n: u32) !ResultChan {
@@ -120,27 +120,29 @@ const ResultChan = struct {
             _ = linux.close(self.wr);
     }
 
-    fn deinit(self: *ResultChan) void { _ = linux.close(self.rd); }
+    fn deinit(self: *ResultChan) void {
+        _ = linux.close(self.rd);
+    }
 };
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
 const WorkerArgs = struct {
-    io:           std.Io,
-    gpa:          Allocator,
-    chain:        *const EvmChainConfig,
-    next:         *std.atomic.Value(u64),
-    to:           u64,
-    chan:          *ResultChan,
+    io: std.Io,
+    gpa: Allocator,
+    chain: *const EvmChainConfig,
+    next: *std.atomic.Value(u64),
+    to: u64,
+    chan: *ResultChan,
     chunkBuckets: u64,
-    cancel:       *std.atomic.Value(bool),
-    backupNode:   ?EvmRpcNodeConfig,
+    cancel: *std.atomic.Value(bool),
+    backupNode: ?EvmRpcNodeConfig,
 };
 
 pub const FetchTransformStatus = union(enum) {
     ok,
-    retry_later,    // null RPC response — block not yet available
-    skip_missing,   // block parsed as null/empty — no data to save
+    retry_later, // null RPC response — block not yet available
+    skip_missing, // block parsed as null/empty — no data to save
     fatal: anyerror,
 };
 
@@ -149,27 +151,27 @@ pub const FetchTransformStatus = union(enum) {
 /// Sets result.fetchNs / parseNs / transformNs for caller logging.
 /// Does NOT save, does NOT advance cursor — callers handle that differently.
 pub fn fetchParseTransform(
-    gpa:          Allocator,
-    io:           std.Io,
-    rpcNode:      EvmRpcNodeConfig,
-    blockNum:     u64,
-    chunkSize:    u64,
+    gpa: Allocator,
+    io: std.Io,
+    rpcNode: EvmRpcNodeConfig,
+    blockNum: u64,
+    chunkSize: u64,
     chunkBuckets: u64,
-    bClient:      *FetchClient,
-    rClient:      *FetchClient,
-    tClient:      *FetchClient,
-    httpPool:     ?*http_pool.HttpPool,
-    result:       *BlockResult,
+    bClient: *FetchClient,
+    rClient: *FetchClient,
+    tClient: *FetchClient,
+    httpPool: ?*http_pool.HttpPool,
+    result: *BlockResult,
 ) FetchTransformStatus {
     const t0 = nowNs();
     const maybeData = fetcher.getConsistentBlockData(gpa, io, .{
-        .rpcNode        = rpcNode,
-        .blockNumber    = blockNum,
-        .blockClient    = bClient,
+        .rpcNode = rpcNode,
+        .blockNumber = blockNum,
+        .blockClient = bClient,
         .receiptsClient = rClient,
-        .tracesClient   = tClient,
-        .httpPool       = httpPool,
-        .skipLogs       = true,
+        .tracesClient = tClient,
+        .httpPool = httpPool,
+        .skipLogs = true,
     }) catch |e| return .{ .fatal = e };
     const data = maybeData orelse return .retry_later;
     result.fetchNs = nowNs() - t0;
@@ -177,21 +179,27 @@ pub fn fetchParseTransform(
     result.rawData = data;
 
     const t1 = nowNs();
-    const aa    = result.arena.allocator();
+    const aa = result.arena.allocator();
     const block = parser.parseBlockRespZC(data.block.body, aa) catch |e|
         return .{ .fatal = e };
     if (block == null) return .skip_missing;
     const receipts = (parser.parseReceiptsRespZC(data.receipts.body, aa) catch null) orelse &.{};
     // Choose trace parser based on detected node type (cached from requestSync probe)
     const traces: []const parser.RpcTrace = switch (node_probe.getCached(rpcNode.https)) {
-        .trace_block       => (parser.parseTracesRespZC(data.traces.body, aa)     catch null) orelse &.{},
+        .trace_block => (parser.parseTracesRespZC(data.traces.body, aa) catch null) orelse &.{},
         .debug_trace_block => (parser.parseGethTracesRespZC(data.traces.body, aa) catch null) orelse &.{},
     };
     result.parseNs = nowNs() - t1;
 
     const t2 = nowNs();
     transformer.transformBlockWithRemap(
-        aa, block.?, receipts, traces, chunkSize, chunkBuckets, &result.ent,
+        aa,
+        block.?,
+        receipts,
+        traces,
+        chunkSize,
+        chunkBuckets,
+        &result.ent,
     ) catch |e| return .{ .fatal = e };
     result.transformNs = nowNs() - t2;
 
@@ -208,17 +216,20 @@ fn workerEntry(args: *WorkerArgs) void {
 }
 
 pub fn resetResult(result: *BlockResult) void {
-    if (result.rawData) |*d| { d.deinit(result.gpa); result.rawData = null; }
+    if (result.rawData) |*d| {
+        d.deinit(result.gpa);
+        result.rawData = null;
+    }
     result.arena.deinit();
     result.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     result.ent = transformer.initEntities();
 }
 
 fn worker(args: *WorkerArgs) !void {
-    const gpa          = args.gpa;
-    const chain        = args.chain;
-    const rpcNode      = chain.rpcNodes.lotosArchiveNode;
-    const chunkSize    = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
+    const gpa = args.gpa;
+    const chain = args.chain;
+    const rpcNode = chain.rpcNodes.lotosArchiveNode;
+    const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
     const chunkBuckets = args.chunkBuckets;
 
     var bClient = FetchClient.init(gpa, args.io);
@@ -239,7 +250,7 @@ fn worker(args: *WorkerArgs) !void {
 
         retry: while (true) {
             switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result)) {
-                .ok           => {
+                .ok => {
                     result.ok = true;
                     std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
                         blockNum,
@@ -253,12 +264,10 @@ fn worker(args: *WorkerArgs) !void {
                     // Block null on primary — try backup before giving up.
                     if (args.backupNode) |backup| {
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets,
-                                &bClient, &rClient, &tClient, null, result) == .ok)
-                        {
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result) == .ok) {
                             result.ok = true;
                             std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                blockNum, result.ent.txs.items.len,
+                                blockNum,                  result.ent.txs.items.len,
                                 result.ent.logs.items.len, result.ent.internalTxs.items.len,
                             });
                         } else {
@@ -269,32 +278,28 @@ fn worker(args: *WorkerArgs) !void {
                     }
                     break :retry;
                 },
-                .retry_later  => {
+                .retry_later => {
                     if (args.cancel.load(.acquire)) break :retry;
                     const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
                     _ = linux.nanosleep(&ts, null);
                     resetResult(result);
                 },
-                .fatal        => |e| {
+                .fatal => |e| {
                     // Try backup node before marking as skipped.
                     if (args.backupNode) |backup| {
-                        std.debug.print("[worker] block={d} primary error: {s} — trying backup\n",
-                            .{ blockNum, @errorName(e) });
+                        std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets,
-                                &bClient, &rClient, &tClient, null, result) == .ok)
-                        {
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result) == .ok) {
                             result.ok = true;
                             std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                blockNum, result.ent.txs.items.len,
+                                blockNum,                  result.ent.txs.items.len,
                                 result.ent.logs.items.len, result.ent.internalTxs.items.len,
                             });
                         } else {
                             std.debug.print("[worker] block={d} unavailable on all nodes — skipping\n", .{blockNum});
                         }
                     } else {
-                        std.debug.print("[worker] block={d} error: {s} — no backup, skipping\n",
-                            .{ blockNum, @errorName(e) });
+                        std.debug.print("[worker] block={d} error: {s} — no backup, skipping\n", .{ blockNum, @errorName(e) });
                     }
                     break :retry;
                 },
@@ -307,23 +312,23 @@ fn worker(args: *WorkerArgs) !void {
 // ─── AccumState ───────────────────────────────────────────────────────────────
 
 const AccumState = struct {
-    gpa:        Allocator,
-    sources:    std.ArrayList(*BlockResult),
-    entPtrs:    std.ArrayList(*const transformer.Entities),
+    gpa: Allocator,
+    sources: std.ArrayList(*BlockResult),
+    entPtrs: std.ArrayList(*const transformer.Entities),
     blockStart: u64,
-    blockEnd:   u64,
-    saveErr:    ?anyerror,
-    saveMs:     f64,
+    blockEnd: u64,
+    saveErr: ?anyerror,
+    saveMs: f64,
 
     fn init(gpa: Allocator) AccumState {
         return .{
-            .gpa        = gpa,
-            .sources    = .empty,
-            .entPtrs    = .empty,
+            .gpa = gpa,
+            .sources = .empty,
+            .entPtrs = .empty,
             .blockStart = std.math.maxInt(u64),
-            .blockEnd   = 0,
-            .saveErr    = null,
-            .saveMs     = 0,
+            .blockEnd = 0,
+            .saveErr = null,
+            .saveMs = 0,
         };
     }
 
@@ -332,7 +337,7 @@ const AccumState = struct {
         if (r.ok) {
             try self.entPtrs.append(self.gpa, &r.ent);
             if (r.blockNum < self.blockStart) self.blockStart = r.blockNum;
-            if (r.blockNum > self.blockEnd)   self.blockEnd   = r.blockNum;
+            if (r.blockNum > self.blockEnd) self.blockEnd = r.blockNum;
         }
     }
 
@@ -341,7 +346,10 @@ const AccumState = struct {
     }
 
     fn deinit(self: *AccumState) void {
-        for (self.sources.items) |r| { r.deinit(); self.gpa.destroy(r); }
+        for (self.sources.items) |r| {
+            r.deinit();
+            self.gpa.destroy(r);
+        }
         self.sources.deinit(self.gpa);
         self.entPtrs.deinit(self.gpa);
     }
@@ -350,28 +358,30 @@ const AccumState = struct {
 // ─── HistoricalConns — all CQL connections for a historical run ───────────────
 
 const HistoricalConns = struct {
-    gpa:       Allocator,
-    blocks:    pool.CqlConn,
-    txs:       [TXS_LANES]pool.CqlConn,
+    gpa: Allocator,
+    blocks: pool.CqlConn,
+    txs: [TXS_LANES]pool.CqlConn,
     contracts: pool.CqlConn,
-    logs:      [LOG_LANES]pool.CqlConn,
-    itxs:      [ITX_LANES]pool.CqlConn,
-    comp:      pool.CqlConn,
+    logs: [LOG_LANES]pool.CqlConn,
+    itxs: [ITX_LANES]pool.CqlConn,
+    comp: pool.CqlConn,
 
     fn open(
-        gpa:  Allocator,
-        host: []const u8, port: u16,
-        ks:   []const u8,
-        user: []const u8, pass: []const u8,
+        gpa: Allocator,
+        host: []const u8,
+        port: u16,
+        ks: []const u8,
+        user: []const u8,
+        pass: []const u8,
     ) !HistoricalConns {
         var self: HistoricalConns = undefined;
         self.gpa = gpa;
 
-        self.blocks    = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+        self.blocks = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.blocks.deinit();
         self.contracts = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.contracts.deinit();
-        self.comp      = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+        self.comp = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.comp.deinit();
 
         var txsN: usize = 0;
@@ -402,22 +412,22 @@ const HistoricalConns = struct {
         self.blocks.deinit();
         self.contracts.deinit();
         self.comp.deinit();
-        for (&self.txs)  |*c| c.deinit();
+        for (&self.txs) |*c| c.deinit();
         for (&self.logs) |*c| c.deinit();
         for (&self.itxs) |*c| c.deinit();
     }
 
     fn saveArgs(self: *HistoricalConns, accum: *AccumState, rdb: *cursor.Conn, bs: pool.BatchSizes) SaveArgs {
         return .{
-            .accum      = accum,
-            .cBlocks    = &self.blocks,
-            .cTxs       = &self.txs,
+            .accum = accum,
+            .cBlocks = &self.blocks,
+            .cTxs = &self.txs,
             .cContracts = &self.contracts,
-            .cLogs      = &self.logs,
-            .cItxs      = &self.itxs,
-            .cComp      = &self.comp,
-            .rdb        = rdb,
-            .bs         = bs,
+            .cLogs = &self.logs,
+            .cItxs = &self.itxs,
+            .cComp = &self.comp,
+            .rdb = rdb,
+            .bs = bs,
         };
     }
 };
@@ -425,15 +435,15 @@ const HistoricalConns = struct {
 // ─── SaveArgs + save thread ───────────────────────────────────────────────────
 
 const SaveArgs = struct {
-    accum:      *AccumState,
-    cBlocks:    *pool.CqlConn,
-    cTxs:       *[TXS_LANES]pool.CqlConn,
+    accum: *AccumState,
+    cBlocks: *pool.CqlConn,
+    cTxs: *[TXS_LANES]pool.CqlConn,
     cContracts: *pool.CqlConn,
-    cLogs:      *[LOG_LANES]pool.CqlConn,
-    cItxs:      *[ITX_LANES]pool.CqlConn,
-    cComp:      *pool.CqlConn,
-    rdb:        *cursor.Conn,
-    bs:         pool.BatchSizes,
+    cLogs: *[LOG_LANES]pool.CqlConn,
+    cItxs: *[ITX_LANES]pool.CqlConn,
+    cComp: *pool.CqlConn,
+    rdb: *cursor.Conn,
+    bs: pool.BatchSizes,
 };
 
 fn saveAccumFn(args: *SaveArgs) void {
@@ -445,10 +455,15 @@ fn saveAccumFn(args: *SaveArgs) void {
         args.cBlocks,
         args.cTxs,
         args.cContracts,
-        args.cLogs, args.cItxs, args.cComp,
+        args.cLogs,
+        args.cItxs,
+        args.cComp,
         ac.entPtrs.items,
         args.bs,
-    ) catch |e| { ac.saveErr = e; return; };
+    ) catch |e| {
+        ac.saveErr = e;
+        return;
+    };
 
     ac.saveMs = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
 
@@ -466,8 +481,8 @@ fn saveAccumFn(args: *SaveArgs) void {
 
 const PrevSave = struct {
     thread: std.Thread,
-    accum:  *AccumState,
-    args:   *SaveArgs,
+    accum: *AccumState,
+    args: *SaveArgs,
 
     fn start(gpa: Allocator, args: SaveArgs) !PrevSave {
         const heapArgs = try gpa.create(SaveArgs);
@@ -491,8 +506,7 @@ const PrevSave = struct {
         const ms = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
         std.debug.print(
             "\nAccum {d}→{d}: saved={d} save={d:.0}ms | {d:.1} blk/s avg\n\n",
-            .{ self.accum.blockStart, self.accum.blockEnd, self.accum.savedCount(),
-               self.accum.saveMs, @as(f64, @floatFromInt(blocksDone.*)) / ms * 1000.0 },
+            .{ self.accum.blockStart, self.accum.blockEnd, self.accum.savedCount(), self.accum.saveMs, @as(f64, @floatFromInt(blocksDone.*)) / ms * 1000.0 },
         );
     }
 };
@@ -500,49 +514,51 @@ const PrevSave = struct {
 // ─── Worker spawn ─────────────────────────────────────────────────────────────
 
 fn spawnHistoricalWorkers(
-    gpa:          Allocator,
-    io:           std.Io,
-    chain:        *const EvmChainConfig,
-    from:         u64,
-    to:           u64,
-    chan:          *ResultChan,
+    gpa: Allocator,
+    io: std.Io,
+    chain: *const EvmChainConfig,
+    from: u64,
+    to: u64,
+    chan: *ResultChan,
     chunkBuckets: u64,
-    cancel:       *std.atomic.Value(bool),
-    next:         *std.atomic.Value(u64),
-    threads:      []std.Thread,
-    backupNode:   ?EvmRpcNodeConfig,
+    cancel: *std.atomic.Value(bool),
+    next: *std.atomic.Value(u64),
+    threads: []std.Thread,
+    backupNode: ?EvmRpcNodeConfig,
 ) !void {
     for (0..threads.len) |w| {
         const wargs = try gpa.create(WorkerArgs);
         wargs.* = .{
-            .io           = io,
-            .gpa          = gpa,
-            .chain        = chain,
-            .next         = next,
-            .to           = to,
-            .chan         = chan,
+            .io = io,
+            .gpa = gpa,
+            .chain = chain,
+            .next = next,
+            .to = to,
+            .chan = chan,
             .chunkBuckets = chunkBuckets,
-            .cancel       = cancel,
-            .backupNode   = backupNode,
+            .cancel = cancel,
+            .backupNode = backupNode,
         };
         _ = from; // from is encoded in next (already set to from by caller)
-        threads[w] = try std.Thread.spawn(
-            .{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
+        threads[w] = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
     }
 }
 
 // ─── Accumulator error path cleanup ───────────────────────────────────────────
 
 fn abortAndDrain(
-    gpa:      Allocator,
-    chan:      *ResultChan,
-    threads:  []std.Thread,
-    accum:    *AccumState,
+    gpa: Allocator,
+    chan: *ResultChan,
+    threads: []std.Thread,
+    accum: *AccumState,
     prevSave: *?PrevSave,
-    cancel:   *std.atomic.Value(bool),
+    cancel: *std.atomic.Value(bool),
 ) void {
     cancel.store(true, .release);
-    while (chan.pop()) |r| { r.deinit(); gpa.destroy(r); }
+    while (chan.pop()) |r| {
+        r.deinit();
+        gpa.destroy(r);
+    }
     for (threads) |t| t.join();
     accum.deinit();
     gpa.destroy(accum);
@@ -562,19 +578,19 @@ fn abortAndDrain(
 // Returns error.MissingHistoricalBlocks if any remain unresolved — caller must
 // not proceed to realtime mode in that case.
 fn retryMissingBlocks(
-    gpa:          Allocator,
-    io:           std.Io,
-    chain:        *const EvmChainConfig,
-    backupNode:   ?EvmRpcNodeConfig,
-    skipped:      []const u64,
-    conns:        *HistoricalConns,
-    bs:           pool.BatchSizes,
+    gpa: Allocator,
+    io: std.Io,
+    chain: *const EvmChainConfig,
+    backupNode: ?EvmRpcNodeConfig,
+    skipped: []const u64,
+    conns: *HistoricalConns,
+    bs: pool.BatchSizes,
     chunkBuckets: u64,
 ) !void {
     if (skipped.len == 0) return;
     std.debug.print("\n[historical] {d} skipped block(s) — retrying...\n", .{skipped.len});
 
-    const rpcNode   = chain.rpcNodes.lotosArchiveNode;
+    const rpcNode = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
 
     var bClient = FetchClient.init(gpa, io);
@@ -592,8 +608,7 @@ fn retryMissingBlocks(
         result.blockNum = blockNum;
 
         // Try primary.
-        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets,
-                &bClient, &rClient, &tClient, null, &result)) {
+        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, &result)) {
             .ok => true,
             else => false,
         };
@@ -602,18 +617,15 @@ fn retryMissingBlocks(
         if (!found) {
             if (backupNode) |backup| {
                 resetResult(&result);
-                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets,
-                        &bClient, &rClient, &tClient, null, &result)) {
+                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, &result)) {
                     .ok => true,
                     else => false,
                 };
                 if (!found) {
-                    std.debug.print("[historical-retry] block={d} unavailable on primary and backup\n",
-                        .{blockNum});
+                    std.debug.print("[historical-retry] block={d} unavailable on primary and backup\n", .{blockNum});
                 }
             } else {
-                std.debug.print("[historical-retry] block={d} unavailable (no backup configured)\n",
-                    .{blockNum});
+                std.debug.print("[historical-retry] block={d} unavailable (no backup configured)\n", .{blockNum});
             }
         }
 
@@ -621,12 +633,16 @@ fn retryMissingBlocks(
             std.debug.print("[historical-retry] block={d} recovered — saving\n", .{blockNum});
             var ents = [1]*const transformer.Entities{&result.ent};
             batch.saveEntitiesParallel(
-                &conns.blocks, &conns.txs, &conns.contracts,
-                &conns.logs, &conns.itxs, &conns.comp,
-                ents[0..], bs,
+                &conns.blocks,
+                &conns.txs,
+                &conns.contracts,
+                &conns.logs,
+                &conns.itxs,
+                &conns.comp,
+                ents[0..],
+                bs,
             ) catch |e| {
-                std.debug.print("[historical-retry] save error block={d}: {s}\n",
-                    .{ blockNum, @errorName(e) });
+                std.debug.print("[historical-retry] save error block={d}: {s}\n", .{ blockNum, @errorName(e) });
                 stillMissing += 1;
             };
         } else {
@@ -635,9 +651,7 @@ fn retryMissingBlocks(
     }
 
     if (stillMissing > 0) {
-        std.debug.print(
-            "[historical] {d} block(s) permanently missing — cannot proceed to realtime\n",
-            .{stillMissing});
+        std.debug.print("[historical] {d} block(s) permanently missing — cannot proceed to realtime\n", .{stillMissing});
         return error.MissingHistoricalBlocks;
     }
     std.debug.print("[historical] all skipped blocks recovered\n", .{});
@@ -646,30 +660,28 @@ fn retryMissingBlocks(
 // ─── runHistorical ────────────────────────────────────────────────────────────
 
 pub fn runHistorical(
-    io:           std.Io,
-    gpa:          Allocator,
-    chain:        *const EvmChainConfig,
-    from:         u64,
-    to:           u64,
-    scyllaHost:   []const u8,
-    scyllaPort:   u16,
-    scyllaKs:     []const u8,
-    scyllaUser:   []const u8,
-    scyllaPass:   []const u8,
-    redisUrl:     []const u8,
+    io: std.Io,
+    gpa: Allocator,
+    chain: *const EvmChainConfig,
+    from: u64,
+    to: u64,
+    scyllaHost: []const u8,
+    scyllaPort: u16,
+    scyllaKs: []const u8,
+    scyllaUser: []const u8,
+    scyllaPass: []const u8,
+    redisUrl: []const u8,
     chunkBuckets: u64,
-    saveEvery:    usize,
-    backupNode:   ?EvmRpcNodeConfig,
+    saveEvery: usize,
+    backupNode: ?EvmRpcNodeConfig,
 ) !void {
     if (from > to) return;
 
     const workerCount = chain.indexingOptions.workerCount;
-    const bs          = pool.BatchSizes.fromChain(chain.indexingOptions);
-    const rUrl        = cursor.parseUrl(redisUrl);
+    const bs = pool.BatchSizes.fromChain(chain.indexingOptions);
+    const rUrl = cursor.parseUrl(redisUrl);
 
-    std.debug.print(
-        "Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,3,6,20,1,1\n\n",
-        .{ from, to, workerCount, saveEvery, chunkBuckets });
+    std.debug.print("Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,3,6,20,1,1\n\n", .{ from, to, workerCount, saveEvery, chunkBuckets });
 
     var conns = try HistoricalConns.open(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
     defer conns.deinit();
@@ -679,9 +691,9 @@ pub fn runHistorical(
     if (rUrl.password.len > 0) rdb.auth(rUrl.password) catch {};
     if (rUrl.db > 0) rdb.selectDb(rUrl.db) catch {};
 
-    var next   = std.atomic.Value(u64).init(from);
+    var next = std.atomic.Value(u64).init(from);
     var cancel = std.atomic.Value(bool).init(false);
-    var chan    = try ResultChan.init(@intCast(workerCount));
+    var chan = try ResultChan.init(@intCast(workerCount));
     defer chan.deinit();
 
     const threads = try gpa.alloc(std.Thread, workerCount);
@@ -696,7 +708,7 @@ pub fn runHistorical(
     var skippedBlocks: std.ArrayList(u64) = .empty;
     defer skippedBlocks.deinit(gpa);
 
-    const t0         = nowNs();
+    const t0 = nowNs();
     var blocksDone: u64 = 0;
 
     while (chan.pop()) |result| {
@@ -710,7 +722,7 @@ pub fn runHistorical(
                 prevSave = null;
             }
             prevSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs));
-            accum  = try gpa.create(AccumState);
+            accum = try gpa.create(AccumState);
             accum.* = AccumState.init(gpa);
         }
     }
@@ -731,8 +743,7 @@ pub fn runHistorical(
     }
 
     const elapsedMs = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
-    std.debug.print("\nHistorical sync done: {d:.0}ms  saved_blocks={d}\n",
-        .{ elapsedMs, blocksDone });
+    std.debug.print("\nHistorical sync done: {d:.0}ms  saved_blocks={d}\n", .{ elapsedMs, blocksDone });
 
     // Retry any blocks that were skipped during the main pass, then verify
     // all are present before the caller transitions to realtime mode.

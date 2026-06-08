@@ -5,15 +5,15 @@ const linux = std.os.linux;
 
 const core = @import("indexer/core");
 
-const pipeline   = @import("pipeline.zig");
-const pool       = @import("../db/pool.zig");
-const http_pool  = @import("../rpc/pool.zig");
-const batch      = @import("../db/batch.zig");
-const cursor     = @import("../db/cursor.zig");
+const pipeline = @import("pipeline.zig");
+const pool = @import("indexer/db").pool;
+const http_pool = @import("indexer/rpc").pool;
+const batch = @import("indexer/db").batch;
+const cursor = @import("indexer/db").cursor;
 
-const EvmChainConfig   = core.structures.EvmChainConfig;
+const EvmChainConfig = core.structures.EvmChainConfig;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
-const Allocator        = std.mem.Allocator;
+const Allocator = std.mem.Allocator;
 
 fn nowNs() i64 {
     var ts: linux.timespec = undefined;
@@ -23,41 +23,39 @@ fn nowNs() i64 {
 
 pub const ProcessBlockStatus = union(enum) {
     saved,
-    retry_later,  // block not yet available — caller should retry
+    retry_later, // block not yet available — caller should retry
     fatal: anyerror,
 };
 
 pub fn processBlock(
-    io:           std.Io,
-    gpa:          Allocator,
-    chain:        *const EvmChainConfig,
-    rtConns:      *batch.RealtimeConns,
-    rdb:          *cursor.Conn,
-    bClient:      *core.fetch.Client,
-    rClient:      *core.fetch.Client,
-    tClient:      *core.fetch.Client,
-    blockNum:     u64,
-    hPool:        ?*http_pool.HttpPool,
+    io: std.Io,
+    gpa: Allocator,
+    chain: *const EvmChainConfig,
+    rtConns: *batch.RealtimeConns,
+    rdb: *cursor.Conn,
+    bClient: *core.fetch.Client,
+    rClient: *core.fetch.Client,
+    tClient: *core.fetch.Client,
+    blockNum: u64,
+    hPool: ?*http_pool.HttpPool,
     chunkBuckets: u64,
-    backupNode:   ?EvmRpcNodeConfig,
+    backupNode: ?EvmRpcNodeConfig,
 ) ProcessBlockStatus {
-    const rpcNode   = chain.rpcNodes.lotosArchiveNode;
+    const rpcNode = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
     const bs = pool.BatchSizes.fromChain(chain.indexingOptions);
 
     var result = pipeline.BlockResult.init(gpa);
     defer result.deinit();
 
-    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets,
-        bClient, rClient, tClient, hPool, &result);
+    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &result);
 
     const fetched = switch (primaryStatus) {
         .ok => true,
         .retry_later, .skip_missing => blk: {
             if (backupNode) |backup| {
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets,
-                    bClient, rClient, tClient, null, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &result) == .ok;
             }
             break :blk false;
         },
@@ -66,8 +64,7 @@ pub fn processBlock(
             if (backupNode) |backup| {
                 std.debug.print(" — trying backup\n", .{});
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets,
-                    bClient, rClient, tClient, null, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &result) == .ok;
             }
             std.debug.print("\n", .{});
             break :blk false;
@@ -76,8 +73,8 @@ pub fn processBlock(
 
     if (!fetched) return .retry_later;
 
-    const fetch_ms     = @as(f64, @floatFromInt(result.fetchNs))     / 1e6;
-    const parse_ms     = @as(f64, @floatFromInt(result.parseNs))     / 1e6;
+    const fetch_ms = @as(f64, @floatFromInt(result.fetchNs)) / 1e6;
+    const parse_ms = @as(f64, @floatFromInt(result.parseNs)) / 1e6;
     const transform_ms = @as(f64, @floatFromInt(result.transformNs)) / 1e6;
 
     const t_save = nowNs();
@@ -91,14 +88,10 @@ pub fn processBlock(
     const cursor_ms = @as(f64, @floatFromInt(nowNs() - t_cursor)) / 1e6;
 
     const total_ms = fetch_ms + parse_ms + transform_ms + save_ms + cursor_ms;
-    const kb_blk  = result.rawData.?.block.body.len    / 1024;
+    const kb_blk = result.rawData.?.block.body.len / 1024;
     const kb_rcpt = result.rawData.?.receipts.body.len / 1024;
-    const kb_trc  = result.rawData.?.traces.body.len   / 1024;
-    std.debug.print(
-        "[rt] blk={d} tx={d} log={d} itx={d} kb={d}+{d}+{d} | fetch={d:.0} parse={d:.0} xform={d:.0} save={d:.0} cursor={d:.0} | total={d:.0}ms\n",
-        .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len,
-           kb_blk, kb_rcpt, kb_trc,
-           fetch_ms, parse_ms, transform_ms, save_ms, cursor_ms, total_ms });
+    const kb_trc = result.rawData.?.traces.body.len / 1024;
+    std.debug.print("[rt] blk={d} tx={d} log={d} itx={d} kb={d}+{d}+{d} | fetch={d:.0} parse={d:.0} xform={d:.0} save={d:.0} cursor={d:.0} | total={d:.0}ms\n", .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len, kb_blk, kb_rcpt, kb_trc, fetch_ms, parse_ms, transform_ms, save_ms, cursor_ms, total_ms });
 
     return .saved;
 }

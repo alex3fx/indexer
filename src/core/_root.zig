@@ -15,3 +15,5 @@ pub const ethereum = ethereum_chain.ethereum;
 pub const supportedEvmChains = supported_chains.supportedEvmChains;
 pub const getEvmChainConfig = supported_chains.getEvmChainConfig;
 pub const getRuntimeContext = runtime_context.getRuntimeContext;
+
+pub const utils = @import("indexer/utils");

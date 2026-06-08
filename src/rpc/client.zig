@@ -1,13 +1,13 @@
 const std = @import("std");
 
-const core       = @import("indexer/core");
-const utils      = @import("indexer/utils");
+const core = @import("indexer/core");
+const utils = core.utils;
 const node_probe = @import("node_probe.zig");
 
-const Allocator        = std.mem.Allocator;
+const Allocator = std.mem.Allocator;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
 const EvmRpcNodesConfig = core.structures.EvmRpcNodesConfig;
-const FetchClient      = core.fetch.Client;
+const FetchClient = core.fetch.Client;
 
 pub const TraceMethod = node_probe.TraceMethod;
 

@@ -7,18 +7,18 @@ const core = @import("indexer/core");
 const structures = core.structures;
 
 pub const BatchSizes = struct {
-    blocks:    usize,
-    txs:       usize,
-    logs:      usize,
-    itxs:      usize,
+    blocks: usize,
+    txs: usize,
+    logs: usize,
+    itxs: usize,
     contracts: usize,
 
     pub fn fromChain(opts: structures.EvmIndexingOptions) BatchSizes {
         return .{
-            .blocks    = @intCast(opts.batchSizeBlocks),
-            .txs       = @intCast(opts.batchSizeTxs),
-            .logs      = @intCast(opts.batchSizeLogs),
-            .itxs      = @intCast(opts.batchSizeItxs),
+            .blocks = @intCast(opts.batchSizeBlocks),
+            .txs = @intCast(opts.batchSizeTxs),
+            .logs = @intCast(opts.batchSizeLogs),
+            .itxs = @intCast(opts.batchSizeItxs),
             .contracts = @intCast(opts.batchSizeContracts),
         };
     }
@@ -44,19 +44,21 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
 
     const ip = parseIpv4(host);
     const ipHost = (@as(u32, ip[0]) << 24) | (@as(u32, ip[1]) << 16) |
-                   (@as(u32, ip[2]) << 8)  |  @as(u32, ip[3]);
+        (@as(u32, ip[2]) << 8) | @as(u32, ip[3]);
     const addr = linux.sockaddr.in{
         .family = linux.AF.INET,
-        .port   = std.mem.nativeToBig(u16, port),
-        .addr   = std.mem.nativeToBig(u32, ipHost),
-        .zero   = std.mem.zeroes([8]u8),
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, ipHost),
+        .zero = std.mem.zeroes([8]u8),
     };
     const rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-    if (rc != 0) { _ = linux.close(fd); return error.ConnectFailed; }
+    if (rc != 0) {
+        _ = linux.close(fd);
+        return error.ConnectFailed;
+    }
 
     const nodelay: c_int = 1;
-    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)),
-        linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)), linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
     return fd;
 }
 
@@ -81,17 +83,17 @@ fn tcpReadExact(fd: i32, buf: []u8) !void {
 
 // ─── CQL v4 frame constants ───────────────────────────────────────────────────
 
-const CQL_VERSION:     u8  = 0x04;
-const OPCODE_STARTUP:  u8  = 0x01;
+const CQL_VERSION: u8 = 0x04;
+const OPCODE_STARTUP: u8 = 0x01;
 const OPCODE_AUTH_RESP: u8 = 0x0F;
-const OPCODE_QUERY:    u8  = 0x07;
-const OPCODE_PREPARE:  u8  = 0x09;
-const OPCODE_BATCH:    u8  = 0x0D;
-const OPCODE_READY:    u8  = 0x02;
-const OPCODE_AUTH:     u8  = 0x03;
-const OPCODE_AUTH_OK:  u8  = 0x10;
-const OPCODE_RESULT:   u8  = 0x08;
-const OPCODE_ERROR:    u8  = 0x00;
+const OPCODE_QUERY: u8 = 0x07;
+const OPCODE_PREPARE: u8 = 0x09;
+const OPCODE_BATCH: u8 = 0x0D;
+const OPCODE_READY: u8 = 0x02;
+const OPCODE_AUTH: u8 = 0x03;
+const OPCODE_AUTH_OK: u8 = 0x10;
+const OPCODE_RESULT: u8 = 0x08;
+const OPCODE_ERROR: u8 = 0x00;
 const CONSISTENCY_ONE: u16 = 0x0001;
 
 // Temporary allocator for CQL frame buffers. Lifetime: within each function call.
@@ -100,7 +102,8 @@ pub const tempAllocator = std.heap.page_allocator;
 // ─── CQL value encoding ───────────────────────────────────────────────────────
 
 fn appendShort(list: *std.ArrayList(u8), v: u16) !void {
-    var b: [2]u8 = undefined; std.mem.writeInt(u16, &b, v, .big);
+    var b: [2]u8 = undefined;
+    std.mem.writeInt(u16, &b, v, .big);
     try list.appendSlice(tempAllocator, &b);
 }
 
@@ -110,13 +113,15 @@ fn appendCqlString(list: *std.ArrayList(u8), s: []const u8) !void {
 }
 
 fn appendLongString(list: *std.ArrayList(u8), s: []const u8) !void {
-    var b: [4]u8 = undefined; std.mem.writeInt(u32, &b, @intCast(s.len), .big);
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, @intCast(s.len), .big);
     try list.appendSlice(tempAllocator, &b);
     try list.appendSlice(tempAllocator, s);
 }
 
 fn appendBytes(list: *std.ArrayList(u8), data: []const u8) !void {
-    var b: [4]u8 = undefined; std.mem.writeInt(i32, &b, @intCast(data.len), .big);
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b, @intCast(data.len), .big);
     try list.appendSlice(tempAllocator, &b);
     try list.appendSlice(tempAllocator, data);
 }
@@ -139,15 +144,22 @@ pub fn valVarint(list: *std.ArrayList(u8), hexS: []const u8) !void {
     if (hex.len == 0) return list.appendSlice(tempAllocator, &.{ 0, 0, 0, 1, 0 });
 
     const nbytesMax = (hex.len + 1) / 2;
-    const oldLen   = list.items.len;
+    const oldLen = list.items.len;
     const outStart = oldLen + 4;
     try list.ensureTotalCapacity(tempAllocator, oldLen + 4 + 1 + nbytesMax);
     list.items.len = oldLen + 4 + 1 + nbytesMax;
 
     var wi = outStart;
     var i: usize = 0;
-    if (hex.len % 2 != 0) { list.items[wi] = try hexNibble(hex[0]); wi += 1; i = 1; }
-    while (i < hex.len) : ({ i += 2; wi += 1; }) {
+    if (hex.len % 2 != 0) {
+        list.items[wi] = try hexNibble(hex[0]);
+        wi += 1;
+        i = 1;
+    }
+    while (i < hex.len) : ({
+        i += 2;
+        wi += 1;
+    }) {
         list.items[wi] = (try hexNibble(hex[i]) << 4) | (try hexNibble(hex[i + 1]));
     }
 
@@ -156,14 +168,12 @@ pub fn valVarint(list: *std.ArrayList(u8), hexS: []const u8) !void {
     while (trim + 1 < rawLen and list.items[outStart + trim] == 0) : (trim += 1) {}
     const trimmedLen = rawLen - trim;
     if (trim > 0)
-        std.mem.copyForwards(u8, list.items[outStart..][0..trimmedLen],
-                                 list.items[outStart + trim..][0..trimmedLen]);
+        std.mem.copyForwards(u8, list.items[outStart..][0..trimmedLen], list.items[outStart + trim ..][0..trimmedLen]);
 
     const needPrefix = list.items[outStart] >= 0x80;
     const payloadLen = trimmedLen + if (needPrefix) @as(usize, 1) else 0;
     if (needPrefix) {
-        std.mem.copyBackwards(u8, list.items[outStart + 1..][0..trimmedLen],
-                                  list.items[outStart..][0..trimmedLen]);
+        std.mem.copyBackwards(u8, list.items[outStart + 1 ..][0..trimmedLen], list.items[outStart..][0..trimmedLen]);
         list.items[outStart] = 0x00;
     }
     std.mem.writeInt(i32, list.items[oldLen..][0..4], @intCast(payloadLen), .big);
@@ -242,11 +252,11 @@ pub const PreparedIds = struct {
     blockCompletions: []u8,
 };
 
-const INSERT_BLOCKS          = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
-const INSERT_TXS             = "INSERT INTO transactions (chunk,block_number,transaction_index,hash,block_timestamp_s,block_timestamp_ms,method_id,input,from_address,to_address,value,gas_limit,gas_price,gas_used,max_priority_fee_per_gas,max_fee_per_gas,cumulative_gas_used,effective_gas_price,contract_address,status,type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
-const INSERT_LOGS             = "INSERT INTO logs (chunk,block_number,transaction_index,log_index,block_timestamp_s,block_timestamp_ms,address,data,topic_zeroth,topic_first,topic_second,topic_third,rest_topics,transaction_hash,removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
-const INSERT_INT_TXS          = "INSERT INTO internal_transactions (chunk,block_number,block_timestamp_s,block_timestamp_ms,transaction_index,transaction_hash,trace_index,from_address,to_address,value) VALUES (?,?,?,?,?,?,?,?,?,?)";
-const INSERT_CONTRACTS        = "INSERT INTO contracts (chunk,block_number,transaction_index,transaction_hash,trace_index,block_timestamp_s,block_timestamp_ms,address,creation_method,creator_address,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_BLOCKS = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
+const INSERT_TXS = "INSERT INTO transactions (chunk,block_number,transaction_index,hash,block_timestamp_s,block_timestamp_ms,method_id,input,from_address,to_address,value,gas_limit,gas_price,gas_used,max_priority_fee_per_gas,max_fee_per_gas,cumulative_gas_used,effective_gas_price,contract_address,status,type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_LOGS = "INSERT INTO logs (chunk,block_number,transaction_index,log_index,block_timestamp_s,block_timestamp_ms,address,data,topic_zeroth,topic_first,topic_second,topic_third,rest_topics,transaction_hash,removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_INT_TXS = "INSERT INTO internal_transactions (chunk,block_number,block_timestamp_s,block_timestamp_ms,transaction_index,transaction_hash,trace_index,from_address,to_address,value) VALUES (?,?,?,?,?,?,?,?,?,?)";
+const INSERT_CONTRACTS = "INSERT INTO contracts (chunk,block_number,transaction_index,transaction_hash,trace_index,block_timestamp_s,block_timestamp_ms,address,creation_method,creator_address,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_CONTRACTS_BY_ADDR = "INSERT INTO contracts_by_addresses (address,creator,tx_hash,block_number,timestamp,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_BLOCK_COMPLETIONS = "INSERT INTO block_completions (chunk,block_number,tx_count,log_count,itx_count,contract_count) VALUES (?,?,?,?,?,?)";
 
@@ -321,7 +331,7 @@ pub const CqlConn = struct {
     fn recvFrame(self: *CqlConn) !struct { opcode: u8, body: []u8 } {
         var header: [9]u8 = undefined;
         try tcpReadExact(self.fd, &header);
-        const opcode  = header[4];
+        const opcode = header[4];
         const bodyLen = std.mem.readInt(u32, header[5..9], .big);
         if (bodyLen == 0) return .{ .opcode = opcode, .body = try self.gpa.alloc(u8, 0) };
         const body = try self.gpa.alloc(u8, bodyLen);
@@ -372,17 +382,16 @@ pub const CqlConn = struct {
         defer self.gpa.free(resp.body);
         if (resp.opcode == OPCODE_ERROR) {
             if (resp.body.len >= 6) {
-                const code   = std.mem.readInt(i32, resp.body[0..4], .big);
+                const code = std.mem.readInt(i32, resp.body[0..4], .big);
                 const msgLen = std.mem.readInt(u16, resp.body[4..6], .big);
-                const msg    = resp.body[6..@min(6 + @as(usize, msgLen), resp.body.len)];
-                std.debug.print("[CQL PREPARE ERROR] code=0x{x:0>4} msg={s}\nquery={s}\n",
-                    .{ code, msg, query });
+                const msg = resp.body[6..@min(6 + @as(usize, msgLen), resp.body.len)];
+                std.debug.print("[CQL PREPARE ERROR] code=0x{x:0>4} msg={s}\nquery={s}\n", .{ code, msg, query });
             }
             return error.CqlPrepareError;
         }
         if (resp.opcode != OPCODE_RESULT) return error.CqlUnexpectedOpcode;
         if (resp.body.len < 6) return error.CqlMalformedResult;
-        const kind  = std.mem.readInt(i32, resp.body[0..4], .big);
+        const kind = std.mem.readInt(i32, resp.body[0..4], .big);
         if (kind != 4) return error.CqlNotPrepared;
         const idLen = std.mem.readInt(u16, resp.body[4..6], .big);
         if (resp.body.len < 6 + idLen) return error.CqlMalformedResult;
@@ -392,7 +401,7 @@ pub const CqlConn = struct {
     pub fn recvFrameCheck(self: *CqlConn) !void {
         var header: [9]u8 = undefined;
         try tcpReadExact(self.fd, &header);
-        const opcode  = header[4];
+        const opcode = header[4];
         const bodyLen = std.mem.readInt(u32, header[5..9], .big);
         if (bodyLen == 0) {
             if (opcode == OPCODE_ERROR) return error.CqlError;
@@ -402,9 +411,9 @@ pub const CqlConn = struct {
         const readLen = @min(bodyLen, tmp.len);
         try tcpReadExact(self.fd, tmp[0..readLen]);
         if (opcode == OPCODE_ERROR) {
-            const code   = if (readLen >= 4) std.mem.readInt(i32, tmp[0..4], .big) else -1;
+            const code = if (readLen >= 4) std.mem.readInt(i32, tmp[0..4], .big) else -1;
             const msgLen = if (readLen >= 6) std.mem.readInt(u16, tmp[4..6], .big) else 0;
-            const msg    = tmp[6..@min(6 + @as(usize, msgLen), readLen)];
+            const msg = tmp[6..@min(6 + @as(usize, msgLen), readLen)];
             std.debug.print("[CQL ERROR] code=0x{x:0>4} msg={s}\n", .{ code, msg });
             return error.CqlError;
         }
@@ -453,12 +462,12 @@ pub const CqlConn = struct {
 
 pub fn prepareAll(conn: *CqlConn) !PreparedIds {
     return .{
-        .blocks           = try conn.prepare(INSERT_BLOCKS),
-        .transactions     = try conn.prepare(INSERT_TXS),
-        .logs             = try conn.prepare(INSERT_LOGS),
-        .internalTxs      = try conn.prepare(INSERT_INT_TXS),
-        .contracts        = try conn.prepare(INSERT_CONTRACTS),
-        .contractsByAddr  = try conn.prepare(INSERT_CONTRACTS_BY_ADDR),
+        .blocks = try conn.prepare(INSERT_BLOCKS),
+        .transactions = try conn.prepare(INSERT_TXS),
+        .logs = try conn.prepare(INSERT_LOGS),
+        .internalTxs = try conn.prepare(INSERT_INT_TXS),
+        .contracts = try conn.prepare(INSERT_CONTRACTS),
+        .contractsByAddr = try conn.prepare(INSERT_CONTRACTS_BY_ADDR),
         .blockCompletions = try conn.prepare(INSERT_BLOCK_COMPLETIONS),
     };
 }

@@ -1,31 +1,31 @@
 // Persistent 3-thread pool for parallel RPC requests in realtime mode.
 // Uses Linux pipes for work/done signaling (same pattern as pipeline ResultChan).
 // Eliminates std.Thread.spawn overhead (~6ms) per block.
-const std   = @import("std");
+const std = @import("std");
 const linux = std.os.linux;
 
-const core       = @import("indexer/core");
+const core = @import("indexer/core");
 const client_mod = @import("client.zig");
 
-const Allocator        = std.mem.Allocator;
-const FetchClient      = core.fetch.Client;
+const Allocator = std.mem.Allocator;
+const FetchClient = core.fetch.Client;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
-const Response         = client_mod.Response;
-const Method           = client_mod.Method;
+const Response = client_mod.Response;
+const Method = client_mod.Method;
 
 // Work item: main → worker. Worker frees number and the Work itself.
 const Work = struct {
     allocator: Allocator,
-    client:    *FetchClient,
-    method:    Method,
-    rpcNode:   EvmRpcNodeConfig,
-    number:    []const u8,
+    client: *FetchClient,
+    method: Method,
+    rpcNode: EvmRpcNodeConfig,
+    number: []const u8,
 };
 
 // Result: worker → main. Main frees via allocator + destroy.
 const WorkResult = struct {
     allocator: Allocator,
-    result:    anyerror!?Response,
+    result: anyerror!?Response,
 };
 
 fn pipeWrite8(fd: i32, val: usize) void {
@@ -56,21 +56,21 @@ const Slot = struct {
     work_wr: i32,
     done_rd: i32,
     done_wr: i32,
-    thread:  std.Thread,
+    thread: std.Thread,
 };
 
 pub const HttpPool = struct {
     slots: [3]Slot,
-    gpa:   Allocator,
-    io:    std.Io,
+    gpa: Allocator,
+    io: std.Io,
 
     /// Step 1: create pipes only. Does NOT spawn threads.
     /// Call startThreads() after the HttpPool is at its final memory location.
     pub fn init(gpa: Allocator, io: std.Io) !HttpPool {
         var self = HttpPool{
             .slots = undefined,
-            .gpa   = gpa,
-            .io    = io,
+            .gpa = gpa,
+            .io = io,
         };
         var n: usize = 0;
         errdefer for (0..n) |i| closeSlot(&self.slots[i]);
@@ -79,13 +79,16 @@ pub const HttpPool = struct {
             var dfds: [2]i32 = undefined;
             if (linux.pipe(&wfds) != 0) return error.PipeFailed;
             if (linux.pipe(&dfds) != 0) {
-                _ = linux.close(wfds[0]); _ = linux.close(wfds[1]);
+                _ = linux.close(wfds[0]);
+                _ = linux.close(wfds[1]);
                 return error.PipeFailed;
             }
             self.slots[i] = .{
-                .work_rd = wfds[0], .work_wr = wfds[1],
-                .done_rd = dfds[0], .done_wr = dfds[1],
-                .thread  = undefined,
+                .work_rd = wfds[0],
+                .work_wr = wfds[1],
+                .done_rd = dfds[0],
+                .done_wr = dfds[1],
+                .thread = undefined,
             };
             n += 1;
         }
@@ -95,14 +98,13 @@ pub const HttpPool = struct {
     /// Step 2: spawn worker threads. Must be called when *self is stable in memory.
     pub fn startThreads(self: *HttpPool) !void {
         for (&self.slots) |*slot| {
-            slot.thread = try std.Thread.spawn(
-                .{}, slotWorkerFn, .{slot, self.gpa, self.io});
+            slot.thread = try std.Thread.spawn(.{}, slotWorkerFn, .{ slot, self.gpa, self.io });
         }
     }
 
     pub fn deinit(self: *HttpPool) void {
         for (&self.slots) |*slot| {
-            _ = linux.close(slot.work_wr);  // EOF → worker exits
+            _ = linux.close(slot.work_wr); // EOF → worker exits
             slot.thread.join();
             _ = linux.close(slot.work_rd);
             _ = linux.close(slot.done_rd);
@@ -112,12 +114,12 @@ pub const HttpPool = struct {
 
     /// Submit 3 parallel RPC requests and return their results.
     pub fn requestThree(
-        self:      *HttpPool,
+        self: *HttpPool,
         allocator: Allocator,
-        clients:   [3]*FetchClient,
-        methods:   [3]Method,
-        rpcNode:   EvmRpcNodeConfig,
-        number:    []const u8,
+        clients: [3]*FetchClient,
+        methods: [3]Method,
+        rpcNode: EvmRpcNodeConfig,
+        number: []const u8,
     ) ![3](anyerror!?Response) {
         // Submit work to all 3 slots.
         for (&self.slots, 0..) |*slot, i| {
@@ -126,10 +128,10 @@ pub const HttpPool = struct {
             const work = try allocator.create(Work);
             work.* = .{
                 .allocator = allocator,
-                .client    = clients[i],
-                .method    = methods[i],
-                .rpcNode   = rpcNode,
-                .number    = num_copy,
+                .client = clients[i],
+                .method = methods[i],
+                .rpcNode = rpcNode,
+                .number = num_copy,
             };
             pipeWrite8(slot.work_wr, @intFromPtr(work));
         }
@@ -164,7 +166,7 @@ fn slotWorkerFn(slot: *Slot, _gpa: Allocator, _io: std.Io) void {
 
         const r = client_mod.requestSync(alloc, work.client, work.method, .{
             .rpcNode = work.rpcNode,
-            .number  = work.number,
+            .number = work.number,
         });
         alloc.free(work.number);
         alloc.destroy(work);

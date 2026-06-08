@@ -20,20 +20,19 @@ fn tcpConn(host: []const u8, port: u16) !i32 {
     const fd: i32 = @intCast(sockFd);
     const ip = ipv4Parts(host);
     const ipHost = (@as(u32, ip[0]) << 24) | (@as(u32, ip[1]) << 16) |
-                   (@as(u32, ip[2]) << 8)  |  @as(u32, ip[3]);
+        (@as(u32, ip[2]) << 8) | @as(u32, ip[3]);
     const addr = linux.sockaddr.in{
         .family = linux.AF.INET,
-        .port   = std.mem.nativeToBig(u16, port),
-        .addr   = std.mem.nativeToBig(u32, ipHost),
-        .zero   = std.mem.zeroes([8]u8),
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, ipHost),
+        .zero = std.mem.zeroes([8]u8),
     };
     if (linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)) != 0) {
         _ = linux.close(fd);
         return error.ConnectFailed;
     }
     const nd: c_int = 1;
-    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)),
-                         linux.TCP.NODELAY, @ptrCast(&nd), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)), linux.TCP.NODELAY, @ptrCast(&nd), @sizeOf(c_int));
     return fd;
 }
 
@@ -56,11 +55,11 @@ fn fdReadExact(fd: i32, buf: []u8) !void {
     }
 }
 
-const OPCODE_CONT  = 0x0;
-const OPCODE_TEXT  = 0x1;
+const OPCODE_CONT = 0x0;
+const OPCODE_TEXT = 0x1;
 const OPCODE_CLOSE = 0x8;
-const OPCODE_PING  = 0x9;
-const OPCODE_PONG  = 0xA;
+const OPCODE_PING = 0x9;
+const OPCODE_PONG = 0xA;
 
 fn wsSend(fd: i32, payload: []const u8) !void {
     var hdr: [14]u8 = undefined;
@@ -81,11 +80,14 @@ fn wsSend(fd: i32, payload: []const u8) !void {
         hdr[1] = maskBit | 127;
         var len = payload.len;
         var i: usize = 9;
-        while (i >= 2) : (i -= 1) { hdr[i] = @intCast(len & 0xFF); len >>= 8; }
+        while (i >= 2) : (i -= 1) {
+            hdr[i] = @intCast(len & 0xFF);
+            len >>= 8;
+        }
         hdrLen = 10;
     }
     const maskKey = [4]u8{ 0x12, 0x34, 0x56, 0x78 };
-    @memcpy(hdr[hdrLen..hdrLen + 4], &maskKey);
+    @memcpy(hdr[hdrLen .. hdrLen + 4], &maskKey);
     hdrLen += 4;
 
     try fdWriteAll(fd, hdr[0..hdrLen]);
@@ -97,7 +99,7 @@ fn wsSend(fd: i32, payload: []const u8) !void {
         for (payload[off..end], 0..) |b, i| {
             chunkBuf[i] = b ^ maskKey[(off + i) % 4];
         }
-        try fdWriteAll(fd, chunkBuf[0..end - off]);
+        try fdWriteAll(fd, chunkBuf[0 .. end - off]);
         off = end;
     }
 }
@@ -106,8 +108,8 @@ fn wsRecv(fd: i32, gpa: std.mem.Allocator) !struct { opcode: u8, fin: bool, data
     var hdr2: [2]u8 = undefined;
     try fdReadExact(fd, &hdr2);
 
-    const fin: bool    = (hdr2[0] & 0x80) != 0;
-    const opcode: u8   = hdr2[0] & 0x0F;
+    const fin: bool = (hdr2[0] & 0x80) != 0;
+    const opcode: u8 = hdr2[0] & 0x0F;
     const masked: bool = (hdr2[1] & 0x80) != 0;
     var payloadLen: usize = hdr2[1] & 0x7F;
 
@@ -119,7 +121,9 @@ fn wsRecv(fd: i32, gpa: std.mem.Allocator) !struct { opcode: u8, fin: bool, data
         var ext: [8]u8 = undefined;
         try fdReadExact(fd, &ext);
         payloadLen = 0;
-        for (ext) |b| { payloadLen = (payloadLen << 8) | b; }
+        for (ext) |b| {
+            payloadLen = (payloadLen << 8) | b;
+        }
     }
 
     var maskKey: [4]u8 = .{ 0, 0, 0, 0 };
@@ -132,13 +136,13 @@ fn wsRecv(fd: i32, gpa: std.mem.Allocator) !struct { opcode: u8, fin: bool, data
     var chunkBuf: [4096]u8 = undefined;
     while (off < payloadLen) {
         const chunkEnd = @min(off + chunkBuf.len, payloadLen);
-        try fdReadExact(fd, chunkBuf[0..chunkEnd - off]);
+        try fdReadExact(fd, chunkBuf[0 .. chunkEnd - off]);
         if (masked) {
-            for (chunkBuf[0..chunkEnd - off], 0..) |b, i| {
+            for (chunkBuf[0 .. chunkEnd - off], 0..) |b, i| {
                 data[off + i] = b ^ maskKey[(off + i) % 4];
             }
         } else {
-            @memcpy(data[off..chunkEnd], chunkBuf[0..chunkEnd - off]);
+            @memcpy(data[off..chunkEnd], chunkBuf[0 .. chunkEnd - off]);
         }
         off = chunkEnd;
     }
@@ -155,13 +159,14 @@ pub const Conn = struct {
     pub fn init(gpa: std.mem.Allocator, host: []const u8, port: u16, path: []const u8) !Conn {
         const fd = try tcpConn(host, port);
 
-        const req = try std.fmt.allocPrint(gpa,
+        const req = try std.fmt.allocPrint(
+            gpa,
             "GET {s} HTTP/1.1\r\n" ++
-            "Host: {s}:{d}\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-            "Sec-WebSocket-Version: 13\r\n\r\n",
+                "Host: {s}:{d}\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n\r\n",
             .{ path, host, port },
         );
         defer gpa.free(req);
@@ -247,7 +252,7 @@ pub const ParsedUrl = struct {
 
 pub fn parseUrl(url: []const u8) ParsedUrl {
     var s = url;
-    if (std.mem.startsWith(u8, s, "ws://"))  s = s[5..];
+    if (std.mem.startsWith(u8, s, "ws://")) s = s[5..];
     if (std.mem.startsWith(u8, s, "wss://")) s = s[6..];
     const slash = std.mem.indexOfScalar(u8, s, '/') orelse s.len;
     const path = if (slash < s.len) s[slash..] else "/";

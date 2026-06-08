@@ -18,7 +18,7 @@ pub const RpcTransaction = struct {
     gas: []const u8 = "",
     gasPrice: []const u8 = "",
     input: []const u8 = "",
-    @"type": []const u8 = "",
+    type: []const u8 = "",
     maxPriorityFeePerGas: ?[]const u8 = null,
     maxFeePerGas: ?[]const u8 = null,
 };

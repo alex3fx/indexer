@@ -1,56 +1,67 @@
 const std = @import("std");
 const Build = std.Build;
 
-const executables = .{
-    .{ "start", "raw", "src/main.zig" },
-};
-
-const modules = .{
-    .{ "indexer/utils", "src/utils/_root.zig" },
-    .{ "indexer/core", "src/core/_root.zig" },
-};
-
 pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    inline for (executables) |d| {
-        var module_refs: [modules.len]*Build.Module = undefined;
-        inline for (modules, 0..) |mod, i| {
-            module_refs[i] = b.createModule(.{
-                .root_source_file = b.path(mod[1]),
-                .target = target,
-                .optimize = optimize,
-            });
-        }
+    const utils_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-        inline for (module_refs) |module| {
-            inline for (modules, module_refs) |mod, import_module| {
-                module.addImport(mod[0], import_module);
-            }
-        }
+    const rpc_mod = b.createModule(.{
+        .root_source_file = b.path("src/rpc/_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-        const exe = b.addExecutable(.{
-            .name = d[1],
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(d[2]),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
+    const db_mod = b.createModule(.{
+        .root_source_file = b.path("src/db/_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-        inline for (modules, module_refs) |mod, module| {
-            exe.root_module.addImport(mod[0], module);
-        }
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-        exe.root_module.link_libc = true;
-        b.installArtifact(exe);
+    // core imports itself (so internal files can @import("indexer/core"))
+    // and utils (so _root.zig can re-export it as pub const utils = ...)
+    core_mod.addImport("indexer/core", core_mod);
+    core_mod.addImport("indexer/utils", utils_mod);
+    core_mod.addImport("indexer/rpc", rpc_mod);
 
-        const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| run_cmd.addArgs(args);
+    // utils imports core (env files use @import("indexer/core") for enums/errors)
+    utils_mod.addImport("indexer/core", core_mod);
 
-        const step = b.step(d[0], b.fmt("Build and run {s}", .{d[1]}));
-        step.dependOn(b.getInstallStep());
-        step.dependOn(&run_cmd.step);
-    }
+    // rpc imports core (for structures, fetch.Client, etc.)
+    rpc_mod.addImport("indexer/core", core_mod);
+
+    // db imports core (pool.zig uses core structures)
+    db_mod.addImport("indexer/core", core_mod);
+
+    const exe = b.addExecutable(.{
+        .name = "raw",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("indexer/core", core_mod);
+    exe.root_module.addImport("indexer/rpc", rpc_mod);
+    exe.root_module.addImport("indexer/db", db_mod);
+    exe.root_module.link_libc = true;
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
+
+    const step = b.step("start", "Build and run raw");
+    step.dependOn(b.getInstallStep());
+    step.dependOn(&run_cmd.step);
 }

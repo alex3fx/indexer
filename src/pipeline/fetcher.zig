@@ -1,22 +1,22 @@
 const std = @import("std");
 
 const core = @import("indexer/core");
-const utils = @import("indexer/utils");
-const rpc  = @import("../rpc/client.zig");
-const pool = @import("../rpc/pool.zig");
+const utils = core.utils;
+const rpc = @import("indexer/rpc").client;
+const pool = @import("indexer/rpc").pool;
 
-const Allocator        = std.mem.Allocator;
+const Allocator = std.mem.Allocator;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
-const FetchClient      = core.fetch.Client;
+const FetchClient = core.fetch.Client;
 
 pub const Options = struct {
-    rpcNode:        EvmRpcNodeConfig,
-    blockNumber:    u64,
-    blockClient:    ?*FetchClient = null,
+    rpcNode: EvmRpcNodeConfig,
+    blockNumber: u64,
+    blockClient: ?*FetchClient = null,
     receiptsClient: ?*FetchClient = null,
-    tracesClient:   ?*FetchClient = null,
-    httpPool:       ?*pool.HttpPool = null,  // if set, use pool instead of thread spawn
-    skipLogs:       bool = false,
+    tracesClient: ?*FetchClient = null,
+    httpPool: ?*pool.HttpPool = null, // if set, use pool instead of thread spawn
+    skipLogs: bool = false,
 };
 
 pub const Response = struct {
@@ -65,11 +65,9 @@ pub fn getConsistentBlockData(
     // Try twice (retry on null response = block not yet available).
     for (0..2) |_| {
         const maybe_set = if (options.httpPool) |p|
-            try fetchResponseSetPooled(allocator, p, options.rpcNode, block_number,
-                options.blockClient, options.receiptsClient, options.tracesClient)
+            try fetchResponseSetPooled(allocator, p, options.rpcNode, block_number, options.blockClient, options.receiptsClient, options.tracesClient)
         else
-            try fetchResponseSet(allocator, io, options.rpcNode, block_number,
-                options.blockClient, options.receiptsClient, options.tracesClient);
+            try fetchResponseSet(allocator, io, options.rpcNode, block_number, options.blockClient, options.receiptsClient, options.tracesClient);
 
         if (maybe_set) |set| return try buildResponse(allocator, options.blockNumber, set, options.skipLogs);
     }
@@ -98,24 +96,24 @@ fn buildResponse(allocator: Allocator, height: u64, set: ResponseSet, skipLogs: 
 }
 
 fn fetchResponseSetPooled(
-    allocator:    Allocator,
-    httpPool:     *pool.HttpPool,
-    rpcNode:      EvmRpcNodeConfig,
-    blockNumber:  []const u8,
-    ext_block:    ?*FetchClient,
+    allocator: Allocator,
+    httpPool: *pool.HttpPool,
+    rpcNode: EvmRpcNodeConfig,
+    blockNumber: []const u8,
+    ext_block: ?*FetchClient,
     ext_receipts: ?*FetchClient,
-    ext_traces:   ?*FetchClient,
+    ext_traces: ?*FetchClient,
 ) !?ResponseSet {
-    var tmp_block    = FetchClient.init(allocator, undefined);
+    var tmp_block = FetchClient.init(allocator, undefined);
     var tmp_receipts = FetchClient.init(allocator, undefined);
-    var tmp_traces   = FetchClient.init(allocator, undefined);
-    defer if (ext_block    == null) tmp_block.deinit();
+    var tmp_traces = FetchClient.init(allocator, undefined);
+    defer if (ext_block == null) tmp_block.deinit();
     defer if (ext_receipts == null) tmp_receipts.deinit();
-    defer if (ext_traces   == null) tmp_traces.deinit();
+    defer if (ext_traces == null) tmp_traces.deinit();
 
-    const bc = ext_block    orelse &tmp_block;
+    const bc = ext_block orelse &tmp_block;
     const rc = ext_receipts orelse &tmp_receipts;
-    const tc = ext_traces   orelse &tmp_traces;
+    const tc = ext_traces orelse &tmp_traces;
 
     const started_at_ns = monotonicNs();
 
@@ -133,7 +131,7 @@ fn fetchResponseSetPooled(
 
     const parallel_fetch_elapsed_ns = elapsedNs(started_at_ns);
 
-    const maybe_block    = results[0] catch |err| {
+    const maybe_block = results[0] catch |err| {
         deinitResponseResult(allocator, results[1]);
         deinitResponseResult(allocator, results[2]);
         return err;
@@ -143,7 +141,7 @@ fn fetchResponseSetPooled(
         deinitResponseResult(allocator, results[2]);
         return err;
     };
-    const maybe_traces   = results[2] catch |err| {
+    const maybe_traces = results[2] catch |err| {
         deinitOptionalResponse(allocator, maybe_block);
         deinitOptionalResponse(allocator, maybe_receipts);
         return err;
@@ -158,33 +156,33 @@ fn fetchResponseSetPooled(
 
     return .{
         .parallelFetchElapsedNs = parallel_fetch_elapsed_ns,
-        .block    = maybe_block.?,
+        .block = maybe_block.?,
         .receipts = maybe_receipts.?,
-        .traces   = maybe_traces.?,
+        .traces = maybe_traces.?,
     };
 }
 
 fn fetchResponseSet(
-    allocator:    Allocator,
-    io:           std.Io,
-    rpcNode:      EvmRpcNodeConfig,
-    blockNumber:  []const u8,
-    ext_block:    ?*FetchClient,
+    allocator: Allocator,
+    io: std.Io,
+    rpcNode: EvmRpcNodeConfig,
+    blockNumber: []const u8,
+    ext_block: ?*FetchClient,
     ext_receipts: ?*FetchClient,
-    ext_traces:   ?*FetchClient,
+    ext_traces: ?*FetchClient,
 ) !?ResponseSet {
     const started_at_ns = monotonicNs();
 
-    var tmp_block    = FetchClient.init(allocator, io);
+    var tmp_block = FetchClient.init(allocator, io);
     var tmp_receipts = FetchClient.init(allocator, io);
-    var tmp_traces   = FetchClient.init(allocator, io);
-    defer if (ext_block    == null) tmp_block.deinit();
+    var tmp_traces = FetchClient.init(allocator, io);
+    defer if (ext_block == null) tmp_block.deinit();
     defer if (ext_receipts == null) tmp_receipts.deinit();
-    defer if (ext_traces   == null) tmp_traces.deinit();
+    defer if (ext_traces == null) tmp_traces.deinit();
 
-    const block_client    = ext_block    orelse &tmp_block;
+    const block_client = ext_block orelse &tmp_block;
     const receipts_client = ext_receipts orelse &tmp_receipts;
-    const traces_client   = ext_traces   orelse &tmp_traces;
+    const traces_client = ext_traces orelse &tmp_traces;
 
     var block_task = try rpc.requestWithRpcNode(allocator, block_client, .getBlockWithTransactionsByNumber, .{
         .rpcNode = rpcNode,

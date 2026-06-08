@@ -1,15 +1,15 @@
-const std  = @import("std");
+const std = @import("std");
 const Init = std.process.Init;
 
-const core        = @import("indexer/core");
-const errors      = core.errors;
-const parsers     = @import("parsers.zig");
-const types       = @import("types.zig");
+const core = @import("indexer/core");
+const errors = core.errors;
+const parsers = @import("parsers.zig");
+const types = @import("types.zig");
 const validations = @import("validations.zig");
 
-pub const Env         = types.Env;
+pub const Env = types.Env;
 pub const EnvValueType = types.EnvValueType;
-pub const Mode        = types.Mode;
+pub const Mode = types.Mode;
 pub const ParseEnvError = errors.ParseEnvError;
 
 const EnvVariable = core.enums.EnvVariable;
@@ -28,7 +28,8 @@ pub fn get_envs(init: Init) ParseEnvError!Env {
         .LOGS_GRAYLOG_HOST = init.environ_map.get(@tagName(EnvVariable.LOGS_GRAYLOG_HOST)) orelse "127.0.0.1",
         .LOGS_GRAYLOG_PORT = if (init.environ_map.get(@tagName(EnvVariable.LOGS_GRAYLOG_PORT))) |v|
             std.fmt.parseInt(u16, v, 10) catch 12201
-        else 12201,
+        else
+            12201,
         .LOGS_GRAYLOG_APP = init.environ_map.get(@tagName(EnvVariable.LOGS_GRAYLOG_APP)) orelse "indexer",
     };
 }

@@ -21,12 +21,12 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
 
     const ip = parseIpv4(host);
     const ipHost = (@as(u32, ip[0]) << 24) | (@as(u32, ip[1]) << 16) |
-                   (@as(u32, ip[2]) << 8)  |  @as(u32, ip[3]);
+        (@as(u32, ip[2]) << 8) | @as(u32, ip[3]);
     const addr = linux.sockaddr.in{
         .family = linux.AF.INET,
-        .port   = std.mem.nativeToBig(u16, port),
-        .addr   = std.mem.nativeToBig(u32, ipHost),
-        .zero   = std.mem.zeroes([8]u8),
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, ipHost),
+        .zero = std.mem.zeroes([8]u8),
     };
     const rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
     if (rc != 0) {
@@ -34,8 +34,7 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
         return error.ConnectFailed;
     }
     const nodelay: c_int = 1;
-    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)),
-        linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)), linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
     return fd;
 }
 
@@ -64,7 +63,7 @@ fn fdReadLine(fd: i32, buf: []u8) ![]u8 {
         var b: [1]u8 = undefined;
         try fdReadExact(fd, &b);
         if (b[0] == '\n') {
-            return if (pos > 0 and buf[pos - 1] == '\r') buf[0..pos - 1] else buf[0..pos];
+            return if (pos > 0 and buf[pos - 1] == '\r') buf[0 .. pos - 1] else buf[0..pos];
         }
         buf[pos] = b[0];
         pos += 1;
@@ -86,8 +85,7 @@ pub const Conn = struct {
     }
 
     pub fn auth(self: *Conn, password: []const u8) !void {
-        const cmd = try std.fmt.allocPrint(self.gpa,
-            "*2\r\n$4\r\nAUTH\r\n${d}\r\n{s}\r\n", .{ password.len, password });
+        const cmd = try std.fmt.allocPrint(self.gpa, "*2\r\n$4\r\nAUTH\r\n${d}\r\n{s}\r\n", .{ password.len, password });
         defer self.gpa.free(cmd);
         try fdWrite(self.fd, cmd);
         var buf: [64]u8 = undefined;
@@ -95,8 +93,7 @@ pub const Conn = struct {
     }
 
     pub fn selectDb(self: *Conn, db: u8) !void {
-        const cmd = try std.fmt.allocPrint(self.gpa,
-            "*2\r\n$6\r\nSELECT\r\n${d}\r\n{d}\r\n", .{ digitLen(db), db });
+        const cmd = try std.fmt.allocPrint(self.gpa, "*2\r\n$6\r\nSELECT\r\n${d}\r\n{d}\r\n", .{ digitLen(db), db });
         defer self.gpa.free(cmd);
         try fdWrite(self.fd, cmd);
         var buf: [64]u8 = undefined;
@@ -105,8 +102,7 @@ pub const Conn = struct {
 
     /// Returns null if key does not exist. Caller must free result.
     pub fn get(self: *Conn, key: []const u8) !?[]u8 {
-        const cmd = try std.fmt.allocPrint(self.gpa,
-            "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key });
+        const cmd = try std.fmt.allocPrint(self.gpa, "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key });
         defer self.gpa.free(cmd);
         try fdWrite(self.fd, cmd);
 
@@ -131,9 +127,7 @@ pub const Conn = struct {
     }
 
     pub fn set(self: *Conn, key: []const u8, value: []const u8) !void {
-        const cmd = try std.fmt.allocPrint(self.gpa,
-            "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n",
-            .{ key.len, key, value.len, value });
+        const cmd = try std.fmt.allocPrint(self.gpa, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value });
         defer self.gpa.free(cmd);
         try fdWrite(self.fd, cmd);
         var buf: [64]u8 = undefined;
@@ -149,7 +143,7 @@ pub const Conn = struct {
                 if (attempt == 4) return err;
                 const ms: u64 = @as(u64, 50) << @intCast(attempt);
                 const ts = linux.timespec{
-                    .sec  = @intCast(ms / 1000),
+                    .sec = @intCast(ms / 1000),
                     .nsec = @intCast((ms % 1000) * 1_000_000),
                 };
                 _ = linux.nanosleep(&ts, null);
