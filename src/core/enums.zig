@@ -54,6 +54,7 @@ pub const EnvVariable = enum {
     LOGS_GRAYLOG_HOST, // optional, default "127.0.0.1"
     LOGS_GRAYLOG_PORT, // optional, default 12201
     LOGS_GRAYLOG_APP, // optional, default "indexer"
+    TIME_ZONE, // optional, integer offset from UTC e.g. 3 or -5, default 0
 };
 
 pub const Mode = enum {

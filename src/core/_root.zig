@@ -17,3 +17,4 @@ pub const getEvmChainConfig = supported_chains.getEvmChainConfig;
 pub const getRuntimeContext = runtime_context.getRuntimeContext;
 
 pub const utils = @import("indexer/utils");
+pub const logger = @import("common/logger.zig");

@@ -31,5 +31,9 @@ pub fn get_envs(init: Init) ParseEnvError!Env {
         else
             12201,
         .LOGS_GRAYLOG_APP = init.environ_map.get(@tagName(EnvVariable.LOGS_GRAYLOG_APP)) orelse "indexer",
+        .TIME_ZONE = if (init.environ_map.get(@tagName(EnvVariable.TIME_ZONE))) |v|
+            std.fmt.parseInt(i8, v, 10) catch 0
+        else
+            0,
     };
 }

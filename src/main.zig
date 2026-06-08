@@ -13,6 +13,7 @@ const utils = core.utils;
 const EnvVariable = core.enums.EnvVariable;
 const FetchClient = core.fetch.Client;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
+const Logger = core.logger.Logger;
 
 const pipeline = @import("pipeline/pipeline.zig");
 const writer = @import("pipeline/writer.zig");
@@ -209,8 +210,14 @@ pub fn main(init: Init) !void {
 
     const runtime = try core.getRuntimeContext(init);
     const env = runtime.env;
+
+    var log = Logger.init(gpa, runtime.details,
+        env.LOGS_GRAYLOG_HOST, env.LOGS_GRAYLOG_PORT, env.LOGS_GRAYLOG_APP, env.TIME_ZONE);
+    defer log.deinit();
+    log.info("EVM indexer starting");
+
     const chain = core.getEvmChainConfig(runtime.details.evmChainId) orelse {
-        std.debug.print("Unsupported chain id: {d}\n", .{runtime.details.evmChainId});
+        log.err("Unsupported chain");
         return error.UnsupportedChain;
     };
 
@@ -324,7 +331,7 @@ pub fn main(init: Init) !void {
     if (cli.to != null) return;
 
     // ── Realtime loop ─────────────────────────────────────────────────────────
-    std.debug.print("\nRealtime mode — listening for new blocks via WSS...\n\n", .{});
+    log.info("Realtime mode — listening for new blocks via WSS...");
 
     var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode);
     defer ctx.deinit();

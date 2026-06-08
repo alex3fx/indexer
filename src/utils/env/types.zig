@@ -16,6 +16,7 @@ pub const Env = struct {
     LOGS_GRAYLOG_HOST: []const u8,
     LOGS_GRAYLOG_PORT: u16,
     LOGS_GRAYLOG_APP: []const u8,
+    TIME_ZONE: i8,
 
     pub fn get(self: Env, comptime variable: EnvVariable) EnvValueType(variable) {
         return switch (variable) {
@@ -31,6 +32,7 @@ pub const Env = struct {
             .LOGS_GRAYLOG_HOST => self.LOGS_GRAYLOG_HOST,
             .LOGS_GRAYLOG_PORT => self.LOGS_GRAYLOG_PORT,
             .LOGS_GRAYLOG_APP => self.LOGS_GRAYLOG_APP,
+            .TIME_ZONE => self.TIME_ZONE,
         };
     }
 };
@@ -49,5 +51,6 @@ pub fn EnvValueType(comptime variable: EnvVariable) type {
         .LOGS_GRAYLOG_HOST => []const u8,
         .LOGS_GRAYLOG_PORT => u16,
         .LOGS_GRAYLOG_APP => []const u8,
+        .TIME_ZONE => i8,
     };
 }

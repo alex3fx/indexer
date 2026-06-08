@@ -64,4 +64,16 @@ pub fn build(b: *Build) void {
     const step = b.step("start", "Build and run raw");
     step.dependOn(b.getInstallStep());
     step.dependOn(&run_cmd.step);
+
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tests.root_module.addImport("indexer/core", core_mod);
+
+    const test_step = b.step("test", "Run logger tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }
