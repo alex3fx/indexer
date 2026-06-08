@@ -13,7 +13,6 @@ const utils = @import("indexer/utils");
 const EnvVariable      = core.enums.EnvVariable;
 const FetchClient      = core.fetch.Client;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
-const EvmRpcClientType = core.enums.EvmRpcClientType;
 
 const pipeline  = @import("pipeline/pipeline.zig");
 const writer    = @import("pipeline/writer.zig");
@@ -265,7 +264,6 @@ pub fn main(init: Init) !void {
     // ── Backup RPC node (optional) ────────────────────────────────────────────
     const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
         if (url.len > 0) EvmRpcNodeConfig{
-            .type  = chain.rpcNodes.lotosArchiveNode.type,
             .https = url,
             .wss   = "",
         } else null

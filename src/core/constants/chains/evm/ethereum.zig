@@ -3,7 +3,6 @@ const structures = @import("indexer/core").structures;
 const utils = @import("indexer/utils");
 const EvmChainConfig = structures.EvmChainConfig;
 const EvmCurrencySymbol = enums.EvmCurrencySymbol;
-const EvmRpcClientType = enums.EvmRpcClientType;
 const EvmSystemCurrency = enums.EvmSystemCurrency;
 const lc = utils.lc;
 
@@ -27,22 +26,18 @@ pub const ethereum: EvmChainConfig = .{
     },
     .rpcNodes = .{
         .lotosArchiveNode = .{
-            .type = EvmRpcClientType.RETH,
             .https = "http://100.64.0.7:8545",
             .wss = "ws://100.64.0.7:8546",
         },
         .lotosFullNode = .{
-            .type = EvmRpcClientType.RETH,
             .https = "http://2.0.0.0:8545",
             .wss = "ws://2.0.0.0:8546",
         },
         .mevFullNode = .{
-            .type = EvmRpcClientType.RETH,
             .https = "https://eth.merkle.io",
             .wss = "wss://eth.merkle.io",
         },
         .publicArchiveNode = .{
-            .type = EvmRpcClientType.ERIGON,
             .https = "https://ethereum-rpc.publicnode.com",
             .wss = "wss://ethereum-rpc.publicnode.com",
         },

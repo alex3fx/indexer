@@ -18,6 +18,7 @@ const pool        = @import("../db/pool.zig");
 const http_pool   = @import("../rpc/pool.zig");
 const batch       = @import("../db/batch.zig");
 const cursor      = @import("../db/cursor.zig");
+const node_probe  = @import("../rpc/node_probe.zig");
 
 const EvmChainConfig   = core.structures.EvmChainConfig;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
@@ -181,7 +182,11 @@ pub fn fetchParseTransform(
         return .{ .fatal = e };
     if (block == null) return .skip_missing;
     const receipts = (parser.parseReceiptsRespZC(data.receipts.body, aa) catch null) orelse &.{};
-    const traces   = (parser.parseTracesRespZC(data.traces.body, aa)     catch null) orelse &.{};
+    // Choose trace parser based on detected node type (cached from requestSync probe)
+    const traces: []const parser.RpcTrace = switch (node_probe.getCached(rpcNode.https)) {
+        .trace_block       => (parser.parseTracesRespZC(data.traces.body, aa)     catch null) orelse &.{},
+        .debug_trace_block => (parser.parseGethTracesRespZC(data.traces.body, aa) catch null) orelse &.{},
+    };
     result.parseNs = nowNs() - t1;
 
     const t2 = nowNs();

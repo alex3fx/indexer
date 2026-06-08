@@ -479,5 +479,162 @@ fn parseResult(p: *P, arena: Al, comptime zc: bool) !RpcResult {
     return res;
 }
 
+// ─── GETH callTracer parser ───────────────────────────────────────────────────
+// Parses debug_traceBlockByNumber (callTracer) response.
+// Format: {"result":[{"txHash":"0x...","result":{CallFrame}}, ...]}
+// CallFrame: {from, to, type, value, input, calls:[CallFrame,...]}
+// Flattens the nested call tree into a flat []RpcTrace (same output as parseTracesRespZC).
+
+pub fn parseGethTracesRespZC(raw: []const u8, arena: Al) !?[]RpcTrace {
+    var p = P.init(raw);
+    if (!p.jumpTo("result")) return null;
+    p.ws();
+    if (p.peek() == 'n') return null;
+    return try parseGethTracesArr(&p, arena);
+}
+
+fn parseGethTracesArr(p: *P, arena: Al) ![]RpcTrace {
+    var out: std.ArrayList(RpcTrace) = .empty;
+    if (!p.eat('[')) return out.toOwnedSlice(arena);
+    var tx_pos: i32 = 0;
+    while (p.i < p.s.len) {
+        p.ws();
+        if (p.s[p.i] == ']') { p.i += 1; break; }
+        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        if (p.s[p.i] == '{') {
+            try parseGethTxEntry(p, arena, tx_pos, &out);
+            tx_pos += 1;
+        } else {
+            p.skip();
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn parseGethTxEntry(p: *P, arena: Al, tx_pos: i32, out: *std.ArrayList(RpcTrace)) !void {
+    _ = p.eat('{');
+    var tx_hash: []const u8 = "";
+    var result_start: usize = 0;
+    var result_end: usize = 0;
+    var has_result = false;
+    while (p.i < p.s.len) {
+        p.ws();
+        if (p.s[p.i] == '}') { p.i += 1; break; }
+        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        const key = p.str();
+        _ = p.eat(':');
+        if (eql(key, "txHash") or eql(key, "transactionHash")) {
+            tx_hash = p.str();
+        } else if (eql(key, "result")) {
+            p.ws();
+            if (p.i < p.s.len and p.s[p.i] == '{') {
+                result_start = p.i;
+                p.skip();
+                result_end = p.i;
+                has_result = true;
+            } else {
+                p.skip();
+            }
+        } else {
+            p.skip();
+        }
+    }
+    if (!has_result) return;
+    var fp = P.init(p.s[result_start..result_end]);
+    try flattenCallFrame(&fp, arena, tx_hash, tx_pos, out);
+}
+
+fn flattenCallFrame(
+    p: *P,
+    arena: Al,
+    tx_hash: []const u8,
+    tx_pos: i32,
+    out: *std.ArrayList(RpcTrace),
+) !void {
+    if (p.peek() != '{') return;
+    _ = p.eat('{');
+
+    var from: []const u8 = "";
+    var to: ?[]const u8 = null;
+    var value: ?[]const u8 = null;
+    var frame_type: []const u8 = "";
+    var input: ?[]const u8 = null;
+    var calls_start: usize = 0;
+    var calls_end: usize = 0;
+    var has_calls = false;
+
+    while (p.i < p.s.len) {
+        p.ws();
+        if (p.s[p.i] == '}') { p.i += 1; break; }
+        if (p.s[p.i] == ',') { p.i += 1; continue; }
+        const key = p.str();
+        _ = p.eat(':');
+        if (eql(key, "from")) {
+            from = p.str();
+        } else if (eql(key, "to")) {
+            const v = p.str();
+            to = if (v.len > 0) v else null;
+        } else if (eql(key, "value")) {
+            const v = p.str();
+            value = if (v.len > 0) v else null;
+        } else if (eql(key, "type")) {
+            frame_type = p.str();
+        } else if (eql(key, "input")) {
+            const v = p.str();
+            input = if (v.len > 0) v else null;
+        } else if (eql(key, "calls")) {
+            p.ws();
+            if (p.i < p.s.len and p.s[p.i] == '[') {
+                calls_start = p.i;
+                p.skip();
+                calls_end = p.i;
+                has_calls = true;
+            } else {
+                p.skip();
+            }
+        } else {
+            p.skip();
+        }
+    }
+
+    const is_create = eql(frame_type, "CREATE") or eql(frame_type, "CREATE2");
+    const is_selfdestruct = eql(frame_type, "SELFDESTRUCT");
+
+    if (!is_selfdestruct) {
+        var trace = RpcTrace{
+            .transactionHash     = if (tx_hash.len > 0) tx_hash else null,
+            .transactionPosition = tx_pos,
+        };
+        if (is_create) {
+            trace.action.from          = from;
+            trace.action.value         = value;
+            trace.action.input         = input;
+            trace.action.creationMethod = if (eql(frame_type, "CREATE2")) "create2" else "create";
+            if (to) |addr| trace.result = .{ .address = addr };
+        } else {
+            trace.action.from  = from;
+            trace.action.to    = to;
+            trace.action.value = value;
+        }
+        try out.append(arena, trace);
+    }
+
+    if (has_calls) {
+        var sp = P.init(p.s[calls_start..calls_end]);
+        _ = sp.eat('[');
+        while (sp.i < sp.s.len) {
+            sp.ws();
+            if (sp.i >= sp.s.len) break;
+            if (sp.s[sp.i] == ']') { sp.i += 1; break; }
+            if (sp.s[sp.i] == ',') { sp.i += 1; continue; }
+            if (sp.s[sp.i] == '{') {
+                try flattenCallFrame(&sp, arena, tx_hash, tx_pos, out);
+            } else {
+                sp.skip();
+            }
+        }
+    }
+}
+
 // suppress unused warning for readInt
 const _readInt = readInt;

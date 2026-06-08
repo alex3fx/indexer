@@ -3,7 +3,6 @@ const enums = @import("enums.zig");
 
 const EvmCurrencySymbol = enums.EvmCurrencySymbol;
 const EvmContract = enums.EvmContract;
-const EvmRpcClientType = enums.EvmRpcClientType;
 const EvmSystemCurrency = enums.EvmSystemCurrency;
 
 pub const EvmNativeCurrency = struct {
@@ -23,7 +22,6 @@ pub const EvmIndexingOptions = struct {
 };
 
 pub const EvmRpcNodeConfig = struct {
-    type: EvmRpcClientType,
     https: []const u8,
     wss: []const u8,
 };

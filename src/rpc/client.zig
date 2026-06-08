@@ -1,12 +1,15 @@
 const std = @import("std");
 
-const core = @import("indexer/core");
-const utils = @import("indexer/utils");
+const core       = @import("indexer/core");
+const utils      = @import("indexer/utils");
+const node_probe = @import("node_probe.zig");
 
-const Allocator = std.mem.Allocator;
+const Allocator        = std.mem.Allocator;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
 const EvmRpcNodesConfig = core.structures.EvmRpcNodesConfig;
-const FetchClient = core.fetch.Client;
+const FetchClient      = core.fetch.Client;
+
+pub const TraceMethod = node_probe.TraceMethod;
 
 pub const Options = struct {
     rpcNodes: EvmRpcNodesConfig,
@@ -123,7 +126,14 @@ pub fn requestSync(
     if (!utils.isHex(options.number)) return error.InvalidBlockNumberHex;
 
     const rpcNode = options.rpcNode;
-    const payload = try makePayload(allocator, method, rpcNode, options.number);
+
+    // Detect trace method on first call per URL, cached thereafter (no HTTP on cache hit)
+    const traceMethod: node_probe.TraceMethod = if (method == .getBlockTraces)
+        node_probe.detect(allocator, client, rpcNode.https)
+    else
+        .trace_block;
+
+    const payload = try makePayload(allocator, method, traceMethod, options.number);
     defer allocator.free(payload);
 
     var response = try client.fetch(.{
@@ -158,7 +168,7 @@ fn selectRpcNode(rpcNodes: EvmRpcNodesConfig) EvmRpcNodeConfig {
 fn makePayload(
     allocator: Allocator,
     method: Method,
-    rpcNode: EvmRpcNodeConfig,
+    traceMethod: node_probe.TraceMethod,
     number: []const u8,
 ) ![]u8 {
     return switch (method) {
@@ -172,14 +182,17 @@ fn makePayload(
             "{{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"eth_getBlockReceipts\",\"params\":[\"{s}\"]}}",
             .{number},
         ),
-        .getBlockTraces => switch (rpcNode.type) {
-            .ERIGON, .RETH => try std.fmt.allocPrint(
+        .getBlockTraces => switch (traceMethod) {
+            .trace_block => try std.fmt.allocPrint(
                 allocator,
                 "{{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"trace_block\",\"params\":[\"{s}\"]}}",
                 .{number},
             ),
-            // TODO: Geth needs debug_traceBlock with the final tracer/options model.
-            .GETH => error.DebugTraceBlockNotImplemented,
+            .debug_trace_block => try std.fmt.allocPrint(
+                allocator,
+                "{{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"debug_traceBlockByNumber\",\"params\":[\"{s}\",{{\"tracer\":\"callTracer\",\"tracerConfig\":{{\"onlyTopCall\":false}}}}]}}",
+                .{number},
+            ),
         },
     };
 }

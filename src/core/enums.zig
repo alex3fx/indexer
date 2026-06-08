@@ -10,12 +10,6 @@ pub const AppErrorCode = enum {
     UNSUPPORTED_CHAIN,
 };
 
-pub const EvmRpcClientType = enum {
-    RETH,
-    ERIGON,
-    GETH,
-};
-
 pub const EvmContract = enum {
     UNISWAP_V2_ROUTER,
     PANCAKE_V2_ROUTER,

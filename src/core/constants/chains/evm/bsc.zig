@@ -3,7 +3,6 @@ const structures = @import("indexer/core").structures;
 const utils = @import("indexer/utils");
 const EvmChainConfig = structures.EvmChainConfig;
 const EvmCurrencySymbol = enums.EvmCurrencySymbol;
-const EvmRpcClientType = enums.EvmRpcClientType;
 const EvmSystemCurrency = enums.EvmSystemCurrency;
 const lc = utils.lc;
 
@@ -27,22 +26,18 @@ pub const bsc: EvmChainConfig = .{
     },
     .rpcNodes = .{
         .lotosArchiveNode = .{
-            .type = EvmRpcClientType.RETH,
             .https = "http://3.0.0.0:8545",
             .wss = "ws://3.0.0.0:8546",
         },
         .lotosFullNode = .{
-            .type = EvmRpcClientType.RETH,
             .https = "http://4.0.0.0:8545",
             .wss = "ws://4.0.0.0:8546",
         },
         .mevFullNode = .{
-            .type = EvmRpcClientType.GETH,
             .https = "https://bscrpc.pancakeswap.finance",
             .wss = "wss://bscrpc.pancakeswap.finance",
         },
         .publicArchiveNode = .{
-            .type = EvmRpcClientType.RETH,
             .https = "https://bsc-rpc.publicnode.com",
             .wss = "wss://bsc-rpc.publicnode.com",
         },
