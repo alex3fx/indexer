@@ -10,6 +10,7 @@ const std = @import("std");
 const linux = std.os.linux;
 
 const core = @import("indexer/core");
+const Logger = core.logger.Logger;
 
 const fetcher = @import("fetcher.zig");
 const parser = @import("parser.zig");
@@ -674,6 +675,7 @@ pub fn runHistorical(
     chunkBuckets: u64,
     saveEvery: usize,
     backupNode: ?EvmRpcNodeConfig,
+    log: *Logger,
 ) !void {
     if (from > to) return;
 
@@ -744,6 +746,9 @@ pub fn runHistorical(
 
     const elapsedMs = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
     std.debug.print("\nHistorical sync done: {d:.0}ms  saved_blocks={d}\n", .{ elapsedMs, blocksDone });
+    const syncMsg = std.fmt.allocPrint(gpa, "historical sync done: {d} blocks in {d:.0}ms", .{ blocksDone, elapsedMs }) catch "";
+    defer if (syncMsg.len > 0) gpa.free(syncMsg);
+    log.info(if (syncMsg.len > 0) syncMsg else "historical sync done");
 
     // Retry any blocks that were skipped during the main pass, then verify
     // all are present before the caller transitions to realtime mode.

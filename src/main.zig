@@ -162,12 +162,17 @@ fn runRealtimeLoop(
     wsParsed: ws.ParsedUrl,
     ctx: *RealtimeContext,
     startBlock: u64,
+    log: *Logger,
+    heartbeatN: u64,
 ) !void {
     var cursorPos = startBlock;
+    var blocksSinceHeartbeat: u64 = 0;
 
     while (true) {
         const blockNum = wsConn.nextBlockNum() catch |err| {
-            std.debug.print("WSS error: {s} — reconnecting...\n", .{@errorName(err)});
+            const msg = std.fmt.allocPrint(gpa, "WSS disconnected: {s} — reconnecting", .{@errorName(err)}) catch "";
+            defer if (msg.len > 0) gpa.free(msg);
+            log.warn(if (msg.len > 0) msg else "WSS disconnected — reconnecting");
             wsConn.deinit();
             wsConn.* = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch break;
             _ = wsConn.subscribeNewHeads() catch break;
@@ -188,14 +193,28 @@ fn runRealtimeLoop(
                 switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode)) {
                     .saved => break,
                     .retry_later => {
+                        const msg = std.fmt.allocPrint(gpa, "block {d} unavailable — retry in {d}ms", .{ blk, ctx.retryDelayMs }) catch "";
+                        defer if (msg.len > 0) gpa.free(msg);
+                        log.warn(if (msg.len > 0) msg else "block unavailable — retrying");
                         std.debug.print("[realtime] block={d} unavailable on all nodes — retry in {d}ms\n", .{ blk, ctx.retryDelayMs });
                         delayMs(ctx.retryDelayMs);
                     },
                     .fatal => |e| {
+                        const msg = std.fmt.allocPrint(gpa, "block {d} fatal: {s} — retry in {d}ms", .{ blk, @errorName(e), ctx.retryDelayMs }) catch "";
+                        defer if (msg.len > 0) gpa.free(msg);
+                        log.err(if (msg.len > 0) msg else "block fatal error — retrying");
                         std.debug.print("[realtime] block={d} fatal: {s} — retry in {d}ms\n", .{ blk, @errorName(e), ctx.retryDelayMs });
                         delayMs(ctx.retryDelayMs);
                     },
                 }
+            }
+
+            blocksSinceHeartbeat += 1;
+            if (heartbeatN > 0 and blocksSinceHeartbeat >= heartbeatN) {
+                const msg = std.fmt.allocPrint(gpa, "heartbeat: realtime blk={d}", .{blk}) catch "";
+                defer if (msg.len > 0) gpa.free(msg);
+                log.info(if (msg.len > 0) msg else "heartbeat");
+                blocksSinceHeartbeat = 0;
             }
         }
         cursorPos = blockNum;
@@ -307,6 +326,11 @@ pub fn main(init: Init) !void {
     else
         pipeline.SAVE_EVERY_DEFAULT;
 
+    const heartbeatN: u64 = if (init.environ_map.get("LOG_HEARTBEAT_BLOCKS")) |v|
+        std.fmt.parseInt(u64, v, 10) catch 10
+    else
+        10;
+
     // ── Historical sync ───────────────────────────────────────────────────────
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
@@ -324,6 +348,7 @@ pub fn main(init: Init) !void {
             chunkBuckets,
             saveEvery,
             backupNode,
+            &log,
         );
     }
 
@@ -336,5 +361,5 @@ pub fn main(init: Init) !void {
     var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode);
     defer ctx.deinit();
 
-    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock);
+    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log, heartbeatN);
 }
