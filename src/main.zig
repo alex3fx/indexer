@@ -163,10 +163,8 @@ fn runRealtimeLoop(
     ctx: *RealtimeContext,
     startBlock: u64,
     log: *Logger,
-    heartbeatN: u64,
 ) !void {
     var cursorPos = startBlock;
-    var blocksSinceHeartbeat: u64 = 0;
 
     while (true) {
         const blockNum = wsConn.nextBlockNum() catch |err| {
@@ -191,7 +189,20 @@ fn runRealtimeLoop(
             // Only returns .retry_later when both are unavailable.
             while (true) {
                 switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode)) {
-                    .saved => break,
+                    .saved => |m| {
+                        const kb = @as(f64, @floatFromInt(m.kb_total));
+                        const fetch_us_kb = if (kb > 0) m.fetch_ms * 1000.0 / kb else 0;
+                        const parse_us_kb = if (kb > 0) m.parse_ms * 1000.0 / kb else 0;
+                        const xform_us_kb = if (kb > 0) m.transform_ms * 1000.0 / kb else 0;
+                        const save_us_kb = if (kb > 0) m.save_ms * 1000.0 / kb else 0;
+                        const msg = std.fmt.allocPrint(gpa,
+                            "blk={d} D={d}ms | fetch={d:.0}ms|{d:.2}µs/KB parse={d:.0}ms|{d:.2}µs/KB xform={d:.0}ms|{d:.2}µs/KB save={d:.0}ms|{d:.2}µs/KB | kb={d}",
+                            .{ blk, m.distance_ms, m.fetch_ms, fetch_us_kb, m.parse_ms, parse_us_kb, m.transform_ms, xform_us_kb, m.save_ms, save_us_kb, m.kb_total },
+                        ) catch "";
+                        defer if (msg.len > 0) gpa.free(msg);
+                        log.info(if (msg.len > 0) msg else "block saved");
+                        break;
+                    },
                     .retry_later => {
                         const msg = std.fmt.allocPrint(gpa, "block {d} unavailable — retry in {d}ms", .{ blk, ctx.retryDelayMs }) catch "";
                         defer if (msg.len > 0) gpa.free(msg);
@@ -207,14 +218,6 @@ fn runRealtimeLoop(
                         delayMs(ctx.retryDelayMs);
                     },
                 }
-            }
-
-            blocksSinceHeartbeat += 1;
-            if (heartbeatN > 0 and blocksSinceHeartbeat >= heartbeatN) {
-                const msg = std.fmt.allocPrint(gpa, "heartbeat: realtime blk={d}", .{blk}) catch "";
-                defer if (msg.len > 0) gpa.free(msg);
-                log.info(if (msg.len > 0) msg else "heartbeat");
-                blocksSinceHeartbeat = 0;
             }
         }
         cursorPos = blockNum;
@@ -326,11 +329,6 @@ pub fn main(init: Init) !void {
     else
         pipeline.SAVE_EVERY_DEFAULT;
 
-    const heartbeatN: u64 = if (init.environ_map.get("LOG_HEARTBEAT_BLOCKS")) |v|
-        std.fmt.parseInt(u64, v, 10) catch 10
-    else
-        10;
-
     // ── Historical sync ───────────────────────────────────────────────────────
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
@@ -361,5 +359,5 @@ pub fn main(init: Init) !void {
     var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode);
     defer ctx.deinit();
 
-    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log, heartbeatN);
+    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log);
 }

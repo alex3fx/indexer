@@ -21,8 +21,23 @@ fn nowNs() i64 {
     return ts.sec * 1_000_000_000 + ts.nsec;
 }
 
+fn realtimeMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
+pub const BlockMetrics = struct {
+    distance_ms: i64, // time from block mined (timestampMs) to fetch request sent
+    fetch_ms: f64,
+    parse_ms: f64,
+    transform_ms: f64,
+    save_ms: f64,
+    kb_total: usize,
+};
+
 pub const ProcessBlockStatus = union(enum) {
-    saved,
+    saved: BlockMetrics,
     retry_later, // block not yet available — caller should retry
     fatal: anyerror,
 };
@@ -47,6 +62,8 @@ pub fn processBlock(
 
     var result = pipeline.BlockResult.init(gpa);
     defer result.deinit();
+
+    const t_recv_ms = realtimeMs();
 
     const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &result);
 
@@ -93,5 +110,17 @@ pub fn processBlock(
     const kb_trc = result.rawData.?.traces.body.len / 1024;
     std.debug.print("[rt] blk={d} tx={d} log={d} itx={d} kb={d}+{d}+{d} | fetch={d:.0} parse={d:.0} xform={d:.0} save={d:.0} cursor={d:.0} | total={d:.0}ms\n", .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len, kb_blk, kb_rcpt, kb_trc, fetch_ms, parse_ms, transform_ms, save_ms, cursor_ms, total_ms });
 
-    return .saved;
+    const distance_ms = if (result.ent.blocks.items.len > 0)
+        t_recv_ms - result.ent.blocks.items[0].timestampMs
+    else
+        0;
+
+    return .{ .saved = .{
+        .distance_ms = distance_ms,
+        .fetch_ms = fetch_ms,
+        .parse_ms = parse_ms,
+        .transform_ms = transform_ms,
+        .save_ms = save_ms,
+        .kb_total = kb_blk + kb_rcpt + kb_trc,
+    } };
 }

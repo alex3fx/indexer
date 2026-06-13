@@ -161,7 +161,7 @@ pub const Logger = struct {
             .graylog_port = graylog_port,
             .graylog_app = graylog_app,
             .tz_offset_h = tz_offset_h,
-            .fd = if (!flags.isLocal) tcpConnect(graylog_host, graylog_port) catch -1 else -1,
+            .fd = if (flags.isDev or flags.isProd) tcpConnect(graylog_host, graylog_port) catch -1 else -1,
         };
     }
 
@@ -174,12 +174,13 @@ pub const Logger = struct {
     }
 
     pub fn warn(self: *Logger, msg: []const u8) void {
-        self.emit(msg, .warn, "⚠️ ");
+        self.emit(msg, .warn, "⚠️");
     }
 
     pub fn err(self: *Logger, msg: []const u8) void {
         self.emit(msg, .err, "❌");
     }
+
 
     pub fn success(self: *Logger, msg: []const u8) void {
         self.emit(msg, .info, "✅");
@@ -187,14 +188,14 @@ pub const Logger = struct {
 
     fn emit(self: *Logger, msg: []const u8, level: Level, emoji: []const u8) void {
         const ms = realtimeMs();
-        if (self.flags.isLocal) {
+        if (self.flags.isDev or self.flags.isProd) {
+            self.sendGelf(msg, level, ms);
+        } else {
             var ts_buf: [32]u8 = undefined;
             const ts = formatTimestamp(&ts_buf, ms, self.tz_offset_h);
             const line = std.fmt.allocPrint(self.gpa, "[{s}] {s} {s}\n", .{ ts, emoji, msg }) catch return;
             defer self.gpa.free(line);
             _ = linux.write(1, line.ptr, line.len); // fd=1 is stdout
-        } else {
-            self.sendGelf(msg, level, ms);
         }
     }
 
