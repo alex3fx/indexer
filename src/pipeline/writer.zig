@@ -33,6 +33,7 @@ pub const BlockMetrics = struct {
     parse_ms: f64,
     transform_ms: f64,
     save_ms: f64,
+    total_ms: f64, // TTP: fetch + parse + transform + save + cursor
     kb_total: usize,
 };
 
@@ -121,6 +122,7 @@ pub fn processBlock(
         .parse_ms = parse_ms,
         .transform_ms = transform_ms,
         .save_ms = save_ms,
+        .total_ms = total_ms,
         .kb_total = kb_blk + kb_rcpt + kb_trc,
     } };
 }

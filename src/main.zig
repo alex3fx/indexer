@@ -196,8 +196,8 @@ fn runRealtimeLoop(
                         const xform_us_kb = if (kb > 0) m.transform_ms * 1000.0 / kb else 0;
                         const save_us_kb = if (kb > 0) m.save_ms * 1000.0 / kb else 0;
                         const msg = std.fmt.allocPrint(gpa,
-                            "blk={d} D={d}ms | fetch={d:.0}ms|{d:.2}µs/KB parse={d:.0}ms|{d:.2}µs/KB xform={d:.0}ms|{d:.2}µs/KB save={d:.0}ms|{d:.2}µs/KB | kb={d}",
-                            .{ blk, m.distance_ms, m.fetch_ms, fetch_us_kb, m.parse_ms, parse_us_kb, m.transform_ms, xform_us_kb, m.save_ms, save_us_kb, m.kb_total },
+                            "blk={d} D={d}ms | fetch={d:.0}ms|{d:.2}µs/KB parse={d:.0}ms|{d:.2}µs/KB xform={d:.0}ms|{d:.2}µs/KB save={d:.0}ms|{d:.2}µs/KB | TTP={d:.0}ms | kb={d}",
+                            .{ blk, m.distance_ms, m.fetch_ms, fetch_us_kb, m.parse_ms, parse_us_kb, m.transform_ms, xform_us_kb, m.save_ms, save_us_kb, m.total_ms, m.kb_total },
                         ) catch "";
                         defer if (msg.len > 0) gpa.free(msg);
                         log.info(if (msg.len > 0) msg else "block saved");
