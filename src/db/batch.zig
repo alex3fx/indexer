@@ -25,10 +25,11 @@ pub const ACCUM_LOG_LANES: usize = 6;
 pub const ACCUM_ITX_LANES: usize = 20;
 
 pub const RealtimeConns = struct {
+    gpa: std.mem.Allocator,
     blk: CqlConn,
-    txs: [ACCUM_TXS_LANES]CqlConn,
-    logs: [ACCUM_LOG_LANES]CqlConn,
-    itxs: [ACCUM_ITX_LANES]CqlConn,
+    txs: []CqlConn,
+    logs: []CqlConn,
+    itxs: []CqlConn,
     contracts: CqlConn,
     comp: CqlConn,
 
@@ -39,24 +40,44 @@ pub const RealtimeConns = struct {
         ks: []const u8,
         user: []const u8,
         pass: []const u8,
+        txsN: usize,
+        logsN: usize,
+        itxsN: usize,
     ) !RealtimeConns {
-        var self: RealtimeConns = undefined;
-        self.blk = try CqlConn.init(gpa, host, port, ks, user, pass);
-        for (&self.txs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
-        for (&self.logs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
-        for (&self.itxs) |*c| c.* = try CqlConn.init(gpa, host, port, ks, user, pass);
-        self.contracts = try CqlConn.init(gpa, host, port, ks, user, pass);
-        self.comp = try CqlConn.init(gpa, host, port, ks, user, pass);
-        return self;
+        const txs = try gpa.alloc(CqlConn, txsN);
+        errdefer gpa.free(txs);
+        const logs = try gpa.alloc(CqlConn, logsN);
+        errdefer gpa.free(logs);
+        const itxs = try gpa.alloc(CqlConn, itxsN);
+        errdefer gpa.free(itxs);
+
+        var blk = try CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer blk.deinit();
+        var txsN2: usize = 0;
+        errdefer for (txs[0..txsN2]) |*c| c.deinit();
+        for (txs) |*c| { c.* = try CqlConn.init(gpa, host, port, ks, user, pass); txsN2 += 1; }
+        var logsN2: usize = 0;
+        errdefer for (logs[0..logsN2]) |*c| c.deinit();
+        for (logs) |*c| { c.* = try CqlConn.init(gpa, host, port, ks, user, pass); logsN2 += 1; }
+        var itxsN2: usize = 0;
+        errdefer for (itxs[0..itxsN2]) |*c| c.deinit();
+        for (itxs) |*c| { c.* = try CqlConn.init(gpa, host, port, ks, user, pass); itxsN2 += 1; }
+        var contracts = try CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer contracts.deinit();
+        const comp = try CqlConn.init(gpa, host, port, ks, user, pass);
+        return .{ .gpa = gpa, .blk = blk, .txs = txs, .logs = logs, .itxs = itxs, .contracts = contracts, .comp = comp };
     }
 
     pub fn deinit(self: *RealtimeConns) void {
         self.blk.deinit();
-        for (&self.txs) |*c| c.deinit();
-        for (&self.logs) |*c| c.deinit();
-        for (&self.itxs) |*c| c.deinit();
+        for (self.txs) |*c| c.deinit();
+        for (self.logs) |*c| c.deinit();
+        for (self.itxs) |*c| c.deinit();
         self.contracts.deinit();
         self.comp.deinit();
+        self.gpa.free(self.txs);
+        self.gpa.free(self.logs);
+        self.gpa.free(self.itxs);
     }
 };
 
@@ -64,10 +85,10 @@ pub fn saveBlockRt(conns: *RealtimeConns, ent: *const Entities, bs: BatchSizes) 
     const ents = [1]*const Entities{ent};
     try saveEntitiesParallel(
         &conns.blk,
-        &conns.txs,
+        conns.txs,
         &conns.contracts,
-        &conns.logs,
-        &conns.itxs,
+        conns.logs,
+        conns.itxs,
         &conns.comp,
         @constCast(&ents),
         bs,
@@ -81,7 +102,7 @@ fn preallocBuf(est: usize) std.ArrayList(u8) {
 }
 
 // Max rows per batch — stack arrays sized to this to avoid heap allocs.
-const MAX_BS: usize = 512;
+const MAX_BS: usize = 2000;
 
 // ─── Save a single block's entities ──────────────────────────────────────────
 
@@ -232,45 +253,52 @@ pub fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const Entities) !void 
 
 pub fn saveEntitiesParallel(
     connBlocks: *CqlConn,
-    connTxs: *[ACCUM_TXS_LANES]CqlConn,
+    connTxs: []CqlConn,
     connContracts: *CqlConn,
-    connLogs: *[ACCUM_LOG_LANES]CqlConn,
-    connItxs: *[ACCUM_ITX_LANES]CqlConn,
+    connLogs: []CqlConn,
+    connItxs: []CqlConn,
     connComp: *CqlConn,
     ents: []*const Entities,
     bs: BatchSizes,
 ) !void {
     if (ents.len == 0) return;
 
+    const txsN = connTxs.len;
+    const logsN = connLogs.len;
+    const itxsN = connItxs.len;
+
     var gBlocks = TableSave{ .conn = connBlocks, .ents = ents, .bs = bs };
     var gContracts = TableSave{ .conn = connContracts, .ents = ents, .bs = bs };
-    var gTxs: [ACCUM_TXS_LANES]TableLaneSave = undefined;
-    var gLogs: [ACCUM_LOG_LANES]TableLaneSave = undefined;
-    var gItxs: [ACCUM_ITX_LANES]TableLaneSave = undefined;
+    const gTxs = try tempAllocator.alloc(TableLaneSave, txsN);
+    defer tempAllocator.free(gTxs);
+    const gLogs = try tempAllocator.alloc(TableLaneSave, logsN);
+    defer tempAllocator.free(gLogs);
+    const gItxs = try tempAllocator.alloc(TableLaneSave, itxsN);
+    defer tempAllocator.free(gItxs);
 
-    for (0..ACCUM_TXS_LANES) |i|
-        gTxs[i] = .{ .conn = &connTxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_TXS_LANES };
-    for (0..ACCUM_LOG_LANES) |i|
-        gLogs[i] = .{ .conn = &connLogs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_LOG_LANES };
-    for (0..ACCUM_ITX_LANES) |i|
-        gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = ACCUM_ITX_LANES };
+    for (0..txsN) |i|
+        gTxs[i] = .{ .conn = &connTxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = txsN };
+    for (0..logsN) |i|
+        gLogs[i] = .{ .conn = &connLogs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = logsN };
+    for (0..itxsN) |i|
+        gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = itxsN };
 
-    // Spawns 30 threads: 1 (blocks) + 3 (txs) + 6 (logs) + 20 (itxs).
-    // Contracts run inline on the caller's thread (few rows, fast path).
-    const nSpawn = 1 + ACCUM_TXS_LANES + ACCUM_LOG_LANES + ACCUM_ITX_LANES;
-    var threads: [nSpawn]std.Thread = undefined;
+    // 1 (blocks) + txsN (txs) + logsN (logs) + itxsN (itxs); contracts run inline.
+    const nSpawn = 1 + txsN + logsN + itxsN;
+    const threads = try tempAllocator.alloc(std.Thread, nSpawn);
+    defer tempAllocator.free(threads);
     var spawned: usize = 0;
     errdefer for (threads[0..spawned]) |t| t.join();
 
-    for (0..ACCUM_TXS_LANES) |i| {
+    for (0..txsN) |i| {
         threads[spawned] = try std.Thread.spawn(.{}, saveTxRowsForLane, .{&gTxs[i]});
         spawned += 1;
     }
-    for (0..ACCUM_LOG_LANES) |i| {
+    for (0..logsN) |i| {
         threads[spawned] = try std.Thread.spawn(.{}, saveLogRowsForLane, .{&gLogs[i]});
         spawned += 1;
     }
-    for (0..ACCUM_ITX_LANES) |i| {
+    for (0..itxsN) |i| {
         threads[spawned] = try std.Thread.spawn(.{}, saveItxRowsForLane, .{&gItxs[i]});
         spawned += 1;
     }

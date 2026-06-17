@@ -89,8 +89,12 @@ const RealtimeContext = struct {
         chunkBuckets: u64,
         environ: anytype,
         backupNode: ?EvmRpcNodeConfig,
+        txsLanes: usize,
+        logsLanes: usize,
+        itxsLanes: usize,
     ) !RealtimeContext {
-        std.debug.print("Connecting realtime CQL (32 conns)...\n", .{});
+        const totalConns = 2 + txsLanes + logsLanes + itxsLanes;
+        std.debug.print("Connecting realtime CQL ({d} conns)...\n", .{totalConns});
         var rtConns = try batch.RealtimeConns.init(
             gpa,
             env.SCYLLA_DB_HOST,
@@ -98,6 +102,9 @@ const RealtimeContext = struct {
             env.SCYLLA_DB_KEYSPACE,
             env.SCYLLA_DB_USERNAME,
             env.SCYLLA_DB_PASSWORD,
+            txsLanes,
+            logsLanes,
+            itxsLanes,
         );
         errdefer rtConns.deinit();
 
@@ -329,6 +336,21 @@ pub fn main(init: Init) !void {
     else
         pipeline.SAVE_EVERY_DEFAULT;
 
+    const txsLanes: usize = if (init.environ_map.get("ACCUM_TXS_LANES")) |v|
+        std.fmt.parseInt(usize, v, 10) catch pipeline.TXS_LANES_DEFAULT
+    else
+        pipeline.TXS_LANES_DEFAULT;
+
+    const logsLanes: usize = if (init.environ_map.get("ACCUM_LOG_LANES")) |v|
+        std.fmt.parseInt(usize, v, 10) catch pipeline.LOG_LANES_DEFAULT
+    else
+        pipeline.LOG_LANES_DEFAULT;
+
+    const itxsLanes: usize = if (init.environ_map.get("ACCUM_ITX_LANES")) |v|
+        std.fmt.parseInt(usize, v, 10) catch pipeline.ITX_LANES_DEFAULT
+    else
+        pipeline.ITX_LANES_DEFAULT;
+
     // ── Historical sync ───────────────────────────────────────────────────────
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
@@ -347,6 +369,9 @@ pub fn main(init: Init) !void {
             saveEvery,
             backupNode,
             &log,
+            txsLanes,
+            logsLanes,
+            itxsLanes,
         );
     }
 
@@ -356,7 +381,7 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     log.info("Realtime mode — listening for new blocks via WSS...");
 
-    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode);
+    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
 
     try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log);

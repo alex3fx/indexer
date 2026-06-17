@@ -42,10 +42,11 @@ pub const SAVE_EVERY_DEFAULT: usize = 24;
 // Override via env SCYLLA_CHUNK_BUCKETS (default 24).
 pub const SCYLLA_CHUNK_BUCKETS_DEFAULT: u64 = 24;
 
-// Connection split matching production SPLIT=1,3,6,20,1,1.
-const TXS_LANES: usize = batch.ACCUM_TXS_LANES;
-const LOG_LANES: usize = batch.ACCUM_LOG_LANES;
-const ITX_LANES: usize = batch.ACCUM_ITX_LANES;
+// Default connection split matching production SPLIT=1,3,6,20,1,1.
+// Override via env ACCUM_TXS_LANES, ACCUM_LOG_LANES, ACCUM_ITX_LANES.
+pub const TXS_LANES_DEFAULT: usize = batch.ACCUM_TXS_LANES;
+pub const LOG_LANES_DEFAULT: usize = batch.ACCUM_LOG_LANES;
+pub const ITX_LANES_DEFAULT: usize = batch.ACCUM_ITX_LANES;
 
 // ─── BlockResult ──────────────────────────────────────────────────────────────
 
@@ -361,10 +362,10 @@ const AccumState = struct {
 const HistoricalConns = struct {
     gpa: Allocator,
     blocks: pool.CqlConn,
-    txs: [TXS_LANES]pool.CqlConn,
+    txs: []pool.CqlConn,
     contracts: pool.CqlConn,
-    logs: [LOG_LANES]pool.CqlConn,
-    itxs: [ITX_LANES]pool.CqlConn,
+    logs: []pool.CqlConn,
+    itxs: []pool.CqlConn,
     comp: pool.CqlConn,
 
     fn open(
@@ -374,6 +375,9 @@ const HistoricalConns = struct {
         ks: []const u8,
         user: []const u8,
         pass: []const u8,
+        txsN: usize,
+        logsN: usize,
+        itxsN: usize,
     ) !HistoricalConns {
         var self: HistoricalConns = undefined;
         self.gpa = gpa;
@@ -385,25 +389,37 @@ const HistoricalConns = struct {
         self.comp = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.comp.deinit();
 
-        var txsN: usize = 0;
-        errdefer for (0..txsN) |i| self.txs[i].deinit();
-        for (0..TXS_LANES) |i| {
+        self.txs = try gpa.alloc(pool.CqlConn, txsN);
+        var txsOpened: usize = 0;
+        errdefer {
+            for (0..txsOpened) |i| self.txs[i].deinit();
+            gpa.free(self.txs);
+        }
+        for (0..txsN) |i| {
             self.txs[i] = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
-            txsN += 1;
+            txsOpened += 1;
         }
 
-        var logsN: usize = 0;
-        errdefer for (0..logsN) |i| self.logs[i].deinit();
-        for (0..LOG_LANES) |i| {
+        self.logs = try gpa.alloc(pool.CqlConn, logsN);
+        var logsOpened: usize = 0;
+        errdefer {
+            for (0..logsOpened) |i| self.logs[i].deinit();
+            gpa.free(self.logs);
+        }
+        for (0..logsN) |i| {
             self.logs[i] = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
-            logsN += 1;
+            logsOpened += 1;
         }
 
-        var itxsN: usize = 0;
-        errdefer for (0..itxsN) |i| self.itxs[i].deinit();
-        for (0..ITX_LANES) |i| {
+        self.itxs = try gpa.alloc(pool.CqlConn, itxsN);
+        var itxsOpened: usize = 0;
+        errdefer {
+            for (0..itxsOpened) |i| self.itxs[i].deinit();
+            gpa.free(self.itxs);
+        }
+        for (0..itxsN) |i| {
             self.itxs[i] = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
-            itxsN += 1;
+            itxsOpened += 1;
         }
 
         return self;
@@ -413,19 +429,22 @@ const HistoricalConns = struct {
         self.blocks.deinit();
         self.contracts.deinit();
         self.comp.deinit();
-        for (&self.txs) |*c| c.deinit();
-        for (&self.logs) |*c| c.deinit();
-        for (&self.itxs) |*c| c.deinit();
+        for (self.txs) |*c| c.deinit();
+        self.gpa.free(self.txs);
+        for (self.logs) |*c| c.deinit();
+        self.gpa.free(self.logs);
+        for (self.itxs) |*c| c.deinit();
+        self.gpa.free(self.itxs);
     }
 
     fn saveArgs(self: *HistoricalConns, accum: *AccumState, rdb: *cursor.Conn, bs: pool.BatchSizes) SaveArgs {
         return .{
             .accum = accum,
             .cBlocks = &self.blocks,
-            .cTxs = &self.txs,
+            .cTxs = self.txs,
             .cContracts = &self.contracts,
-            .cLogs = &self.logs,
-            .cItxs = &self.itxs,
+            .cLogs = self.logs,
+            .cItxs = self.itxs,
             .cComp = &self.comp,
             .rdb = rdb,
             .bs = bs,
@@ -438,10 +457,10 @@ const HistoricalConns = struct {
 const SaveArgs = struct {
     accum: *AccumState,
     cBlocks: *pool.CqlConn,
-    cTxs: *[TXS_LANES]pool.CqlConn,
+    cTxs: []pool.CqlConn,
     cContracts: *pool.CqlConn,
-    cLogs: *[LOG_LANES]pool.CqlConn,
-    cItxs: *[ITX_LANES]pool.CqlConn,
+    cLogs: []pool.CqlConn,
+    cItxs: []pool.CqlConn,
     cComp: *pool.CqlConn,
     rdb: *cursor.Conn,
     bs: pool.BatchSizes,
@@ -635,10 +654,10 @@ fn retryMissingBlocks(
             var ents = [1]*const transformer.Entities{&result.ent};
             batch.saveEntitiesParallel(
                 &conns.blocks,
-                &conns.txs,
+                conns.txs,
                 &conns.contracts,
-                &conns.logs,
-                &conns.itxs,
+                conns.logs,
+                conns.itxs,
                 &conns.comp,
                 ents[0..],
                 bs,
@@ -676,6 +695,9 @@ pub fn runHistorical(
     saveEvery: usize,
     backupNode: ?EvmRpcNodeConfig,
     log: *Logger,
+    txsLanes: usize,
+    logsLanes: usize,
+    itxsLanes: usize,
 ) !void {
     if (from > to) return;
 
@@ -683,9 +705,9 @@ pub fn runHistorical(
     const bs = pool.BatchSizes.fromChain(chain.indexingOptions);
     const rUrl = cursor.parseUrl(redisUrl);
 
-    std.debug.print("Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,3,6,20,1,1\n\n", .{ from, to, workerCount, saveEvery, chunkBuckets });
+    std.debug.print("Historical: blocks {d}→{d}  workers={d}  save_every={d}  chunk_buckets={d}  split=1,{d},{d},{d},1,1\n\n", .{ from, to, workerCount, saveEvery, chunkBuckets, txsLanes, logsLanes, itxsLanes });
 
-    var conns = try HistoricalConns.open(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass);
+    var conns = try HistoricalConns.open(gpa, scyllaHost, scyllaPort, scyllaKs, scyllaUser, scyllaPass, txsLanes, logsLanes, itxsLanes);
     defer conns.deinit();
 
     var rdb = try cursor.Conn.init(gpa, rUrl.host, rUrl.port);
