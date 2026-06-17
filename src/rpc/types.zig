@@ -47,6 +47,9 @@ pub const RpcLog = struct {
 pub const RpcTrace = struct {
     transactionHash: ?[]const u8 = null,
     transactionPosition: ?i32 = null,
+    // Parity trace_block "type": "call" | "create" | "suicide" | "reward" | "".
+    // Geth callTracer frames are normalized to the same values by the parser.
+    type: []const u8 = "",
     action: RpcAction = .{},
     result: ?RpcResult = null,
 };
@@ -58,6 +61,10 @@ pub const RpcAction = struct {
     init: ?[]const u8 = null,
     input: ?[]const u8 = null,
     creationMethod: ?[]const u8 = null,
+    // suicide-only (Parity trace_block "action" shape for type=="suicide"):
+    // the contract being destructed and the address receiving its balance.
+    address: ?[]const u8 = null,
+    refundAddress: ?[]const u8 = null,
 };
 
 pub const RpcResult = struct {

@@ -203,6 +203,13 @@ pub fn valTinyint(list: *std.ArrayList(u8), v: i8) !void {
     try list.appendSlice(tempAllocator, &b);
 }
 
+pub fn valSmallint(list: *std.ArrayList(u8), v: i16) !void {
+    var b: [6]u8 = undefined;
+    std.mem.writeInt(i32, b[0..4], 2, .big);
+    std.mem.writeInt(i16, b[4..6], v, .big);
+    try list.appendSlice(tempAllocator, &b);
+}
+
 pub fn valText(list: *std.ArrayList(u8), s: []const u8) !void {
     if (s.len == 0) return valNull(list);
     var b: [4]u8 = undefined;
@@ -250,6 +257,12 @@ pub const PreparedIds = struct {
     contracts: []u8,
     contractsByAddr: []u8,
     blockCompletions: []u8,
+    erc20Tokens: []u8,
+    erc20SupplyInsert: []u8,
+    erc20SupplyUpdate: []u8,
+    erc20OwnerInsert: []u8,
+    erc20OwnerUpdate: []u8,
+    erc20SelfDestruct: []u8,
 };
 
 const INSERT_BLOCKS = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
@@ -259,6 +272,12 @@ const INSERT_INT_TXS = "INSERT INTO internal_transactions (chunk,block_number,bl
 const INSERT_CONTRACTS = "INSERT INTO contracts (chunk,block_number,transaction_index,transaction_hash,trace_index,block_timestamp_s,block_timestamp_ms,address,creation_method,creator_address,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_CONTRACTS_BY_ADDR = "INSERT INTO contracts_by_addresses (address,creator,tx_hash,block_number,timestamp,contract_factory,creation_bytecode,deployed_bytecode) VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_BLOCK_COMPLETIONS = "INSERT INTO block_completions (chunk,block_number,tx_count,log_count,itx_count,contract_count) VALUES (?,?,?,?,?,?)";
+const INSERT_ERC20_TOKENS = "INSERT INTO erc20_tokens (address,chain_id,name,symbol,decimals,has_balance_of,has_transfer,has_transfer_from,has_approve,has_allowance,is_standard_decimals,is_fully_following_standard,is_minimally_following_standard,is_partially_following_standard,is_not_following_standard,detection_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_ERC20_SUPPLY = "INSERT INTO erc20_total_supplies (address,chain_id,initial_total_supply,latest_total_supply,updated_at_block,updated_at_timestamp) VALUES (?,?,?,?,?,?)";
+const UPDATE_ERC20_SUPPLY = "UPDATE erc20_total_supplies SET latest_total_supply=?,updated_at_block=?,updated_at_timestamp=? WHERE address=?";
+const INSERT_ERC20_OWNER = "INSERT INTO erc20_owners (address,chain_id,initial_owner,latest_owner,is_ownership_renounced,updated_at_block,updated_at_timestamp) VALUES (?,?,?,?,?,?,?)";
+const UPDATE_ERC20_OWNER = "UPDATE erc20_owners SET latest_owner=?,is_ownership_renounced=?,updated_at_block=?,updated_at_timestamp=? WHERE address=?";
+const INSERT_ERC20_SELFDESTRUCT = "INSERT INTO erc20_self_destructed (address,chain_id,at_block,at_timestamp) VALUES (?,?,?,?)";
 
 // ─── CqlConn ──────────────────────────────────────────────────────────────────
 
@@ -314,6 +333,12 @@ pub const CqlConn = struct {
         self.gpa.free(self.prepIds.contracts);
         self.gpa.free(self.prepIds.contractsByAddr);
         self.gpa.free(self.prepIds.blockCompletions);
+        self.gpa.free(self.prepIds.erc20Tokens);
+        self.gpa.free(self.prepIds.erc20SupplyInsert);
+        self.gpa.free(self.prepIds.erc20SupplyUpdate);
+        self.gpa.free(self.prepIds.erc20OwnerInsert);
+        self.gpa.free(self.prepIds.erc20OwnerUpdate);
+        self.gpa.free(self.prepIds.erc20SelfDestruct);
         _ = linux.close(self.fd);
     }
 
@@ -469,5 +494,11 @@ pub fn prepareAll(conn: *CqlConn) !PreparedIds {
         .contracts = try conn.prepare(INSERT_CONTRACTS),
         .contractsByAddr = try conn.prepare(INSERT_CONTRACTS_BY_ADDR),
         .blockCompletions = try conn.prepare(INSERT_BLOCK_COMPLETIONS),
+        .erc20Tokens = try conn.prepare(INSERT_ERC20_TOKENS),
+        .erc20SupplyInsert = try conn.prepare(INSERT_ERC20_SUPPLY),
+        .erc20SupplyUpdate = try conn.prepare(UPDATE_ERC20_SUPPLY),
+        .erc20OwnerInsert = try conn.prepare(INSERT_ERC20_OWNER),
+        .erc20OwnerUpdate = try conn.prepare(UPDATE_ERC20_OWNER),
+        .erc20SelfDestruct = try conn.prepare(INSERT_ERC20_SELFDESTRUCT),
     };
 }

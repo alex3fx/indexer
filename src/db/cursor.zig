@@ -135,6 +135,73 @@ pub const Conn = struct {
         if (line.len > 0 and line[0] == '-') return error.RedisError;
     }
 
+    fn readBulkString(self: *Conn) !?[]u8 {
+        var lineBuf: [64]u8 = undefined;
+        const line = try fdReadLine(self.fd, &lineBuf);
+        if (line.len == 0 or line[0] != '$') return error.ProtocolError;
+        const len = std.fmt.parseInt(i32, line[1..], 10) catch return error.ProtocolError;
+        if (len < 0) return null;
+        const data = try self.gpa.alloc(u8, @intCast(len));
+        errdefer self.gpa.free(data);
+        try fdReadExact(self.fd, data);
+        var crlf: [2]u8 = undefined;
+        try fdReadExact(self.fd, &crlf);
+        return data;
+    }
+
+    pub const ScanResult = struct {
+        cursor: []u8,
+        keys: [][]u8,
+
+        pub fn deinit(self: *ScanResult, gpa: std.mem.Allocator) void {
+            gpa.free(self.cursor);
+            for (self.keys) |k| gpa.free(k);
+            gpa.free(self.keys);
+        }
+    };
+
+    /// SCAN cursor MATCH pattern COUNT count — caller loops until the returned
+    /// cursor is "0". Used only by the offline --erc20-rescan maintenance pass,
+    /// never from the hot indexing path.
+    pub fn scan(self: *Conn, cursorStr: []const u8, pattern: []const u8, count: u32) !ScanResult {
+        var countBuf: [20]u8 = undefined;
+        const countStr = std.fmt.bufPrint(&countBuf, "{d}", .{count}) catch unreachable;
+        const cmd = try std.fmt.allocPrint(
+            self.gpa,
+            "*6\r\n$4\r\nSCAN\r\n${d}\r\n{s}\r\n$5\r\nMATCH\r\n${d}\r\n{s}\r\n$5\r\nCOUNT\r\n${d}\r\n{s}\r\n",
+            .{ cursorStr.len, cursorStr, pattern.len, pattern, countStr.len, countStr },
+        );
+        defer self.gpa.free(cmd);
+        try fdWrite(self.fd, cmd);
+
+        var lineBuf: [64]u8 = undefined;
+        const line = try fdReadLine(self.fd, &lineBuf);
+        if (line.len == 0 or line[0] != '*') return error.ProtocolError;
+        const nElems = std.fmt.parseInt(i32, line[1..], 10) catch return error.ProtocolError;
+        if (nElems != 2) return error.ProtocolError;
+
+        const cursorOut = (try self.readBulkString()) orelse return error.ProtocolError;
+        errdefer self.gpa.free(cursorOut);
+
+        var arrLineBuf: [64]u8 = undefined;
+        const arrLine = try fdReadLine(self.fd, &arrLineBuf);
+        if (arrLine.len == 0 or arrLine[0] != '*') return error.ProtocolError;
+        const nKeys = std.fmt.parseInt(i32, arrLine[1..], 10) catch return error.ProtocolError;
+        if (nKeys <= 0) return .{ .cursor = cursorOut, .keys = &.{} };
+
+        const keys = try self.gpa.alloc([]u8, @intCast(nKeys));
+        var got: usize = 0;
+        errdefer {
+            for (keys[0..got]) |k| self.gpa.free(k);
+            self.gpa.free(keys);
+        }
+        for (0..@intCast(nKeys)) |i| {
+            keys[i] = (try self.readBulkString()) orelse return error.ProtocolError;
+            got += 1;
+        }
+        return .{ .cursor = cursorOut, .keys = keys };
+    }
+
     /// SET with exponential-backoff retry (up to 5 attempts).
     pub fn setWithRetry(self: *Conn, key: []const u8, value: []const u8) !void {
         var attempt: usize = 0;

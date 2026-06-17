@@ -6,6 +6,7 @@ const linux = std.os.linux;
 const core = @import("indexer/core");
 
 const pipeline = @import("pipeline.zig");
+const erc20 = @import("erc20.zig");
 const pool = @import("indexer/db").pool;
 const http_pool = @import("indexer/rpc").pool;
 const batch = @import("indexer/db").batch;
@@ -56,6 +57,7 @@ pub fn processBlock(
     hPool: ?*http_pool.HttpPool,
     chunkBuckets: u64,
     backupNode: ?EvmRpcNodeConfig,
+    erc20Ctx: *erc20.Erc20Context,
 ) ProcessBlockStatus {
     const rpcNode = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
@@ -66,14 +68,14 @@ pub fn processBlock(
 
     const t_recv_ms = realtimeMs();
 
-    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &result);
+    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &erc20Ctx.bloom, &result);
 
     const fetched = switch (primaryStatus) {
         .ok => true,
         .retry_later, .skip_missing => blk: {
             if (backupNode) |backup| {
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &result) == .ok;
             }
             break :blk false;
         },
@@ -82,7 +84,7 @@ pub fn processBlock(
             if (backupNode) |backup| {
                 std.debug.print(" — trying backup\n", .{});
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &result) == .ok;
             }
             std.debug.print("\n", .{});
             break :blk false;
@@ -94,6 +96,8 @@ pub fn processBlock(
     const fetch_ms = @as(f64, @floatFromInt(result.fetchNs)) / 1e6;
     const parse_ms = @as(f64, @floatFromInt(result.parseNs)) / 1e6;
     const transform_ms = @as(f64, @floatFromInt(result.transformNs)) / 1e6;
+
+    erc20.resolveAndEnrich(erc20Ctx, chain, rdb, result.arena.allocator(), &result.ent);
 
     const t_save = nowNs();
     batch.saveBlockRt(rtConns, &result.ent, bs) catch |e| return .{ .fatal = e };

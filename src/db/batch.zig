@@ -15,6 +15,10 @@ const LogRow = schema.LogRow;
 const InternalTxRow = schema.InternalTxRow;
 const ContractRow = schema.ContractRow;
 const ContractByAddrRow = schema.ContractByAddrRow;
+const Erc20TokenRow = schema.Erc20TokenRow;
+const Erc20SupplyRow = schema.Erc20SupplyRow;
+const Erc20OwnerRow = schema.Erc20OwnerRow;
+const Erc20SelfDestructRow = schema.Erc20SelfDestructRow;
 
 // ─── RealtimeConns ────────────────────────────────────────────────────────────
 // 32 persistent CQL connections for parallel per-table writes in realtime mode.
@@ -32,6 +36,7 @@ pub const RealtimeConns = struct {
     itxs: []CqlConn,
     contracts: CqlConn,
     comp: CqlConn,
+    erc20: CqlConn,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -64,8 +69,10 @@ pub const RealtimeConns = struct {
         for (itxs) |*c| { c.* = try CqlConn.init(gpa, host, port, ks, user, pass); itxsN2 += 1; }
         var contracts = try CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer contracts.deinit();
-        const comp = try CqlConn.init(gpa, host, port, ks, user, pass);
-        return .{ .gpa = gpa, .blk = blk, .txs = txs, .logs = logs, .itxs = itxs, .contracts = contracts, .comp = comp };
+        var comp = try CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer comp.deinit();
+        const erc20 = try CqlConn.init(gpa, host, port, ks, user, pass);
+        return .{ .gpa = gpa, .blk = blk, .txs = txs, .logs = logs, .itxs = itxs, .contracts = contracts, .comp = comp, .erc20 = erc20 };
     }
 
     pub fn deinit(self: *RealtimeConns) void {
@@ -75,6 +82,7 @@ pub const RealtimeConns = struct {
         for (self.itxs) |*c| c.deinit();
         self.contracts.deinit();
         self.comp.deinit();
+        self.erc20.deinit();
         self.gpa.free(self.txs);
         self.gpa.free(self.logs);
         self.gpa.free(self.itxs);
@@ -90,6 +98,7 @@ pub fn saveBlockRt(conns: *RealtimeConns, ent: *const Entities, bs: BatchSizes) 
         conns.logs,
         conns.itxs,
         &conns.comp,
+        &conns.erc20,
         @constCast(&ents),
         bs,
     );
@@ -113,6 +122,10 @@ pub fn saveBlock(conn: *CqlConn, ent: *const Entities, bs: BatchSizes) !void {
     try saveInternalTxs(conn, ent.internalTxs.items, bs.itxs);
     try saveContracts(conn, ent.contracts.items, bs.contracts);
     try saveContractsByAddr(conn, ent.contractsByAddr.items, bs.contracts);
+    try saveErc20Tokens(conn, ent.erc20Tokens.items, bs.contracts);
+    try saveErc20Supplies(conn, ent.erc20Supplies.items, bs.contracts);
+    try saveErc20Owners(conn, ent.erc20Owners.items, bs.contracts);
+    try saveErc20SelfDestructs(conn, ent.erc20SelfDestructs.items, bs.contracts);
     try saveBlockCompletions(conn, ent);
 }
 
@@ -141,6 +154,27 @@ pub fn saveContractRowsForEntities(g: *TableSave) void {
             return;
         };
         saveContractsByAddr(g.conn, ent.contractsByAddr.items, g.bs.contracts) catch |e| {
+            g.err = e;
+            return;
+        };
+    }
+}
+
+pub fn saveErc20RowsForEntities(g: *TableSave) void {
+    for (g.ents) |ent| {
+        saveErc20Tokens(g.conn, ent.erc20Tokens.items, g.bs.contracts) catch |e| {
+            g.err = e;
+            return;
+        };
+        saveErc20Supplies(g.conn, ent.erc20Supplies.items, g.bs.contracts) catch |e| {
+            g.err = e;
+            return;
+        };
+        saveErc20Owners(g.conn, ent.erc20Owners.items, g.bs.contracts) catch |e| {
+            g.err = e;
+            return;
+        };
+        saveErc20SelfDestructs(g.conn, ent.erc20SelfDestructs.items, g.bs.contracts) catch |e| {
             g.err = e;
             return;
         };
@@ -258,6 +292,7 @@ pub fn saveEntitiesParallel(
     connLogs: []CqlConn,
     connItxs: []CqlConn,
     connComp: *CqlConn,
+    connErc20: *CqlConn,
     ents: []*const Entities,
     bs: BatchSizes,
 ) !void {
@@ -269,6 +304,7 @@ pub fn saveEntitiesParallel(
 
     var gBlocks = TableSave{ .conn = connBlocks, .ents = ents, .bs = bs };
     var gContracts = TableSave{ .conn = connContracts, .ents = ents, .bs = bs };
+    var gErc20 = TableSave{ .conn = connErc20, .ents = ents, .bs = bs };
     const gTxs = try tempAllocator.alloc(TableLaneSave, txsN);
     defer tempAllocator.free(gTxs);
     const gLogs = try tempAllocator.alloc(TableLaneSave, logsN);
@@ -283,8 +319,8 @@ pub fn saveEntitiesParallel(
     for (0..itxsN) |i|
         gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = itxsN };
 
-    // 1 (blocks) + txsN (txs) + logsN (logs) + itxsN (itxs); contracts run inline.
-    const nSpawn = 1 + txsN + logsN + itxsN;
+    // 1 (blocks) + 1 (erc20) + txsN (txs) + logsN (logs) + itxsN (itxs); contracts run inline.
+    const nSpawn = 2 + txsN + logsN + itxsN;
     const threads = try tempAllocator.alloc(std.Thread, nSpawn);
     defer tempAllocator.free(threads);
     var spawned: usize = 0;
@@ -304,6 +340,8 @@ pub fn saveEntitiesParallel(
     }
     threads[spawned] = try std.Thread.spawn(.{}, saveBlockRowsForEntities, .{&gBlocks});
     spawned += 1;
+    threads[spawned] = try std.Thread.spawn(.{}, saveErc20RowsForEntities, .{&gErc20});
+    spawned += 1;
 
     saveContractRowsForEntities(&gContracts);
 
@@ -311,6 +349,7 @@ pub fn saveEntitiesParallel(
 
     if (gBlocks.err) |e| return e;
     if (gContracts.err) |e| return e;
+    if (gErc20.err) |e| return e;
     for (gTxs) |g| if (g.err) |e| return e;
     for (gLogs) |g| if (g.err) |e| return e;
     for (gItxs) |g| if (g.err) |e| return e;
@@ -326,6 +365,12 @@ const ITX_COLS: u16 = 10;
 const CONTRACT_COLS: u16 = 13;
 const CONTRACT_CBA_COLS: u16 = 8;
 const COMPLETION_COLS: u16 = 6;
+const ERC20_TOKEN_COLS: u16 = 16;
+const ERC20_SUPPLY_INSERT_COLS: u16 = 6;
+const ERC20_SUPPLY_UPDATE_COLS: u16 = 4;
+const ERC20_OWNER_INSERT_COLS: u16 = 7;
+const ERC20_OWNER_UPDATE_COLS: u16 = 5;
+const ERC20_SELFDESTRUCT_COLS: u16 = 4;
 
 fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
     if (rows.len == 0) return;
@@ -563,6 +608,210 @@ fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow, bs: usiz
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
         try conn.batchSendRows(conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveErc20Tokens(conn: *CqlConn, rows: []const Erc20TokenRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v = preallocBuf(256);
+    defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 256);
+    defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs: [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valTextRequired(&v, r.address);
+            try pool.valInt32(&v, r.chainId);
+            try pool.valText(&v, r.name);
+            try pool.valText(&v, r.symbol);
+            if (r.decimals < 0) try pool.valNull(&v) else try pool.valSmallint(&v, r.decimals);
+            try pool.valBool(&v, r.hasBalanceOf);
+            try pool.valBool(&v, r.hasTransfer);
+            try pool.valBool(&v, r.hasTransferFrom);
+            try pool.valBool(&v, r.hasApprove);
+            try pool.valBool(&v, r.hasAllowance);
+            try pool.valBool(&v, r.isStandardDecimals);
+            try pool.valBool(&v, r.isFullyFollowingStandard);
+            try pool.valBool(&v, r.isMinimallyFollowingStandard);
+            try pool.valBool(&v, r.isPartiallyFollowingStandard);
+            try pool.valBool(&v, r.isNotFollowingStandard);
+            try pool.valInt32(&v, r.detectionVersion);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.erc20Tokens, ERC20_TOKEN_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveErc20Supplies(conn: *CqlConn, rows: []const Erc20SupplyRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v = preallocBuf(128);
+    defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 128);
+    defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs: [MAX_BS][]const u8 = undefined;
+
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            const r = rows[j];
+            if (r.isUpdate) continue;
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            try pool.valTextRequired(&v, r.address);
+            try pool.valInt32(&v, r.chainId);
+            try pool.valText(&v, r.initialTotalSupply);
+            try pool.valText(&v, r.latestTotalSupply);
+            try pool.valBigint(&v, r.updatedAtBlock);
+            try pool.valBigint(&v, r.updatedAtTimestamp);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        if (enc > 0) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.erc20SupplyInsert, ERC20_SUPPLY_INSERT_COLS, ptrs[0..enc]);
+        }
+        i = end;
+    }
+
+    i = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            const r = rows[j];
+            if (!r.isUpdate) continue;
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            try pool.valText(&v, r.latestTotalSupply);
+            try pool.valBigint(&v, r.updatedAtBlock);
+            try pool.valBigint(&v, r.updatedAtTimestamp);
+            try pool.valTextRequired(&v, r.address);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        if (enc > 0) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.erc20SupplyUpdate, ERC20_SUPPLY_UPDATE_COLS, ptrs[0..enc]);
+        }
+        i = end;
+    }
+}
+
+fn saveErc20Owners(conn: *CqlConn, rows: []const Erc20OwnerRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v = preallocBuf(128);
+    defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 128);
+    defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs: [MAX_BS][]const u8 = undefined;
+
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            const r = rows[j];
+            if (r.isUpdate) continue;
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            try pool.valTextRequired(&v, r.address);
+            try pool.valInt32(&v, r.chainId);
+            try pool.valText(&v, r.initialOwner);
+            try pool.valText(&v, r.latestOwner);
+            try pool.valBool(&v, r.isOwnershipRenounced);
+            try pool.valBigint(&v, r.updatedAtBlock);
+            try pool.valBigint(&v, r.updatedAtTimestamp);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        if (enc > 0) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.erc20OwnerInsert, ERC20_OWNER_INSERT_COLS, ptrs[0..enc]);
+        }
+        i = end;
+    }
+
+    i = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            const r = rows[j];
+            if (!r.isUpdate) continue;
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            try pool.valText(&v, r.latestOwner);
+            try pool.valBool(&v, r.isOwnershipRenounced);
+            try pool.valBigint(&v, r.updatedAtBlock);
+            try pool.valBigint(&v, r.updatedAtTimestamp);
+            try pool.valTextRequired(&v, r.address);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        if (enc > 0) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.erc20OwnerUpdate, ERC20_OWNER_UPDATE_COLS, ptrs[0..enc]);
+        }
+        i = end;
+    }
+}
+
+fn saveErc20SelfDestructs(conn: *CqlConn, rows: []const Erc20SelfDestructRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v = preallocBuf(64);
+    defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 64);
+    defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs: [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            const r = rows[j];
+            try pool.valTextRequired(&v, r.address);
+            try pool.valInt32(&v, r.chainId);
+            try pool.valBigint(&v, r.atBlock);
+            try pool.valBigint(&v, r.atTimestamp);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(conn.prepIds.erc20SelfDestruct, ERC20_SELFDESTRUCT_COLS, ptrs[0..enc]);
         i = end;
     }
 }

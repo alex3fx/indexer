@@ -61,6 +61,10 @@ models=(
   "db/models/minified/contracts.cql"
   "db/models/minified/block_completions.cql"
   "db/models/lookups/contracts.cql"
+  "db/models/lookups/erc20_tokens.cql"
+  "db/models/lookups/erc20_total_supplies.cql"
+  "db/models/lookups/erc20_owners.cql"
+  "db/models/lookups/erc20_self_destructed.cql"
 )
 
 echo "sync.sh: initializing keyspace $keyspace"

@@ -509,6 +509,8 @@ fn parseTrace(p: *P, arena: Al, comptime zc: bool) !RpcTrace {
         _ = p.eat(':');
         if (eql(key, "transactionHash")) {
             trace.transactionHash = try OS(p, arena, zc);
+        } else if (eql(key, "type")) {
+            trace.type = try S(p, arena, zc);
         } else if (eql(key, "transactionPosition")) {
             const s = p.str();
             if (s.len > 2 and s[0] == '0' and s[1] == 'x')
@@ -558,6 +560,10 @@ fn parseAction(p: *P, arena: Al, comptime zc: bool) !RpcAction {
             action.input = try OS(p, arena, zc);
         } else if (eql(key, "creationMethod")) {
             action.creationMethod = try OS(p, arena, zc);
+        } else if (eql(key, "address")) {
+            action.address = try OS(p, arena, zc);
+        } else if (eql(key, "refundAddress")) {
+            action.refundAddress = try OS(p, arena, zc);
         } else {
             p.skip();
         }
@@ -730,12 +736,18 @@ fn flattenCallFrame(
     const is_create = eql(frame_type, "CREATE") or eql(frame_type, "CREATE2");
     const is_selfdestruct = eql(frame_type, "SELFDESTRUCT");
 
-    if (!is_selfdestruct) {
+    {
         var trace = RpcTrace{
             .transactionHash = if (tx_hash.len > 0) tx_hash else null,
             .transactionPosition = tx_pos,
         };
-        if (is_create) {
+        if (is_selfdestruct) {
+            // Normalize to the same shape as Parity trace_block's "suicide" type:
+            // `from` is the contract being destructed, `to` is the refund recipient.
+            trace.type = "suicide";
+            trace.action.address = if (from.len > 0) from else null;
+            trace.action.refundAddress = to;
+        } else if (is_create) {
             trace.action.from = from;
             trace.action.value = value;
             trace.action.input = input;

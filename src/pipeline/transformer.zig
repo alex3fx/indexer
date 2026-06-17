@@ -5,6 +5,7 @@ const std = @import("std");
 
 const types = @import("indexer/rpc").types;
 const schema = @import("indexer/db").schema;
+const Bloom = @import("bloom.zig").Bloom;
 
 const RpcBlock = types.RpcBlock;
 const RpcReceipt = types.RpcReceipt;
@@ -16,7 +17,62 @@ pub const LogRow = schema.LogRow;
 pub const InternalTxRow = schema.InternalTxRow;
 pub const ContractRow = schema.ContractRow;
 pub const ContractByAddrRow = schema.ContractByAddrRow;
+pub const Erc20Candidate = schema.Erc20Candidate;
 pub const Entities = schema.Entities;
+
+// ─── ERC-20 selector scan ───────────────────────────────────────────────────
+// EIP-20 function selectors (keccak256(signature)[0..4]), lowercase hex, no "0x".
+// Matched as a raw substring of the deployed bytecode — same heuristic as
+// try_discover_erc_twenty_tokens.ts: a contract advertising these selectors in
+// its runtime code is a detection *candidate*, confirmed later via Multicall3.
+const SELECTOR_BALANCE_OF = "70a08231";
+const SELECTOR_TRANSFER = "a9059cbb";
+const SELECTOR_TRANSFER_FROM = "23b872dd";
+const SELECTOR_APPROVE = "095ea7b3";
+const SELECTOR_ALLOWANCE = "dd62ed3e";
+
+// Case-insensitive substring search without mutating or copying `haystack`
+// (which is a zero-copy slice into the raw RPC JSON buffer).
+fn containsSelectorCI(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var matched = true;
+        for (needle, 0..) |nc, j| {
+            if (std.ascii.toLower(haystack[i + j]) != nc) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
+pub const Erc20SelectorFlags = struct {
+    hasBalanceOf: bool,
+    hasTransfer: bool,
+    hasTransferFrom: bool,
+    hasApprove: bool,
+    hasAllowance: bool,
+
+    pub fn any(self: Erc20SelectorFlags) bool {
+        return self.hasBalanceOf or self.hasTransfer or self.hasTransferFrom or self.hasApprove or self.hasAllowance;
+    }
+};
+
+/// Scans deployed bytecode for EIP-20 function selectors. Shared between the
+/// CREATE-time candidate detection below and the --erc20-rescan maintenance
+/// pass (erc20_rescan.zig), which re-fetches bytecode independently of trace data.
+pub fn scanErc20Selectors(deployedBytecode: []const u8) Erc20SelectorFlags {
+    return .{
+        .hasBalanceOf = containsSelectorCI(deployedBytecode, SELECTOR_BALANCE_OF),
+        .hasTransfer = containsSelectorCI(deployedBytecode, SELECTOR_TRANSFER),
+        .hasTransferFrom = containsSelectorCI(deployedBytecode, SELECTOR_TRANSFER_FROM),
+        .hasApprove = containsSelectorCI(deployedBytecode, SELECTOR_APPROVE),
+        .hasAllowance = containsSelectorCI(deployedBytecode, SELECTOR_ALLOWANCE),
+    };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -82,6 +138,13 @@ pub fn initEntities() Entities {
         .internalTxs = .empty,
         .contracts = .empty,
         .contractsByAddr = .empty,
+        .erc20Candidates = .empty,
+        .erc20Touches = .empty,
+        .selfDestructEvents = .empty,
+        .erc20Tokens = .empty,
+        .erc20Supplies = .empty,
+        .erc20Owners = .empty,
+        .erc20SelfDestructs = .empty,
         .lastBlock = 0,
     };
 }
@@ -95,9 +158,10 @@ pub fn transformBlock(
     receipts: []const RpcReceipt,
     traces: []const RpcTrace,
     chunkSize: u64,
+    bloom: *Bloom,
     ent: *Entities,
 ) !void {
-    return transformBlockWithRemap(arena, block, receipts, traces, chunkSize, 0, ent);
+    return transformBlockWithRemap(arena, block, receipts, traces, chunkSize, 0, bloom, ent);
 }
 
 pub fn transformBlockWithRemap(
@@ -107,6 +171,7 @@ pub fn transformBlockWithRemap(
     traces: []const RpcTrace,
     chunkSize: u64,
     remapMod: u64,
+    bloom: *Bloom,
     ent: *Entities,
 ) !void {
     if (receipts.len != block.transactions.len) return error.IncompleteBlock;
@@ -208,6 +273,15 @@ pub fn transformBlockWithRemap(
         const fromAddr = li(trace.action.from);
         const toAddr = liOpt(trace.action.to);
 
+        if (toAddr.len > 0 and bloom.mightContain(toAddr)) {
+            try ent.erc20Touches.append(arena, .{
+                .address = toAddr,
+                .chunk = chunk,
+                .blockNumber = number,
+                .blockTimestampS = timestampS,
+            });
+        }
+
         if (fromAddr.len > 0 and trace.action.value != null) {
             try ent.internalTxs.append(arena, .{
                 .chunk = chunk,
@@ -221,6 +295,17 @@ pub fn transformBlockWithRemap(
                 .toAddress = toAddr,
                 .value = li(trace.action.value.?),
             });
+        }
+
+        if (std.mem.eql(u8, trace.type, "suicide")) {
+            if (trace.action.address) |destructedAddr| {
+                try ent.selfDestructEvents.append(arena, .{
+                    .address = li(destructedAddr),
+                    .chunk = chunk,
+                    .blockNumber = number,
+                    .blockTimestampS = timestampS,
+                });
+            }
         }
 
         if (trace.result) |res| {
@@ -257,6 +342,24 @@ pub fn transformBlockWithRemap(
                     .creationBytecode = creationBc,
                     .deployedBytecode = deployedBc,
                 });
+
+                const sel = scanErc20Selectors(deployedBc);
+
+                if (sel.any()) {
+                    bloom.insert(addrLower);
+                    try ent.erc20Candidates.append(arena, .{
+                        .address = addrLower,
+                        .chunk = chunk,
+                        .blockNumber = number,
+                        .blockTimestampS = timestampS,
+                        .blockTimestampMs = timestampMs,
+                        .hasBalanceOf = sel.hasBalanceOf,
+                        .hasTransfer = sel.hasTransfer,
+                        .hasTransferFrom = sel.hasTransferFrom,
+                        .hasApprove = sel.hasApprove,
+                        .hasAllowance = sel.hasAllowance,
+                    });
+                }
             }
         }
     }

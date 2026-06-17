@@ -17,6 +17,8 @@ const Logger = core.logger.Logger;
 
 const pipeline = @import("pipeline/pipeline.zig");
 const writer = @import("pipeline/writer.zig");
+const erc20 = @import("pipeline/erc20.zig");
+const erc20_rescan = @import("pipeline/erc20_rescan.zig");
 const ws = @import("indexer/rpc").ws;
 const cursor = @import("indexer/db").cursor;
 const pool = @import("indexer/db").pool;
@@ -26,11 +28,12 @@ const node_probe = @import("indexer/rpc").node_probe;
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 
-const CliArgs = struct { from: ?u64, to: ?u64 };
+const CliArgs = struct { from: ?u64, to: ?u64, erc20Rescan: bool };
 
 fn parseCli(init: Init) !CliArgs {
     var from: ?u64 = null;
     var to: ?u64 = null;
+    var erc20Rescan = false;
     var it = std.process.Args.iterate(init.minimal.args);
     _ = it.next(); // skip executable name
     while (it.next()) |arg| {
@@ -44,9 +47,11 @@ fn parseCli(init: Init) !CliArgs {
                 std.debug.print("Invalid --to value: {s}\n", .{arg[5..]});
                 return error.InvalidCliArg;
             };
+        } else if (std.mem.eql(u8, arg, "--erc20-rescan")) {
+            erc20Rescan = true;
         }
     }
-    return .{ .from = from, .to = to };
+    return .{ .from = from, .to = to, .erc20Rescan = erc20Rescan };
 }
 
 // ─── Redis helpers ────────────────────────────────────────────────────────────
@@ -170,6 +175,7 @@ fn runRealtimeLoop(
     ctx: *RealtimeContext,
     startBlock: u64,
     log: *Logger,
+    erc20Ctx: *erc20.Erc20Context,
 ) !void {
     var cursorPos = startBlock;
 
@@ -195,7 +201,7 @@ fn runRealtimeLoop(
             // processBlock tries primary, then backup on any failure.
             // Only returns .retry_later when both are unavailable.
             while (true) {
-                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode)) {
+                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode, erc20Ctx)) {
                     .saved => |m| {
                         const kb = @as(f64, @floatFromInt(m.kb_total));
                         const fetch_us_kb = if (kb > 0) m.fetch_ms * 1000.0 / kb else 0;
@@ -256,6 +262,14 @@ pub fn main(init: Init) !void {
     const redisUrl = env.CM_CONNECTION_URL;
     var rdb = try openRedis(gpa, redisUrl);
     defer rdb.deinit();
+
+    // ── Maintenance mode: --erc20-rescan (re-resolve all known ERC-20s, exits) ─
+    if (cli.erc20Rescan) {
+        var conn = try pool.CqlConn.init(gpa, env.SCYLLA_DB_HOST, env.SCYLLA_DB_PORT, env.SCYLLA_DB_KEYSPACE, env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD);
+        defer conn.deinit();
+        try erc20_rescan.run(gpa, io, &chain, &rdb, &conn);
+        return;
+    }
 
     const fromBlock: u64 = cli.from orelse
         (readCursorBlock(&rdb, gpa) orelse 0);
@@ -351,6 +365,16 @@ pub fn main(init: Init) !void {
     else
         pipeline.ITX_LANES_DEFAULT;
 
+    // ── ERC-20 tracking context (bloom filter + Multicall3 client) ───────────
+    // Shared across historical and realtime phases so the bloom filter built
+    // up during historical sync keeps catching re-checks once realtime starts.
+    const erc20ChunkSize: usize = if (init.environ_map.get("ERC20_MULTICALL_CHUNK_SIZE")) |v|
+        std.fmt.parseInt(usize, v, 10) catch erc20.MULTICALL_CHUNK_SIZE_DEFAULT
+    else
+        erc20.MULTICALL_CHUNK_SIZE_DEFAULT;
+    var erc20Ctx = try erc20.Erc20Context.init(gpa, io, &chain, erc20ChunkSize);
+    defer erc20Ctx.deinit();
+
     // ── Historical sync ───────────────────────────────────────────────────────
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
@@ -372,6 +396,7 @@ pub fn main(init: Init) !void {
             txsLanes,
             logsLanes,
             itxsLanes,
+            &erc20Ctx,
         );
     }
 
@@ -384,5 +409,5 @@ pub fn main(init: Init) !void {
     var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
 
-    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log);
+    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log, &erc20Ctx);
 }
