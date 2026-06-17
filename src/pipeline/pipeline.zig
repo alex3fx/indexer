@@ -494,11 +494,33 @@ fn saveAccumFn(args: *SaveArgs) void {
 
     // ERC-20 resolution (Multicall3 + Redis) runs sequentially here, on the
     // single Redis connection, before the batch save — same place the cursor
-    // advance below already runs from. One block at a time; each block's own
-    // arena hosts the resulting rows so they're included in this same save.
+    // advance below already runs from. Candidates/touches from every block in
+    // this accumulation window are merged and resolved together (pinned to
+    // the window's last block), instead of one RPC round trip per block —
+    // that per-block latency was the dominant cost in token-dense windows.
+    var windowEnts: std.ArrayList(*transformer.Entities) = .empty;
+    defer windowEnts.deinit(ac.gpa);
+    var pinTimestampS: i64 = 0;
+    var carrier: ?*BlockResult = null;
     for (ac.sources.items) |r| {
         if (!r.ok) continue;
-        erc20.resolveAndEnrich(args.erc20Ctx, args.chain, args.rdb, r.arena.allocator(), &r.ent);
+        windowEnts.append(ac.gpa, &r.ent) catch continue;
+        if (carrier == null) carrier = r;
+        if (r.blockNum == ac.blockEnd and r.ent.blocks.items.len > 0) {
+            pinTimestampS = r.ent.blocks.items[0].timestampS;
+        }
+    }
+    if (windowEnts.items.len > 0) {
+        erc20.resolveAndEnrichWindow(
+            args.erc20Ctx,
+            args.chain,
+            args.rdb,
+            carrier.?.arena.allocator(),
+            windowEnts.items,
+            ac.blockEnd,
+            pinTimestampS,
+            &carrier.?.ent,
+        );
     }
 
     const t0 = nowNs();

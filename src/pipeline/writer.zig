@@ -97,7 +97,9 @@ pub fn processBlock(
     const parse_ms = @as(f64, @floatFromInt(result.parseNs)) / 1e6;
     const transform_ms = @as(f64, @floatFromInt(result.transformNs)) / 1e6;
 
-    erc20.resolveAndEnrich(erc20Ctx, chain, rdb, result.arena.allocator(), &result.ent);
+    const pinTimestampS: i64 = if (result.ent.blocks.items.len > 0) result.ent.blocks.items[0].timestampS else 0;
+    var windowEnts = [1]*batch.Entities{&result.ent};
+    erc20.resolveAndEnrichWindow(erc20Ctx, chain, rdb, result.arena.allocator(), windowEnts[0..], blockNum, pinTimestampS, &result.ent);
 
     const t_save = nowNs();
     batch.saveBlockRt(rtConns, &result.ent, bs) catch |e| return .{ .fatal = e };

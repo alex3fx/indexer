@@ -89,44 +89,93 @@ pub const Erc20Context = struct {
     }
 };
 
-/// Entry point: call once per block, after transform, before the rows are saved.
-/// Best-effort — logs and swallows individual RPC/Redis failures so a flaky node
-/// never aborts the block's main save.
-pub fn resolveAndEnrich(
+/// Entry point: call once per accumulation window (e.g. SAVE_EVERY blocks in
+/// historical, or a single block in realtime — pass a 1-element slice), after
+/// transform, before the rows are saved. Merges candidates/touches across all
+/// of `ents` and resolves each kind in as few Multicall3 round trips as
+/// `multicallChunkSize` allows, instead of one round trip per block — the
+/// per-block-with-candidates RPC latency was the dominant cost in dense/bursty
+/// ranges (e.g. one window with a single token-factory burst measurably
+/// slower than denser-but-quieter neighboring windows).
+///
+/// Approximation: all addresses in the window are resolved as of `pinBlock`
+/// (the window's last block), not each candidate's own exact creation block.
+/// Within a SAVE_EVERY-sized window (~24 blocks / ~5 min on ETH) a freshly
+/// deployed token's name/symbol/decimals/totalSupply/owner essentially never
+/// change before its next read, so `initial*` fields stay accurate in
+/// practice — but it IS a relaxation from "at creation" to "as of window end",
+/// traded for collapsing N RPC round trips into ~1. `updatedAtBlock` is set to
+/// `pinBlock` to honestly reflect what was actually read.
+///
+/// Best-effort — logs and swallows individual RPC/Redis failures so a flaky
+/// node never aborts the window's main save.
+pub fn resolveAndEnrichWindow(
     self: *Erc20Context,
     chain: *const EvmChainConfig,
     rdb: *cursor.Conn,
     rowAllocator: Allocator,
-    ent: *schema.Entities,
+    ents: []const *schema.Entities,
+    pinBlock: u64,
+    pinTimestampS: i64,
+    carrier: *schema.Entities,
 ) void {
-    if (ent.erc20Candidates.items.len == 0 and ent.erc20Touches.items.len == 0 and ent.selfDestructEvents.items.len == 0) {
-        return;
-    }
-
     const mc = chain.contracts.MULTICALL3 orelse return;
     const chainId: i32 = @intCast(chain.id);
 
-    if (ent.erc20Candidates.items.len > 0) {
-        resolveCandidates(self, chain, mc, chainId, rdb, rowAllocator, ent) catch |e| {
+    var candCount: usize = 0;
+    var touchCount: usize = 0;
+    for (ents) |ent| {
+        candCount += ent.erc20Candidates.items.len;
+        touchCount += ent.erc20Touches.items.len;
+        for (ent.selfDestructEvents.items) |sd| {
+            if (!self.bloom.mightContain(sd.address)) continue;
+            carrier.erc20SelfDestructs.append(rowAllocator, .{
+                .address = sd.address,
+                .chainId = chainId,
+                .atBlock = sd.blockNumber,
+                .atTimestamp = sd.blockTimestampS,
+            }) catch {};
+        }
+    }
+
+    if (candCount > 0) {
+        const allCands = self.gpa.alloc(schema.Erc20Candidate, candCount) catch |e| {
+            std.debug.print("[erc20] candidate merge alloc failed: {s}\n", .{@errorName(e)});
+            return resolveTouchesWindowOrLog(self, chain, mc, chainId, rdb, rowAllocator, ents, touchCount, pinBlock, pinTimestampS, carrier);
+        };
+        defer self.gpa.free(allCands);
+        var i: usize = 0;
+        for (ents) |ent| {
+            for (ent.erc20Candidates.items) |c| {
+                allCands[i] = c;
+                i += 1;
+            }
+        }
+        resolveCandidatesWindow(self, chain, mc, chainId, rdb, rowAllocator, allCands, pinBlock, pinTimestampS, carrier) catch |e| {
             std.debug.print("[erc20] candidate resolve failed: {s}\n", .{@errorName(e)});
         };
     }
 
-    if (ent.erc20Touches.items.len > 0) {
-        resolveTouches(self, chain, mc, chainId, rdb, rowAllocator, ent) catch |e| {
-            std.debug.print("[erc20] touch resolve failed: {s}\n", .{@errorName(e)});
-        };
-    }
+    resolveTouchesWindowOrLog(self, chain, mc, chainId, rdb, rowAllocator, ents, touchCount, pinBlock, pinTimestampS, carrier);
+}
 
-    for (ent.selfDestructEvents.items) |sd| {
-        if (!self.bloom.mightContain(sd.address)) continue;
-        ent.erc20SelfDestructs.append(rowAllocator, .{
-            .address = sd.address,
-            .chainId = chainId,
-            .atBlock = sd.blockNumber,
-            .atTimestamp = sd.blockTimestampS,
-        }) catch {};
-    }
+fn resolveTouchesWindowOrLog(
+    self: *Erc20Context,
+    chain: *const EvmChainConfig,
+    mc: EvmContractConfig,
+    chainId: i32,
+    rdb: *cursor.Conn,
+    rowAllocator: Allocator,
+    ents: []const *schema.Entities,
+    touchCount: usize,
+    pinBlock: u64,
+    pinTimestampS: i64,
+    carrier: *schema.Entities,
+) void {
+    if (touchCount == 0) return;
+    resolveTouchesWindow(self, chain, mc, chainId, rdb, rowAllocator, ents, pinBlock, pinTimestampS, carrier) catch |e| {
+        std.debug.print("[erc20] touch resolve failed: {s}\n", .{@errorName(e)});
+    };
 }
 
 pub const Classification = struct {
@@ -137,7 +186,7 @@ pub const Classification = struct {
     isNotFollowingStandard: bool,
 };
 
-/// Shared by the per-block candidate path (applyCandidateResults) and the
+/// Shared by the window-level candidate path (applyCandidateResults) and the
 /// --erc20-rescan maintenance pass (erc20_rescan.zig) — same rules as
 /// try_discover_erc_twenty_tokens.ts.
 pub fn classify(sel: transformer.Erc20SelectorFlags, r: multicall.Erc20MulticallResult) Classification {
@@ -190,25 +239,25 @@ fn isStaleOrUnknown(rdb: *cursor.Conn, gpa: Allocator, address: []const u8, bloc
     return blockNumber > storedBlock;
 }
 
-fn resolveCandidates(
+fn resolveCandidatesWindow(
     self: *Erc20Context,
     chain: *const EvmChainConfig,
     mc: EvmContractConfig,
     chainId: i32,
     rdb: *cursor.Conn,
     rowAllocator: Allocator,
-    ent: *schema.Entities,
+    allCands: []const schema.Erc20Candidate,
+    pinBlock: u64,
+    pinTimestampS: i64,
+    carrier: *schema.Entities,
 ) !void {
-    const allCands = ent.erc20Candidates.items;
-
     const addrs = try self.gpa.alloc([]const u8, allCands.len);
     defer self.gpa.free(addrs);
     for (allCands, 0..) |c, i| addrs[i] = c.address;
 
-    const blockNumber: u64 = @intCast(allCands[0].blockNumber);
     var blockHexBuf: [20]u8 = undefined;
-    const blockHex = try std.fmt.bufPrint(&blockHexBuf, "0x{x}", .{blockNumber});
-    const override = self.overrideFor(mc, blockNumber);
+    const blockHex = try std.fmt.bufPrint(&blockHexBuf, "0x{x}", .{pinBlock});
+    const override = self.overrideFor(mc, pinBlock);
 
     var off: usize = 0;
     while (off < allCands.len) {
@@ -225,7 +274,7 @@ fn resolveCandidates(
         );
         defer freeMulticallResults(self.gpa, results);
 
-        try applyCandidateResults(self.gpa, chain, chainId, rdb, rowAllocator, ent, blockNumber, cands, results);
+        try applyCandidateResults(self.gpa, chain, chainId, rdb, rowAllocator, carrier, pinBlock, pinTimestampS, cands, results);
         off = end;
     }
 }
@@ -237,7 +286,8 @@ fn applyCandidateResults(
     rdb: *cursor.Conn,
     rowAllocator: Allocator,
     ent: *schema.Entities,
-    blockNumber: u64,
+    pinBlock: u64,
+    pinTimestampS: i64,
     cands: []const schema.Erc20Candidate,
     results: []const multicall.Erc20MulticallResult,
 ) !void {
@@ -277,8 +327,8 @@ fn applyCandidateResults(
             .chainId = chainId,
             .initialTotalSupply = supplyStr,
             .latestTotalSupply = supplyStr,
-            .updatedAtBlock = c.blockNumber,
-            .updatedAtTimestamp = c.blockTimestampS,
+            .updatedAtBlock = @intCast(pinBlock),
+            .updatedAtTimestamp = pinTimestampS,
             .isUpdate = false,
         });
 
@@ -289,48 +339,49 @@ fn applyCandidateResults(
             .initialOwner = ownerStr,
             .latestOwner = ownerStr,
             .isOwnershipRenounced = if (r.owner) |o| chain.wellKnownBurnAddresses.is(o) else false,
-            .updatedAtBlock = c.blockNumber,
-            .updatedAtTimestamp = c.blockTimestampS,
+            .updatedAtBlock = @intCast(pinBlock),
+            .updatedAtTimestamp = pinTimestampS,
             .isUpdate = false,
         });
 
-        writeErc20Cursor(rdb, gpa, c.address, blockNumber) catch |e| {
+        writeErc20Cursor(rdb, gpa, c.address, pinBlock) catch |e| {
             std.debug.print("[erc20] redis cursor write failed for {s}: {s}\n", .{ c.address, @errorName(e) });
         };
     }
 }
 
-fn resolveTouches(
+fn resolveTouchesWindow(
     self: *Erc20Context,
     chain: *const EvmChainConfig,
     mc: EvmContractConfig,
     chainId: i32,
     rdb: *cursor.Conn,
     rowAllocator: Allocator,
-    ent: *schema.Entities,
+    ents: []const *schema.Entities,
+    pinBlock: u64,
+    pinTimestampS: i64,
+    carrier: *schema.Entities,
 ) !void {
-    const touches = ent.erc20Touches.items;
-    const blockNumber: u64 = @intCast(touches[0].blockNumber);
-    const blockTimestampS = touches[0].blockTimestampS;
-
     var seen = std.StringHashMap(void).init(self.gpa);
     defer seen.deinit();
 
     var uniqueAddrs: std.ArrayList([]const u8) = .empty;
     defer uniqueAddrs.deinit(self.gpa);
 
-    for (touches) |t| {
-        if (seen.contains(t.address)) continue;
-        if (!isStaleOrUnknown(rdb, self.gpa, t.address, blockNumber)) continue;
-        try seen.put(t.address, {});
-        try uniqueAddrs.append(self.gpa, t.address);
+    for (ents) |ent| {
+        for (ent.erc20Touches.items) |t| {
+            if (seen.contains(t.address)) continue;
+            if (!isStaleOrUnknown(rdb, self.gpa, t.address, pinBlock)) continue;
+            try seen.put(t.address, {});
+            try uniqueAddrs.append(self.gpa, t.address);
+        }
     }
 
     if (uniqueAddrs.items.len == 0) return;
 
     var blockHexBuf: [20]u8 = undefined;
-    const blockHex = try std.fmt.bufPrint(&blockHexBuf, "0x{x}", .{blockNumber});
-    const override = self.overrideFor(mc, blockNumber);
+    const blockHex = try std.fmt.bufPrint(&blockHexBuf, "0x{x}", .{pinBlock});
+    const override = self.overrideFor(mc, pinBlock);
 
     var off: usize = 0;
     while (off < uniqueAddrs.items.len) {
@@ -350,30 +401,30 @@ fn resolveTouches(
         for (addrsChunk, results) |addr, r| {
             if (r.totalSupply) |ts| {
                 const supplyStr = try dupe(rowAllocator, ts);
-                try ent.erc20Supplies.append(rowAllocator, .{
+                try carrier.erc20Supplies.append(rowAllocator, .{
                     .address = addr,
                     .chainId = chainId,
                     .initialTotalSupply = "",
                     .latestTotalSupply = supplyStr,
-                    .updatedAtBlock = @intCast(blockNumber),
-                    .updatedAtTimestamp = blockTimestampS,
+                    .updatedAtBlock = @intCast(pinBlock),
+                    .updatedAtTimestamp = pinTimestampS,
                     .isUpdate = true,
                 });
             }
             if (r.owner) |o| {
                 const ownerStr = try dupe(rowAllocator, o);
-                try ent.erc20Owners.append(rowAllocator, .{
+                try carrier.erc20Owners.append(rowAllocator, .{
                     .address = addr,
                     .chainId = chainId,
                     .initialOwner = "",
                     .latestOwner = ownerStr,
                     .isOwnershipRenounced = chain.wellKnownBurnAddresses.is(o),
-                    .updatedAtBlock = @intCast(blockNumber),
-                    .updatedAtTimestamp = blockTimestampS,
+                    .updatedAtBlock = @intCast(pinBlock),
+                    .updatedAtTimestamp = pinTimestampS,
                     .isUpdate = true,
                 });
             }
-            writeErc20Cursor(rdb, self.gpa, addr, blockNumber) catch |e| {
+            writeErc20Cursor(rdb, self.gpa, addr, pinBlock) catch |e| {
                 std.debug.print("[erc20] redis cursor write failed for {s}: {s}\n", .{ addr, @errorName(e) });
             };
         }
