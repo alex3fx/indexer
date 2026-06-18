@@ -139,7 +139,29 @@ const WorkerArgs = struct {
     chunkBuckets: u64,
     cancel: *std.atomic.Value(bool),
     backupNode: ?EvmRpcNodeConfig,
+    connErrors: *std.atomic.Value(u64),
 };
+
+// Errors that indicate the RPC node itself is unreachable/refusing connections
+// (vs. an isolated per-block issue). Used to alert immediately instead of only
+// discovering a fully-failed run after it has already finished.
+fn isConnIssue(e: anyerror) bool {
+    return switch (e) {
+        error.ConnectionRefused, error.ConnectionResetByPeer, error.ConnectionTimedOut, error.NetworkUnreachable, error.TemporaryNameServerFailure, error.UnknownHostName => true,
+        else => false,
+    };
+}
+
+// Fires once per threshold crossing (10, 20, 30, ...) so it can't spam but is
+// still visible immediately, well before a batch finishes.
+fn maybeAlertConnIssues(count: u64) void {
+    if (count > 0 and count % 10 == 0) {
+        std.debug.print(
+            "\n[ALERT] {d} connection errors so far this run — RPC node may be unreachable/refusing connections (check node health, reduce FETCH_WORKERS)\n\n",
+            .{count},
+        );
+    }
+}
 
 pub const FetchTransformStatus = union(enum) {
     ok,
@@ -250,6 +272,9 @@ fn worker(args: *WorkerArgs) !void {
         result.* = BlockResult.init(gpa);
         result.blockNum = blockNum;
 
+        const MAX_RETRY_LATER: u32 = 25; // ~5s of 200ms sleeps before giving up
+        var retryCount: u32 = 0;
+
         retry: while (true) {
             switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result)) {
                 .ok => {
@@ -282,11 +307,35 @@ fn worker(args: *WorkerArgs) !void {
                 },
                 .retry_later => {
                     if (args.cancel.load(.acquire)) break :retry;
+                    retryCount += 1;
+                    if (retryCount >= MAX_RETRY_LATER) {
+                        // Node persistently failing this block — try backup before giving up.
+                        if (args.backupNode) |backup| {
+                            std.debug.print("[worker] block={d} stuck retry_later x{d} — trying backup\n", .{ blockNum, retryCount });
+                            resetResult(result);
+                            if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result) == .ok) {
+                                result.ok = true;
+                                std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
+                                    blockNum,                  result.ent.txs.items.len,
+                                    result.ent.logs.items.len, result.ent.internalTxs.items.len,
+                                });
+                            } else {
+                                std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — skipping\n", .{ blockNum, retryCount });
+                            }
+                        } else {
+                            std.debug.print("[worker] block={d} stuck retry_later x{d} — no backup, skipping\n", .{ blockNum, retryCount });
+                        }
+                        break :retry;
+                    }
                     const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
                     _ = linux.nanosleep(&ts, null);
                     resetResult(result);
                 },
                 .fatal => |e| {
+                    if (isConnIssue(e)) {
+                        const n = args.connErrors.fetchAdd(1, .monotonic) + 1;
+                        maybeAlertConnIssues(n);
+                    }
                     // Try backup node before marking as skipped.
                     if (args.backupNode) |backup| {
                         std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
@@ -545,6 +594,7 @@ fn spawnHistoricalWorkers(
     next: *std.atomic.Value(u64),
     threads: []std.Thread,
     backupNode: ?EvmRpcNodeConfig,
+    connErrors: *std.atomic.Value(u64),
 ) !void {
     for (0..threads.len) |w| {
         const wargs = try gpa.create(WorkerArgs);
@@ -558,6 +608,7 @@ fn spawnHistoricalWorkers(
             .chunkBuckets = chunkBuckets,
             .cancel = cancel,
             .backupNode = backupNode,
+            .connErrors = connErrors,
         };
         _ = from; // from is encoded in next (already set to from by caller)
         threads[w] = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
@@ -698,10 +749,11 @@ pub fn runHistorical(
     txsLanes: usize,
     logsLanes: usize,
     itxsLanes: usize,
+    fetchWorkers: usize,
 ) !void {
     if (from > to) return;
 
-    const workerCount = chain.indexingOptions.workerCount;
+    const workerCount = fetchWorkers;
     const bs = pool.BatchSizes.fromChain(chain.indexingOptions);
     const rUrl = cursor.parseUrl(redisUrl);
 
@@ -722,7 +774,8 @@ pub fn runHistorical(
 
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
-    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode);
+    var connErrors = std.atomic.Value(u64).init(0);
+    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &connErrors);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
@@ -768,7 +821,18 @@ pub fn runHistorical(
 
     const elapsedMs = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
     std.debug.print("\nHistorical sync done: {d:.0}ms  saved_blocks={d}\n", .{ elapsedMs, blocksDone });
-    const syncMsg = std.fmt.allocPrint(gpa, "historical sync done: {d} blocks in {d:.0}ms", .{ blocksDone, elapsedMs }) catch "";
+
+    const requested = to - from + 1;
+    const totalConnErrors = connErrors.load(.monotonic);
+    if (skippedBlocks.items.len * 100 > requested * 20) {
+        std.debug.print(
+            "[WARNING] {d}/{d} blocks ({d}%) were skipped on the main pass (conn_errors={d}) — " ++
+                "this run's blk/s is NOT a valid throughput measurement, results below are misleading\n",
+            .{ skippedBlocks.items.len, requested, skippedBlocks.items.len * 100 / requested, totalConnErrors },
+        );
+    }
+
+    const syncMsg = std.fmt.allocPrint(gpa, "historical sync done: {d} blocks in {d:.0}ms (skipped={d}, conn_errors={d})", .{ blocksDone, elapsedMs, skippedBlocks.items.len, totalConnErrors }) catch "";
     defer if (syncMsg.len > 0) gpa.free(syncMsg);
     log.info(if (syncMsg.len > 0) syncMsg else "historical sync done");
 

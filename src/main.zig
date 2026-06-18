@@ -260,19 +260,22 @@ pub fn main(init: Init) !void {
     const fromBlock: u64 = cli.from orelse
         (readCursorBlock(&rdb, gpa) orelse 0);
 
-    // ── WSS: get current head ─────────────────────────────────────────────────
+    // ── WSS: get current head (only needed when --to is not given) ────────────
     const wssUrl = chain.rpcNodes.lotosArchiveNode.wss;
     const wsParsed = ws.parseUrl(wssUrl);
 
-    var wsConn = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch |err| {
-        std.debug.print("WSS connect failed ({s}): {s}\n", .{ wssUrl, @errorName(err) });
-        return err;
-    };
-    defer wsConn.deinit();
-    _ = try wsConn.subscribeNewHeads();
+    var wsConnOpt: ?ws.Conn = if (cli.to == null) blk: {
+        var c = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch |err| {
+            std.debug.print("WSS connect failed ({s}): {s}\n", .{ wssUrl, @errorName(err) });
+            return err;
+        };
+        _ = try c.subscribeNewHeads();
+        break :blk c;
+    } else null;
+    defer if (wsConnOpt) |*c| c.deinit();
 
     const toBlock: u64 = cli.to orelse blk: {
-        const head = wsConn.nextBlockNum() catch 0;
+        const head = wsConnOpt.?.nextBlockNum() catch 0;
         break :blk if (head > 0) head else {
             std.debug.print("Could not get current head from WSS\n", .{});
             return error.NoHeadBlock;
@@ -351,6 +354,11 @@ pub fn main(init: Init) !void {
     else
         pipeline.ITX_LANES_DEFAULT;
 
+    const fetchWorkers: usize = if (init.environ_map.get("FETCH_WORKERS")) |v|
+        std.fmt.parseInt(usize, v, 10) catch chain.indexingOptions.workerCount
+    else
+        chain.indexingOptions.workerCount;
+
     // ── Historical sync ───────────────────────────────────────────────────────
     if (fromBlock <= toBlock) {
         try pipeline.runHistorical(
@@ -372,6 +380,7 @@ pub fn main(init: Init) !void {
             txsLanes,
             logsLanes,
             itxsLanes,
+            fetchWorkers,
         );
     }
 
@@ -384,5 +393,5 @@ pub fn main(init: Init) !void {
     var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
 
-    try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log);
+    try runRealtimeLoop(io, gpa, &chain, &wsConnOpt.?, wsParsed, &ctx, toBlock, &log);
 }

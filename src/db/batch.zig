@@ -308,6 +308,7 @@ pub fn saveEntitiesParallel(
     saveContractRowsForEntities(&gContracts);
 
     for (threads[0..spawned]) |t| t.join();
+    spawned = 0; // already joined — disarm the errdefer above
 
     if (gBlocks.err) |e| return e;
     if (gContracts.err) |e| return e;
