@@ -77,6 +77,10 @@ const RealtimeContext = struct {
     rtConns: batch.RealtimeConns,
     hPool: http_pool.HttpPool,
     redis: cursor.Conn,
+    redisHost: []const u8,
+    redisPort: u16,
+    redisPassword: []const u8,
+    redisDb: u8,
     bClient: FetchClient,
     rClient: FetchClient,
     tClient: FetchClient,
@@ -114,12 +118,18 @@ const RealtimeContext = struct {
         errdefer rtConns.deinit();
 
         std.debug.print("Starting HTTP thread pool (3 persistent threads)...\n", .{});
+        // startThreads() is deliberately NOT called here: the threads it spawns
+        // capture *Slot pointers into this HttpPool's `slots` array, and `hPool`
+        // is about to be copied into the returned RealtimeContext value — those
+        // pointers would dangle into this function's dead stack frame. Call
+        // startThreads() once `hPool` is at its final, stable address instead
+        // (see the caller, after `var ctx = try RealtimeContext.init(...)`).
         var hPool = try http_pool.HttpPool.init(gpa, io);
-        try hPool.startThreads();
         errdefer hPool.deinit();
 
         var redis = try openRedis(gpa, redisUrl);
         errdefer redis.deinit();
+        const rUrl = cursor.parseUrl(redisUrl);
 
         const wsDelayMs: u64 = if (environ.get("WS_DELAY_MS")) |v|
             std.fmt.parseInt(u64, v, 10) catch 100
@@ -137,6 +147,10 @@ const RealtimeContext = struct {
             .rtConns = rtConns,
             .hPool = hPool,
             .redis = redis,
+            .redisHost = rUrl.host,
+            .redisPort = rUrl.port,
+            .redisPassword = rUrl.password,
+            .redisDb = rUrl.db,
             .bClient = FetchClient.init(gpa, io),
             .rClient = FetchClient.init(gpa, io),
             .tClient = FetchClient.init(gpa, io),
@@ -155,7 +169,37 @@ const RealtimeContext = struct {
         self.rClient.deinit();
         self.tClient.deinit();
     }
+
+    /// True only if Scylla and Redis both answer a liveness probe.
+    fn isHealthy(self: *RealtimeContext) bool {
+        if (!self.rtConns.pingAll()) return false;
+        self.redis.ping() catch return false;
+        return true;
+    }
+
+    /// Reconnects Scylla (all lanes) and Redis. Best-effort: attempts both
+    /// even if one fails, returns the first error so the caller can log it.
+    fn reconnectAll(self: *RealtimeContext) !void {
+        var firstErr: ?anyerror = null;
+        self.rtConns.reconnectAll() catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        self.redis.reopen(self.redisHost, self.redisPort, self.redisPassword, self.redisDb) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        if (firstErr) |e| return e;
+    }
 };
+
+fn realtimeMs() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
+// How often the realtime loop proactively probes Scylla/Redis liveness,
+// independent of whether a save has actually failed yet.
+const DB_HEALTH_CHECK_INTERVAL_MS: i64 = 60_000;
 
 fn delayMs(ms: u64) void {
     if (ms == 0) return;
@@ -178,8 +222,25 @@ fn runRealtimeLoop(
     erc20Ctx: *erc20.Erc20Context,
 ) !void {
     var cursorPos = startBlock;
+    var lastHealthCheckMs = realtimeMs();
 
     while (true) {
+        const nowMs = realtimeMs();
+        if (nowMs - lastHealthCheckMs >= DB_HEALTH_CHECK_INTERVAL_MS) {
+            lastHealthCheckMs = nowMs;
+            if (!ctx.isHealthy()) {
+                log.err("DB health check failed (Scylla and/or Redis not responding) — reconnecting");
+                std.debug.print("[realtime] DB health check failed — reconnecting\n", .{});
+                if (ctx.reconnectAll()) |_| {
+                    log.warn("DB reconnected after health-check failure");
+                } else |re| {
+                    const msg = std.fmt.allocPrint(gpa, "DB reconnect after health-check failure FAILED: {s}", .{@errorName(re)}) catch "";
+                    defer if (msg.len > 0) gpa.free(msg);
+                    log.err(if (msg.len > 0) msg else "DB reconnect failed");
+                }
+            }
+        }
+
         const blockNum = wsConn.nextBlockNum() catch |err| {
             const msg = std.fmt.allocPrint(gpa, "WSS disconnected: {s} — reconnecting", .{@errorName(err)}) catch "";
             defer if (msg.len > 0) gpa.free(msg);
@@ -228,6 +289,19 @@ fn runRealtimeLoop(
                         defer if (msg.len > 0) gpa.free(msg);
                         log.err(if (msg.len > 0) msg else "block fatal error — retrying");
                         std.debug.print("[realtime] block={d} fatal: {s} — retry in {d}ms\n", .{ blk, @errorName(e), ctx.retryDelayMs });
+
+                        // A fatal error here is most often a dropped Scylla/Redis
+                        // connection (e.g. a DB restart) — those don't recover on
+                        // their own, so reconnect proactively before retrying.
+                        // Harmless if the connection was actually fine.
+                        if (ctx.reconnectAll()) |_| {
+                            log.warn("DB reconnected after fatal block error");
+                        } else |re| {
+                            const rmsg = std.fmt.allocPrint(gpa, "DB reconnect after fatal block error FAILED: {s}", .{@errorName(re)}) catch "";
+                            defer if (rmsg.len > 0) gpa.free(rmsg);
+                            log.err(if (rmsg.len > 0) rmsg else "DB reconnect failed");
+                        }
+
                         delayMs(ctx.retryDelayMs);
                     },
                 }
@@ -408,6 +482,9 @@ pub fn main(init: Init) !void {
 
     var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
+    // Must run after `ctx` is at its final address — see the comment in
+    // RealtimeContext.init() next to where HttpPool.init() is called.
+    try ctx.hPool.startThreads();
 
     try runRealtimeLoop(io, gpa, &chain, &wsConn, wsParsed, &ctx, toBlock, &log, &erc20Ctx);
 }

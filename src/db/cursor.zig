@@ -35,6 +35,12 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
     }
     const nodelay: c_int = 1;
     _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)), linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
+
+    // Bounds GET/SET/SCAN/PING so a half-dead connection can't block the
+    // realtime loop forever — see the matching comment in db/pool.zig.
+    const tv = linux.timeval{ .sec = 10, .usec = 0 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     return fd;
 }
 
@@ -82,6 +88,26 @@ pub const Conn = struct {
 
     pub fn deinit(self: *Conn) void {
         _ = linux.close(self.fd);
+    }
+
+    /// Lightweight liveness probe — used for periodic health checks in the
+    /// realtime loop, distinct from a real GET/SET so it doesn't touch data.
+    pub fn ping(self: *Conn) !void {
+        try fdWrite(self.fd, "*1\r\n$4\r\nPING\r\n");
+        var buf: [64]u8 = undefined;
+        const line = try fdReadLine(self.fd, &buf);
+        if (!std.mem.eql(u8, line, "+PONG")) return error.RedisPingFailed;
+    }
+
+    /// Tears down the current socket and reconnects in place — recovers from
+    /// a dropped connection (e.g. Redis/Dragonfly restart) without restarting
+    /// the whole indexer process. Callers holding a `*Conn` stay valid.
+    pub fn reopen(self: *Conn, host: []const u8, port: u16, password: []const u8, db: u8) !void {
+        _ = linux.close(self.fd);
+        self.fd = -1;
+        self.fd = try tcpConnect(host, port);
+        if (password.len > 0) try self.auth(password);
+        if (db > 0) try self.selectDb(db);
     }
 
     pub fn auth(self: *Conn, password: []const u8) !void {

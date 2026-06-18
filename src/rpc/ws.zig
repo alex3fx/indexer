@@ -33,6 +33,15 @@ fn tcpConn(host: []const u8, port: u16) !i32 {
     }
     const nd: c_int = 1;
     _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)), linux.TCP.NODELAY, @ptrCast(&nd), @sizeOf(c_int));
+
+    // nextBlockNum() legitimately blocks for ~12s (ETH block time) between
+    // messages, so this needs to be generous — but without SOME bound, a
+    // half-dead connection (no clean FIN/RST) blocks read() forever and the
+    // existing "WSS disconnected — reconnecting" recovery path in main.zig
+    // never gets a chance to run.
+    const tv = linux.timeval{ .sec = 60, .usec = 0 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     return fd;
 }
 

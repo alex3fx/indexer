@@ -30,6 +30,13 @@ pub const ACCUM_ITX_LANES: usize = 20;
 
 pub const RealtimeConns = struct {
     gpa: std.mem.Allocator,
+    // Kept for reconnectAll() — connection params, not owned (point into the
+    // caller's env-derived strings, which outlive the process).
+    host: []const u8,
+    port: u16,
+    ks: []const u8,
+    user: []const u8,
+    pass: []const u8,
     blk: CqlConn,
     txs: []CqlConn,
     logs: []CqlConn,
@@ -72,7 +79,21 @@ pub const RealtimeConns = struct {
         var comp = try CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer comp.deinit();
         const erc20 = try CqlConn.init(gpa, host, port, ks, user, pass);
-        return .{ .gpa = gpa, .blk = blk, .txs = txs, .logs = logs, .itxs = itxs, .contracts = contracts, .comp = comp, .erc20 = erc20 };
+        return .{
+            .gpa = gpa,
+            .host = host,
+            .port = port,
+            .ks = ks,
+            .user = user,
+            .pass = pass,
+            .blk = blk,
+            .txs = txs,
+            .logs = logs,
+            .itxs = itxs,
+            .contracts = contracts,
+            .comp = comp,
+            .erc20 = erc20,
+        };
     }
 
     pub fn deinit(self: *RealtimeConns) void {
@@ -86,6 +107,47 @@ pub const RealtimeConns = struct {
         self.gpa.free(self.txs);
         self.gpa.free(self.logs);
         self.gpa.free(self.itxs);
+    }
+
+    /// True only if every connection responds to a CQL OPTIONS probe.
+    pub fn pingAll(self: *RealtimeConns) bool {
+        self.blk.ping() catch return false;
+        for (self.txs) |*c| c.ping() catch return false;
+        for (self.logs) |*c| c.ping() catch return false;
+        for (self.itxs) |*c| c.ping() catch return false;
+        self.contracts.ping() catch return false;
+        self.comp.ping() catch return false;
+        self.erc20.ping() catch return false;
+        return true;
+    }
+
+    /// Reconnects every connection (e.g. after a Scylla restart broke them
+    /// all at once). Best-effort: attempts all of them even if some fail,
+    /// then returns the first error seen (if any) so the caller can log it.
+    pub fn reconnectAll(self: *RealtimeConns) !void {
+        var firstErr: ?anyerror = null;
+        self.blk.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        for (self.txs) |*c| c.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        for (self.logs) |*c| c.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        for (self.itxs) |*c| c.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        self.contracts.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        self.comp.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        self.erc20.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
+        if (firstErr) |e| return e;
     }
 };
 
@@ -324,7 +386,14 @@ pub fn saveEntitiesParallel(
     const threads = try tempAllocator.alloc(std.Thread, nSpawn);
     defer tempAllocator.free(threads);
     var spawned: usize = 0;
-    errdefer for (threads[0..spawned]) |t| t.join();
+    // Only for spawn failures below — once the real join below succeeds,
+    // `joined` stops this from running again on the same handles. Calling
+    // pthread_join twice on the same thread is UB and segfaults (verified
+    // live: a lane's post-join `return e` — e.g. a write to a connection
+    // that died mid-save — re-triggered this errdefer on already-joined
+    // threads, crashing inside __pthread_clockjoin_ex).
+    var joined = false;
+    errdefer if (!joined) for (threads[0..spawned]) |t| t.join();
 
     for (0..txsN) |i| {
         threads[spawned] = try std.Thread.spawn(.{}, saveTxRowsForLane, .{&gTxs[i]});
@@ -346,6 +415,7 @@ pub fn saveEntitiesParallel(
     saveContractRowsForEntities(&gContracts);
 
     for (threads[0..spawned]) |t| t.join();
+    joined = true;
 
     if (gBlocks.err) |e| return e;
     if (gContracts.err) |e| return e;

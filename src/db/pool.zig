@@ -59,6 +59,15 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
 
     const nodelay: c_int = 1;
     _ = linux.setsockopt(fd, @as(c_int, @intCast(linux.IPPROTO.TCP)), linux.TCP.NODELAY, @ptrCast(&nodelay), @sizeOf(c_int));
+
+    // Without this, a half-dead connection (e.g. the remote restarted but
+    // didn't get to send a clean RST/FIN, or a network partition) blocks
+    // read()/write() forever — no application-level reconnect logic ever
+    // gets a chance to run because the syscall never returns. CQL is a
+    // tight request/response protocol, so a short bound is safe.
+    const tv = linux.timeval{ .sec = 10, .usec = 0 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     return fd;
 }
 
@@ -86,12 +95,14 @@ fn tcpReadExact(fd: i32, buf: []u8) !void {
 const CQL_VERSION: u8 = 0x04;
 const OPCODE_STARTUP: u8 = 0x01;
 const OPCODE_AUTH_RESP: u8 = 0x0F;
+const OPCODE_OPTIONS: u8 = 0x05;
 const OPCODE_QUERY: u8 = 0x07;
 const OPCODE_PREPARE: u8 = 0x09;
 const OPCODE_BATCH: u8 = 0x0D;
 const OPCODE_READY: u8 = 0x02;
 const OPCODE_AUTH: u8 = 0x03;
 const OPCODE_AUTH_OK: u8 = 0x10;
+const OPCODE_SUPPORTED: u8 = 0x06;
 const OPCODE_RESULT: u8 = 0x08;
 const OPCODE_ERROR: u8 = 0x00;
 const CONSISTENCY_ONE: u16 = 0x0001;
@@ -326,20 +337,41 @@ pub const CqlConn = struct {
     }
 
     pub fn deinit(self: *CqlConn) void {
-        self.gpa.free(self.prepIds.blocks);
-        self.gpa.free(self.prepIds.transactions);
-        self.gpa.free(self.prepIds.logs);
-        self.gpa.free(self.prepIds.internalTxs);
-        self.gpa.free(self.prepIds.contracts);
-        self.gpa.free(self.prepIds.contractsByAddr);
-        self.gpa.free(self.prepIds.blockCompletions);
-        self.gpa.free(self.prepIds.erc20Tokens);
-        self.gpa.free(self.prepIds.erc20SupplyInsert);
-        self.gpa.free(self.prepIds.erc20SupplyUpdate);
-        self.gpa.free(self.prepIds.erc20OwnerInsert);
-        self.gpa.free(self.prepIds.erc20OwnerUpdate);
-        self.gpa.free(self.prepIds.erc20SelfDestruct);
+        freePreparedIds(self.gpa, self.prepIds);
         _ = linux.close(self.fd);
+    }
+
+    /// Lightweight liveness probe (CQL OPTIONS/SUPPORTED) — no query execution,
+    /// just confirms the socket is still accepted by the server. Used for
+    /// periodic health checks in the realtime loop.
+    pub fn ping(self: *CqlConn) !void {
+        try self.sendFrame(OPCODE_OPTIONS, &.{});
+        const resp = try self.recvFrame();
+        defer self.gpa.free(resp.body);
+        if (resp.opcode != OPCODE_SUPPORTED) return error.CqlPingFailed;
+    }
+
+    /// Tears down the current socket/prepared statements and reconnects in
+    /// place — callers holding a `*CqlConn` keep a valid connection after this
+    /// returns, without needing to know the pointer changed underneath them.
+    /// Used to recover from a dropped connection (e.g. Scylla restart) without
+    /// restarting the whole indexer process.
+    pub fn reopen(
+        self: *CqlConn,
+        host: []const u8,
+        port: u16,
+        keyspace: []const u8,
+        user: []const u8,
+        pass: []const u8,
+    ) !void {
+        _ = linux.close(self.fd);
+        self.fd = -1; // leave the connection visibly dead until reinit succeeds —
+        // never let a stale fd number (reusable by the OS after close()) be
+        // mistaken for a live one if init() below fails and returns early.
+        freePreparedIds(self.gpa, self.prepIds);
+        self.prepIds = undefined;
+        const fresh = try CqlConn.init(self.gpa, host, port, keyspace, user, pass);
+        self.* = fresh;
     }
 
     fn sendFrame(self: *CqlConn, opcode: u8, body: []const u8) !void {
@@ -484,6 +516,22 @@ pub const CqlConn = struct {
         try self.recvFrameCheck();
     }
 };
+
+fn freePreparedIds(gpa: std.mem.Allocator, ids: PreparedIds) void {
+    gpa.free(ids.blocks);
+    gpa.free(ids.transactions);
+    gpa.free(ids.logs);
+    gpa.free(ids.internalTxs);
+    gpa.free(ids.contracts);
+    gpa.free(ids.contractsByAddr);
+    gpa.free(ids.blockCompletions);
+    gpa.free(ids.erc20Tokens);
+    gpa.free(ids.erc20SupplyInsert);
+    gpa.free(ids.erc20SupplyUpdate);
+    gpa.free(ids.erc20OwnerInsert);
+    gpa.free(ids.erc20OwnerUpdate);
+    gpa.free(ids.erc20SelfDestruct);
+}
 
 pub fn prepareAll(conn: *CqlConn) !PreparedIds {
     return .{

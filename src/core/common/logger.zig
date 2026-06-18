@@ -96,6 +96,12 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
         _ = linux.close(fd);
         return error.ConnectFailed;
     }
+
+    // sendGelf() is called from every log.* call, including the error paths
+    // that report a DB outage — if GrayLog itself is unreachable, an
+    // un-timed-out write must not be able to hang those call sites too.
+    const tv = linux.timeval{ .sec = 5, .usec = 0 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     return fd;
 }
 

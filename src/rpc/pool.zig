@@ -63,6 +63,7 @@ pub const HttpPool = struct {
     slots: [3]Slot,
     gpa: Allocator,
     io: std.Io,
+    threadsStarted: bool = false,
 
     /// Step 1: create pipes only. Does NOT spawn threads.
     /// Call startThreads() after the HttpPool is at its final memory location.
@@ -100,12 +101,13 @@ pub const HttpPool = struct {
         for (&self.slots) |*slot| {
             slot.thread = try std.Thread.spawn(.{}, slotWorkerFn, .{ slot, self.gpa, self.io });
         }
+        self.threadsStarted = true;
     }
 
     pub fn deinit(self: *HttpPool) void {
         for (&self.slots) |*slot| {
             _ = linux.close(slot.work_wr); // EOF → worker exits
-            slot.thread.join();
+            if (self.threadsStarted) slot.thread.join();
             _ = linux.close(slot.work_rd);
             _ = linux.close(slot.done_rd);
             _ = linux.close(slot.done_wr);
