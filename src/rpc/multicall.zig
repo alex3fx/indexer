@@ -217,7 +217,32 @@ fn decodeAbiString(allocator: Allocator, retData: []const u8) ![]const u8 {
     const len = readWordU64At(retData, off);
     const dataStart = off + 32;
     if (dataStart + len > retData.len) return error.BadAbiString;
-    return try allocator.dupe(u8, retData[dataStart..][0..len]);
+    const raw = try allocator.dupe(u8, retData[dataStart..][0..len]);
+    sanitizeUtf8InPlace(raw);
+    return raw;
+}
+
+// name()/symbol() come from an arbitrary, possibly malicious or non-standard
+// contract — there's no guarantee the returned bytes are valid UTF-8. Scylla's
+// CQL `text` type rejects invalid UTF-8 at bind time (verified live: a token
+// with garbage bytes in its name aborted the whole historical-sync batch with
+// "non-UTF8 character in a UTF8 string"). Replace invalid bytes with '?'
+// in place — same length, always valid UTF-8, no allocation.
+fn sanitizeUtf8InPlace(s: []u8) void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            s[i] = '?';
+            i += 1;
+            continue;
+        };
+        if (i + len > s.len or !std.unicode.utf8ValidateSlice(s[i..][0..len])) {
+            s[i] = '?';
+            i += 1;
+            continue;
+        }
+        i += len;
+    }
 }
 
 fn decodeUint8(retData: []const u8) ?u8 {
