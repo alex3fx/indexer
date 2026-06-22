@@ -78,6 +78,7 @@ const RealtimeContext = struct {
     wsDelayMs: u64,
     retryDelayMs: u64,
     chunkBuckets: u64,
+    chunkEra: u64,
     backupNode: ?EvmRpcNodeConfig,
 
     fn init(
@@ -87,6 +88,7 @@ const RealtimeContext = struct {
         chain: anytype,
         redisUrl: []const u8,
         chunkBuckets: u64,
+        chunkEra: u64,
         environ: anytype,
         backupNode: ?EvmRpcNodeConfig,
         txsLanes: usize,
@@ -138,6 +140,7 @@ const RealtimeContext = struct {
             .wsDelayMs = wsDelayMs,
             .retryDelayMs = retryDelayMs,
             .chunkBuckets = chunkBuckets,
+            .chunkEra = chunkEra,
             .backupNode = backupNode,
         };
     }
@@ -195,7 +198,7 @@ fn runRealtimeLoop(
             // processBlock tries primary, then backup on any failure.
             // Only returns .retry_later when both are unavailable.
             while (true) {
-                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode)) {
+                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.chunkEra, ctx.backupNode)) {
                     .saved => |m| {
                         const kb = @as(f64, @floatFromInt(m.kb_total));
                         const fetch_us_kb = if (kb > 0) m.fetch_ms * 1000.0 / kb else 0;
@@ -331,6 +334,16 @@ pub fn main(init: Init) !void {
     else
         pipeline.SCYLLA_CHUNK_BUCKETS_DEFAULT;
 
+    // SCYLLA_CHUNK_ERA: 0 = flat scheme (chunk=block%chunkBuckets, old behavior).
+    // >0 = chunk=(block%chunkBuckets)+chunkBuckets*(block/era) — bounds partition size by era.
+    const chunkEra: u64 = if (init.environ_map.get("SCYLLA_CHUNK_ERA")) |v|
+        std.fmt.parseInt(u64, v, 10) catch {
+            std.debug.print("Invalid SCYLLA_CHUNK_ERA: {s}\n", .{v});
+            return error.InvalidEnv;
+        }
+    else
+        0;
+
     const saveEvery: usize = if (init.environ_map.get("SAVE_EVERY")) |v|
         std.fmt.parseInt(usize, v, 10) catch {
             std.debug.print("Invalid SAVE_EVERY: {s}\n", .{v});
@@ -374,6 +387,7 @@ pub fn main(init: Init) !void {
             env.SCYLLA_DB_PASSWORD,
             redisUrl,
             chunkBuckets,
+            chunkEra,
             saveEvery,
             backupNode,
             &log,
@@ -390,7 +404,7 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     log.info("Realtime mode — listening for new blocks via WSS...");
 
-    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
+    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, chunkEra, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
 
     try runRealtimeLoop(io, gpa, &chain, &wsConnOpt.?, wsParsed, &ctx, toBlock, &log);

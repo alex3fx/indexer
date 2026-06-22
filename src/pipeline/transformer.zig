@@ -97,7 +97,7 @@ pub fn transformBlock(
     chunkSize: u64,
     ent: *Entities,
 ) !void {
-    return transformBlockWithRemap(arena, block, receipts, traces, chunkSize, 0, ent);
+    return transformBlockWithRemap(arena, block, receipts, traces, chunkSize, 0, 0, ent);
 }
 
 pub fn transformBlockWithRemap(
@@ -107,6 +107,7 @@ pub fn transformBlockWithRemap(
     traces: []const RpcTrace,
     chunkSize: u64,
     remapMod: u64,
+    chunkEra: u64,
     ent: *Entities,
 ) !void {
     if (receipts.len != block.transactions.len) return error.IncompleteBlock;
@@ -114,7 +115,14 @@ pub fn transformBlockWithRemap(
     const number = hexToI64(block.number);
     const timestampS = hexToI64(block.timestamp);
     const timestampMs: i64 = if (block.milliTimestamp) |m| hexToI64(m) else timestampS * 1000;
-    const chunk: i32 = if (remapMod > 0)
+    // remapMod>0 && chunkEra>0: chunk = lane + lanes*era (v2/v3 scheme — bounds partition
+    // size by era while spreading lanes for shard parallelism).
+    // remapMod>0, chunkEra==0: chunk = block % remapMod (flat scheme).
+    // both 0: chunk = block / chunkSize (legacy fixed-window scheme).
+    const chunk: i32 = if (remapMod > 0 and chunkEra > 0)
+        @intCast(@mod(number, @as(i64, @intCast(remapMod))) +
+            @as(i64, @intCast(remapMod)) * @divFloor(number, @as(i64, @intCast(chunkEra))))
+    else if (remapMod > 0)
         @intCast(@mod(number, @as(i64, @intCast(remapMod))))
     else
         @intCast(@divFloor(number, @as(i64, @intCast(chunkSize))));

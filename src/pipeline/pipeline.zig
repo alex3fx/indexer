@@ -137,6 +137,7 @@ const WorkerArgs = struct {
     to: u64,
     chan: *ResultChan,
     chunkBuckets: u64,
+    chunkEra: u64,
     cancel: *std.atomic.Value(bool),
     backupNode: ?EvmRpcNodeConfig,
     connErrors: *std.atomic.Value(u64),
@@ -147,7 +148,7 @@ const WorkerArgs = struct {
 // discovering a fully-failed run after it has already finished.
 fn isConnIssue(e: anyerror) bool {
     return switch (e) {
-        error.ConnectionRefused, error.ConnectionResetByPeer, error.ConnectionTimedOut, error.NetworkUnreachable, error.TemporaryNameServerFailure, error.UnknownHostName => true,
+        error.ConnectionRefused, error.ConnectionResetByPeer, error.ConnectionTimedOut, error.NetworkUnreachable, error.TemporaryNameServerFailure, error.UnknownHostName, error.AddressUnavailable, error.ProcessFdQuotaExceeded, error.HttpConnectionClosing => true,
         else => false,
     };
 }
@@ -181,6 +182,7 @@ pub fn fetchParseTransform(
     blockNum: u64,
     chunkSize: u64,
     chunkBuckets: u64,
+    chunkEra: u64,
     bClient: *FetchClient,
     rClient: *FetchClient,
     tClient: *FetchClient,
@@ -223,6 +225,7 @@ pub fn fetchParseTransform(
         traces,
         chunkSize,
         chunkBuckets,
+        chunkEra,
         &result.ent,
     ) catch |e| return .{ .fatal = e };
     result.transformNs = nowNs() - t2;
@@ -255,6 +258,7 @@ fn worker(args: *WorkerArgs) !void {
     const rpcNode = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
     const chunkBuckets = args.chunkBuckets;
+    const chunkEra = args.chunkEra;
 
     var bClient = FetchClient.init(gpa, args.io);
     var rClient = FetchClient.init(gpa, args.io);
@@ -276,7 +280,7 @@ fn worker(args: *WorkerArgs) !void {
         var retryCount: u32 = 0;
 
         retry: while (true) {
-            switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result)) {
+            switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result)) {
                 .ok => {
                     result.ok = true;
                     std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
@@ -291,7 +295,7 @@ fn worker(args: *WorkerArgs) !void {
                     // Block null on primary — try backup before giving up.
                     if (args.backupNode) |backup| {
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result) == .ok) {
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
                             result.ok = true;
                             std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
                                 blockNum,                  result.ent.txs.items.len,
@@ -313,7 +317,7 @@ fn worker(args: *WorkerArgs) !void {
                         if (args.backupNode) |backup| {
                             std.debug.print("[worker] block={d} stuck retry_later x{d} — trying backup\n", .{ blockNum, retryCount });
                             resetResult(result);
-                            if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result) == .ok) {
+                            if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
                                 result.ok = true;
                                 std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
                                     blockNum,                  result.ent.txs.items.len,
@@ -335,12 +339,23 @@ fn worker(args: *WorkerArgs) !void {
                     if (isConnIssue(e)) {
                         const n = args.connErrors.fetchAdd(1, .monotonic) + 1;
                         maybeAlertConnIssues(n);
+                        // Transient connection issue — retry like retry_later before giving up.
+                        if (!args.cancel.load(.acquire)) {
+                            retryCount += 1;
+                            if (retryCount < MAX_RETRY_LATER) {
+                                const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
+                                _ = linux.nanosleep(&ts, null);
+                                resetResult(result);
+                                continue :retry;
+                            }
+                        }
+                        std.debug.print("[worker] block={d} conn issue persisted x{d}: {s}\n", .{ blockNum, retryCount, @errorName(e) });
                     }
                     // Try backup node before marking as skipped.
                     if (args.backupNode) |backup| {
                         std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, result) == .ok) {
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
                             result.ok = true;
                             std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
                                 blockNum,                  result.ent.txs.items.len,
@@ -590,6 +605,7 @@ fn spawnHistoricalWorkers(
     to: u64,
     chan: *ResultChan,
     chunkBuckets: u64,
+    chunkEra: u64,
     cancel: *std.atomic.Value(bool),
     next: *std.atomic.Value(u64),
     threads: []std.Thread,
@@ -606,6 +622,7 @@ fn spawnHistoricalWorkers(
             .to = to,
             .chan = chan,
             .chunkBuckets = chunkBuckets,
+            .chunkEra = chunkEra,
             .cancel = cancel,
             .backupNode = backupNode,
             .connErrors = connErrors,
@@ -657,6 +674,7 @@ fn retryMissingBlocks(
     conns: *HistoricalConns,
     bs: pool.BatchSizes,
     chunkBuckets: u64,
+    chunkEra: u64,
 ) !void {
     if (skipped.len == 0) return;
     std.debug.print("\n[historical] {d} skipped block(s) — retrying...\n", .{skipped.len});
@@ -679,7 +697,7 @@ fn retryMissingBlocks(
         result.blockNum = blockNum;
 
         // Try primary.
-        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, &result)) {
+        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, &result)) {
             .ok => true,
             else => false,
         };
@@ -688,7 +706,7 @@ fn retryMissingBlocks(
         if (!found) {
             if (backupNode) |backup| {
                 resetResult(&result);
-                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, &result)) {
+                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, &result)) {
                     .ok => true,
                     else => false,
                 };
@@ -743,6 +761,7 @@ pub fn runHistorical(
     scyllaPass: []const u8,
     redisUrl: []const u8,
     chunkBuckets: u64,
+    chunkEra: u64,
     saveEvery: usize,
     backupNode: ?EvmRpcNodeConfig,
     log: *Logger,
@@ -775,7 +794,7 @@ pub fn runHistorical(
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
     var connErrors = std.atomic.Value(u64).init(0);
-    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &connErrors);
+    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, chunkEra, &cancel, &next, threads, backupNode, &connErrors);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
@@ -838,5 +857,5 @@ pub fn runHistorical(
 
     // Retry any blocks that were skipped during the main pass, then verify
     // all are present before the caller transitions to realtime mode.
-    try retryMissingBlocks(gpa, io, chain, backupNode, skippedBlocks.items, &conns, bs, chunkBuckets);
+    try retryMissingBlocks(gpa, io, chain, backupNode, skippedBlocks.items, &conns, bs, chunkBuckets, chunkEra);
 }

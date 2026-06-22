@@ -55,6 +55,7 @@ pub fn processBlock(
     blockNum: u64,
     hPool: ?*http_pool.HttpPool,
     chunkBuckets: u64,
+    chunkEra: u64,
     backupNode: ?EvmRpcNodeConfig,
 ) ProcessBlockStatus {
     const rpcNode = chain.rpcNodes.lotosArchiveNode;
@@ -66,14 +67,14 @@ pub fn processBlock(
 
     const t_recv_ms = realtimeMs();
 
-    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &result);
+    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, hPool, &result);
 
     const fetched = switch (primaryStatus) {
         .ok => true,
         .retry_later, .skip_missing => blk: {
             if (backupNode) |backup| {
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, null, &result) == .ok;
             }
             break :blk false;
         },
@@ -82,7 +83,7 @@ pub fn processBlock(
             if (backupNode) |backup| {
                 std.debug.print(" — trying backup\n", .{});
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, null, &result) == .ok;
             }
             std.debug.print("\n", .{});
             break :blk false;
