@@ -153,6 +153,17 @@ fn isConnIssue(e: anyerror) bool {
     };
 }
 
+// Backoff between full primary+backup retry cycles for a block that exhausted both —
+// 1s, 2s, 4s, ... capped at 30s. Never gives up: a node outage longer than this just
+// means the worker spins slowly on this one block while other workers keep progressing.
+fn sleepBackoff(cycleCount: u32) void {
+    const capSec: u32 = 30;
+    const shift = @min(cycleCount, 5); // 2^5 = 32s, already past the cap
+    const sec: u32 = @min(capSec, @as(u32, 1) << @intCast(shift));
+    const ts = linux.timespec{ .sec = sec, .nsec = 0 };
+    _ = linux.nanosleep(&ts, null);
+}
+
 // Fires once per threshold crossing (10, 20, 30, ...) so it can't spam but is
 // still visible immediately, well before a batch finishes.
 fn maybeAlertConnIssues(count: u64) void {
@@ -276,10 +287,17 @@ fn worker(args: *WorkerArgs) !void {
         result.* = BlockResult.init(gpa);
         result.blockNum = blockNum;
 
-        const MAX_RETRY_LATER: u32 = 25; // ~5s of 200ms sleeps before giving up
+        const MAX_RETRY_LATER: u32 = 25; // ~5s of 200ms sleeps before escalating to a full primary+backup cycle retry
         var retryCount: u32 = 0;
+        var cycleCount: u32 = 0; // full primary(+backup)-exhausted cycles — drives backoff, never gives up
 
+        // Historical sync must never silently drop a block: giving up here would let the
+        // accumulator's watermark advance past it (neighboring blocks still succeed), and a
+        // crash before end-of-run retryMissingBlocks runs would lose it permanently — exactly
+        // the gap class this loop exists to prevent. So "exhausted primary+backup" escalates
+        // to a backed-off full-cycle retry instead of ever marking the block skipped.
         retry: while (true) {
+            if (args.cancel.load(.acquire)) break :retry;
             switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result)) {
                 .ok => {
                     result.ok = true;
@@ -292,7 +310,6 @@ fn worker(args: *WorkerArgs) !void {
                     break :retry;
                 },
                 .skip_missing => {
-                    // Block null on primary — try backup before giving up.
                     if (args.backupNode) |backup| {
                         resetResult(result);
                         if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
@@ -301,19 +318,19 @@ fn worker(args: *WorkerArgs) !void {
                                 blockNum,                  result.ent.txs.items.len,
                                 result.ent.logs.items.len, result.ent.internalTxs.items.len,
                             });
-                        } else {
-                            std.debug.print("[worker] block={d} skip_missing on primary and backup\n", .{blockNum});
+                            break :retry;
                         }
-                    } else {
-                        std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
                     }
-                    break :retry;
+                    cycleCount += 1;
+                    std.debug.print("[worker] block={d} skip_missing on primary and backup — retry cycle #{d}, never giving up\n", .{ blockNum, cycleCount });
+                    sleepBackoff(cycleCount);
+                    retryCount = 0;
+                    resetResult(result);
                 },
                 .retry_later => {
                     if (args.cancel.load(.acquire)) break :retry;
                     retryCount += 1;
                     if (retryCount >= MAX_RETRY_LATER) {
-                        // Node persistently failing this block — try backup before giving up.
                         if (args.backupNode) |backup| {
                             std.debug.print("[worker] block={d} stuck retry_later x{d} — trying backup\n", .{ blockNum, retryCount });
                             resetResult(result);
@@ -323,13 +340,15 @@ fn worker(args: *WorkerArgs) !void {
                                     blockNum,                  result.ent.txs.items.len,
                                     result.ent.logs.items.len, result.ent.internalTxs.items.len,
                                 });
-                            } else {
-                                std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — skipping\n", .{ blockNum, retryCount });
+                                break :retry;
                             }
-                        } else {
-                            std.debug.print("[worker] block={d} stuck retry_later x{d} — no backup, skipping\n", .{ blockNum, retryCount });
                         }
-                        break :retry;
+                        cycleCount += 1;
+                        std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — retry cycle #{d}, never giving up\n", .{ blockNum, retryCount, cycleCount });
+                        sleepBackoff(cycleCount);
+                        retryCount = 0;
+                        resetResult(result);
+                        continue :retry;
                     }
                     const ts = linux.timespec{ .sec = 0, .nsec = 200_000_000 };
                     _ = linux.nanosleep(&ts, null);
@@ -339,7 +358,6 @@ fn worker(args: *WorkerArgs) !void {
                     if (isConnIssue(e)) {
                         const n = args.connErrors.fetchAdd(1, .monotonic) + 1;
                         maybeAlertConnIssues(n);
-                        // Transient connection issue — retry like retry_later before giving up.
                         if (!args.cancel.load(.acquire)) {
                             retryCount += 1;
                             if (retryCount < MAX_RETRY_LATER) {
@@ -351,7 +369,6 @@ fn worker(args: *WorkerArgs) !void {
                         }
                         std.debug.print("[worker] block={d} conn issue persisted x{d}: {s}\n", .{ blockNum, retryCount, @errorName(e) });
                     }
-                    // Try backup node before marking as skipped.
                     if (args.backupNode) |backup| {
                         std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
                         resetResult(result);
@@ -361,13 +378,14 @@ fn worker(args: *WorkerArgs) !void {
                                 blockNum,                  result.ent.txs.items.len,
                                 result.ent.logs.items.len, result.ent.internalTxs.items.len,
                             });
-                        } else {
-                            std.debug.print("[worker] block={d} unavailable on all nodes — skipping\n", .{blockNum});
+                            break :retry;
                         }
-                    } else {
-                        std.debug.print("[worker] block={d} error: {s} — no backup, skipping\n", .{ blockNum, @errorName(e) });
                     }
-                    break :retry;
+                    cycleCount += 1;
+                    std.debug.print("[worker] block={d} error: {s} on all nodes — retry cycle #{d}, never giving up\n", .{ blockNum, @errorName(e), cycleCount });
+                    sleepBackoff(cycleCount);
+                    retryCount = 0;
+                    resetResult(result);
                 },
             }
         }
