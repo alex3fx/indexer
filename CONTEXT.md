@@ -52,11 +52,12 @@ retry-логики (вызвавшей segfault — баг конкретно т
 Базовые коммиты (до этой задачи): `79760c9` "resilient historical sync — FETCH_WORKERS, conn-error
 alerting, backup-node retry", `23ee106` "Polygon (chain 137) support with configurable save lanes".
 
-**Ветка `polygon` не запушена** — всё локально на этой машине. ⚠️ Локальный `dev_test` (откуда
-ветвилась `polygon`, точка `79760c9`) **разошёлся** с `github/dev_test` (там более новая история:
-`45f2cda`/`88460c2`/`ea89363` — node-probe auto-detect и др., которых нет в нашей базе). Прежде чем
-мержить `polygon` обратно — нужно ребейзнуть/смержить актуальный `github/dev_test` (см. "Известные
-ограничения" про auth — `git fetch` с этой машины не работает, нужна помощь пользователя).
+**Ветка `polygon` не запушена** — всё локально на этой машине. Проверено (`merge-base
+--is-ancestor`): `github/dev_test` (45f2cda) — это **предок** локального `dev_test`, НЕ
+разошедшаяся ветка — локальный `dev_test` просто на 9 коммитов впереди (чистый fast-forward,
+включает node-probe auto-detect и всё остальное из github). `polygon` ветвится от `dev_test`
+@79760c9, поэтому уже содержит всё нужное. Мержить/ребейзить ничего не требуется — можно просто
+запушить `polygon` (или fast-forward `dev_test` → `polygon`) когда будет доступ.
 
 ## Инфраструктура
 
