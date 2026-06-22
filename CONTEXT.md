@@ -1,0 +1,160 @@
+# Контекст проекта — Polygon indexer, миграция на новую chunk-схему
+
+_Последнее обновление: 2026-06-22 (вечер)_
+
+## Задача
+
+Полная переиндексация блокчейна Polygon (chain 137) с новой схемой партиционирования Scylla:
+`chunk = (block_number % 64) + 64 * (block_number / 32000)` (v3-схема — "lane+era") вместо старой
+`chunk = block_number % 24`. Причина перехода — старая схема создавала неограниченно растущие
+партиции; см. историю в памяти `project_v3_indexer_relaunch`, `feedback_data_integrity_priority`.
+
+База данных была **полностью очищена** 2026-06-22 (TRUNCATE всех таблиц + Redis-чекпоинт) и
+индексация идёт **с нуля** в новую схему. Старые `_v2`/`_v3` экспериментальные таблицы от
+предыдущей (неудавшейся) попытки миграции остались в Scylla, но больше не используются — можно
+дропнуть когда будет время, не приоритет.
+
+## ⚠️ Важный инцидент: неправильный репозиторий
+
+Первая попытка релонча (2026-06-22, днём) была сделана в `/home/alex/lotos/task1/indexer/indexer`
+— это **другой, заброшенный репозиторий** (2 коммита: "init", "add db check and more"), НЕ тот,
+что реально используется. Там были потрачены часы на: добавление v3-схемы, добавление/откат
+retry-логики (вызвавшей segfault — баг конкретно того репозитория, см. память
+`feedback_retry_without_reconnect_unsafe`, **не актуально для этого репозитория**).
+
+Реальный репозиторий — этот (`devindexer/indexer`, ветка `dev_test`), с богатой историей
+(FETCH_WORKERS, GrayLog, backup-node retry, per-block метрики, dual-node split — всё то, что
+упоминалось в памяти проекта, но отсутствовало в неправильном репо). Вся работа перенесена сюда
+2026-06-22 вечером. Подробности инцидента — память `feedback_wrong_repo_incident`.
+
+**Урок:** перед началом работы с кодом — всегда проверять `git log --oneline -10` и `git branch -a`,
+сверяясь с тем, что описано здесь, а не доверять первой найденной похожей директории.
+
+## Текущий статус кода (ветка `dev_test`)
+
+Коммиты, сделанные в рамках этой задачи (свежие → старые):
+1. `9b9ed50` — снижен `batchSizeLogs`/`batchSizeItxs` (1000/2000 → 200/200) в
+   `src/core/constants/chains/evm/polygon.zig` — фикс краша `[CQL ERROR] Batch too large` на
+   плотных блоках `.63` (см. "Открытые проблемы" ниже — статус: похоже исправлено, проверяется).
+2. `93b17a4` — добавлена v3 chunk-схема:
+   - `src/pipeline/transformer.zig` — `transformBlockWithRemap` получил параметр `chunkEra: u64`;
+     формула `chunk=(block%chunkBuckets)+chunkBuckets*(block/chunkEra)` когда оба >0
+   - `src/main.zig` — новая env `SCYLLA_CHUNK_ERA` (0 = старое поведение)
+   - `src/pipeline/pipeline.zig`, `src/pipeline/writer.zig` — `chunkEra` протянут механически
+     рядом с `chunkBuckets` везде (без изменения поведения при `chunkEra=0`)
+   - Этот же коммит сохранил предсуществующий некоммиченный фикс: `AddressUnavailable`/
+     `ProcessFdQuotaExceeded`/`HttpConnectionClosing` в `isConnIssue` + retry-перед-skip для
+     transient conn issues (был внесён в более ранней сессии, не запушен)
+
+Базовые коммиты (до этой задачи): `79760c9` "resilient historical sync — FETCH_WORKERS, conn-error
+alerting, backup-node retry", `23ee106` "Polygon (chain 137) support with configurable save lanes".
+
+**Не запушено в origin** — всё локально на этой машине. `origin/dev_test` (github) и
+`origin/main`/`origin/dev` (bitbucket) могут отличаться, не проверено (см. "Известные ограничения"
+ниже про auth).
+
+## Инфраструктура
+
+### Сервер 100.64.0.64 (прод, Scylla + Redis + индексер)
+- ssh: `ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.64`
+- Scylla: docker-контейнер `scylla`, keyspace `pol`, `cassandra/cassandra`, host-networking
+  (доступен на `127.0.0.1:9042` с хоста)
+- Redis: docker-контейнер `redis-pol`, `127.0.0.1:6379`, db=0, ключ чекпоинта
+  `LATEST_PROCESSED_BLOCK_NUMBER` (⚠️ общий на оба узла — при dual-node split НЕ используется для
+  резюме, см. ниже)
+- Бинарь: `/data/pol_index/raw_pol_v3` (ReleaseFast, собран из этого репо)
+
+### RPC-ноды Polygon
+- `.62` = `100.64.0.62:8545` (+ WSS `:8546`) — основной для диапазона `[0, 31124773]`
+- `.63` = `100.64.0.63:8545` (+ WSS `:8546`) — основной для диапазона `[31124774, ~89M]`
+- Backup/reserve: `https://polygon-bor-rpc.publicnode.com` (публичный, подтверждён живым)
+- Граница сплита `31124774` — историческая, подобрана по балансу скорости узлов (см. память
+  `project_polygon_dual_node`)
+
+### GrayLog (логи/мониторинг)
+- Ingestion (GELF/TCP): `144.76.108.185:12201`
+- Web UI: `https://graylog.lotos-team.com` (логин см. память `project_logger_graylog`)
+- App-имена сейчас в использовании: `indexer-pol-62-v3`, `indexer-pol-63-v3`,
+  `indexer-pol-62-tuner`, `indexer-pol-63-tuner`
+
+### Запуск (dual-node + динамический тюнер)
+Старые статичные bash-обёртки (`run_62_v3.sh`/`run_63_v3.sh`,
+`/data/pol_index/full_index_run/`) — заменены на **`dynamic_tuner.py`** (копия в
+`/home/alex/lotos/task1/tools/dynamic_tuner.py`, задеплоена в
+`/data/pol_index/full_index_run/dynamic_tuner.py`).
+
+Запуск (на сервере, раздельными ssh-вызовами из-за nohup-бага):
+```bash
+cd /data/pol_index/full_index_run
+nohup python3 dynamic_tuner.py 62 http://100.64.0.62:8545 <FROM> 31124773 >> tuner_62.log 2>&1 &
+nohup python3 dynamic_tuner.py 63 http://100.64.0.63:8545 <FROM> 89000000 >> tuner_63.log 2>&1 &
+```
+`<FROM>` — для резюме после рестарта: `grep -oP 'Accum \d+→\K\d+' tuner_NN.log` (сам tuner это
+делает автоматически через `resume_from()`, читая `run_NN_v3.log`).
+
+**Что делает tuner** (`tools/dynamic_tuner.py`):
+- Пробует `FETCH_WORKERS` ∈ {100,200,300,400} по 90с каждый, измеряет blk/s и connection errors
+  (`[ALERT] N connection errors` из лога), выбирает лучший без чрезмерных ошибок
+- На "steady" период (30 мин) — следит за: (а) connection errors (если +10 за 30с — снижает
+  FETCH_WORKERS ×0.6), (б) частотой рестартов процесса (если 3+ рестарта за 5 минут — тоже снижает
+  ×0.6, это ловит Scylla-side ошибки типа "Batch too large", не только RPC-проблемы)
+- После 30 минут steady — переребирает в окрестности текущего значения
+- Шлёт все решения в GrayLog (`indexer-pol-NN-tuner` app)
+- **Известное упущение**: пока НЕ повышает FETCH_WORKERS снизу вверх автоматически после
+  длительной стабильности — только держит текущий, либо снижает. Если нужно увеличение нагрузки
+  обратно после backoff — придётся подождать следующего штатного re-probe цикла (30 мин) или
+  перезапустить вручную.
+
+## Открытые проблемы / задачи (см. также TaskList в Claude Code, если сессия продолжается)
+
+1. **`[CQL ERROR] Batch too large`** — ✅ **ИСПРАВЛЕНО** (подтверждено 2026-06-22 вечером). Частые
+   краши `.63` на плотных блоках (много logs/internal_transactions на блок). Причина:
+   `batchSizeLogs=1000`, `batchSizeItxs=2000` в `polygon.zig`. Фикс: снижено до 200/200 (коммит
+   `9b9ed50`). Подтверждение: 0 новых случаев за 19000+ строк лога / несколько полных раундов
+   проб FETCH_WORKERS с 0 рестартов процесса после редеплоя (было: рестарт каждые ~100с). Задача
+   #16 закрыта. Если когда-нибудь повторится — снизить ещё (до 100/100), либо разобраться, почему
+   400KB frame-split в `src/db/pool.zig:452` не предотвращает это полностью (не срабатывает, если
+   `rowBufs.len == 1`, т.е. единственная строка сама по себе огромная).
+
+2. **Старый сегфолт в "неправильном" репозитории** (`indexer/indexer`) — НЕ актуален для этого
+   репозитория, можно игнорировать / не переносить сюда. Был в RPC keep-alive connection pool
+   того (другого) кодового пути.
+
+3. **Dual-node Redis-чекпоинт коллизия** — `LATEST_PROCESSED_BLOCK_NUMBER` общий ключ. Решение
+   (как и в исходных bash-обёртках): резюмировать НЕ через Redis, а через grep последней
+   `Accum X→Y` строки из СВОЕГО лог-файла каждого узла. `dynamic_tuner.py` это уже делает
+   правильно.
+
+4. **Tuner не повышает FETCH_WORKERS обратно после backoff** (см. выше) — можно доработать, если
+   окажется, что это реальная проблема на практике (пока не критично, раз ёще не roll out на
+   длинный прогон).
+
+5. **`_v2`/`_v3` тестовые таблицы от прошлой попытки** — остались в Scylla, не используются,
+   можно DROP при случае (не приоритет).
+
+## Известные ограничения этой сессии
+
+- `git fetch origin` из этой машины **не работает** (bitbucket просит пароль интерактивно, нет
+  сохранённых credentials в неинтерактивном виде). Если нужно синхронизировать с remote — попросить
+  пользователя выполнить `git fetch`/`git push` вручную (через `!` префикс в Claude Code, у
+  пользователя есть сохранённые credentials).
+- Ветки в этом репозитории: `dev_test` (рабочая, текущая), `alex_dev`, `alex_erc20`, `dev`,
+  `worktree-agent-ace75276bdbb944dc` (старый Claude Code worktree, возможно стоит проверить на
+  незакоммиченную работу), `remotes/github/dev_test`, `remotes/origin/{HEAD,alex_dev,dev}`.
+
+## Память Claude Code (если сессия продолжается с тем же memory-индексом)
+
+Релевантные записи (project root `-home-alex-lotos-task1`):
+- `project_v3_indexer_relaunch` — главный лог этой задачи
+- `feedback_wrong_repo_incident` — инцидент с неправильным репо
+- `feedback_data_integrity_priority`, `feedback_two_stage_verification` — принципы целостности
+  данных, выработанные в ходе предыдущей (неудавшейся) попытки миграции v2→v3
+- `feedback_retry_without_reconnect_unsafe` — НЕ актуально для этого репо (баг другого кодового пути)
+- `project_polygon_dual_node` — историческая информация по сплиту узлов/скоростям
+- `project_logger_graylog` — детали GrayLog интеграции (credentials, формат событий)
+- `feedback_zig_017dev` — особенности Zig 0.17-dev API
+- `feedback_save_tool_sources` — правило хранения вспомогательных скриптов в `tools/`
+
+Если сессия стартует **в этой папке** (`devindexer/indexer`) как отдельный проект — Claude Code
+может не подхватить эту память автоматически (она привязана к другому project root). В этом случае
+весь нужный контекст уже продублирован в этом файле и в `CLAUDE.md` рядом.
