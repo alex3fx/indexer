@@ -104,6 +104,16 @@ fn preallocBuf(est: usize) std.ArrayList(u8) {
 // Max rows per batch — stack arrays sized to this to avoid heap allocs.
 const MAX_BS: usize = 2000;
 
+// Batches for variable-size tables (txs/logs/itxs/contracts) are flushed by
+// accumulated encoded byte size rather than fixed row count — dense Polygon
+// blocks post-merge can carry rows whose encoded size varies by 100x (huge
+// calldata/log data/bytecode), so a fixed row count either wastes round-trips
+// on tiny rows or builds an oversized batch that Scylla rejects as "Batch too
+// large". Kept well under batch_size_warn_threshold_in_kb (128KB on prod) to
+// leave headroom; pool.zig's recursive byte-size split is the remaining
+// backstop for a single pathologically large row.
+const SIZE_BUDGET_BYTES: usize = 64 * 1024;
+
 // ─── Save a single block's entities ──────────────────────────────────────────
 
 pub fn saveBlock(conn: *CqlConn, ent: *const Entities, bs: BatchSizes) !void {
@@ -362,209 +372,204 @@ fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
 }
 
 fn saveTxs(conn: *CqlConn, rows: []const TxRow, bs: usize) !void {
+    _ = bs;
     if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
     var v = preallocBuf(512);
     defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 512);
+    var bd = preallocBuf(SIZE_BUDGET_BYTES + 4096);
     defer bd.deinit(tempAllocator);
     var starts: [MAX_BS + 1]usize = undefined;
     var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valInt32(&v, r.chunk);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valInt32(&v, r.transactionIndex);
-            try pool.valTextRequired(&v, r.hash);
-            try pool.valBigint(&v, r.blockTimestampS);
-            try pool.valBigint(&v, r.blockTimestampMs);
-            try pool.valText(&v, r.methodId);
-            try pool.valText(&v, r.input);
-            try pool.valTextRequired(&v, r.fromAddress);
-            try pool.valText(&v, r.toAddress);
-            try pool.valVarint(&v, r.value);
-            try pool.valBigint(&v, r.gasLimit);
-            try pool.valBigint(&v, r.gasPrice);
-            try pool.valBigint(&v, r.gasUsed);
-            try pool.valBigint(&v, r.maxPriorityFee);
-            try pool.valBigint(&v, r.maxFee);
-            try pool.valBigint(&v, r.cumulativeGasUsed);
-            try pool.valBigint(&v, r.effectiveGasPrice);
-            try pool.valText(&v, r.contractAddress);
-            try pool.valTinyint(&v, r.status);
-            try pool.valTinyint(&v, r.txType);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
+    var enc: usize = 0;
+    bd.items.len = 0;
+    for (rows, 0..) |r, j| {
+        v.items.len = 0;
+        try pool.valInt32(&v, r.chunk);
+        try pool.valBigint(&v, r.blockNumber);
+        try pool.valInt32(&v, r.transactionIndex);
+        try pool.valTextRequired(&v, r.hash);
+        try pool.valBigint(&v, r.blockTimestampS);
+        try pool.valBigint(&v, r.blockTimestampMs);
+        try pool.valText(&v, r.methodId);
+        try pool.valText(&v, r.input);
+        try pool.valTextRequired(&v, r.fromAddress);
+        try pool.valText(&v, r.toAddress);
+        try pool.valVarint(&v, r.value);
+        try pool.valBigint(&v, r.gasLimit);
+        try pool.valBigint(&v, r.gasPrice);
+        try pool.valBigint(&v, r.gasUsed);
+        try pool.valBigint(&v, r.maxPriorityFee);
+        try pool.valBigint(&v, r.maxFee);
+        try pool.valBigint(&v, r.cumulativeGasUsed);
+        try pool.valBigint(&v, r.effectiveGasPrice);
+        try pool.valText(&v, r.contractAddress);
+        try pool.valTinyint(&v, r.status);
+        try pool.valTinyint(&v, r.txType);
         starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.transactions, TX_COLS, ptrs[0..enc]);
-        i = end;
+        try bd.appendSlice(tempAllocator, v.items);
+        enc += 1;
+
+        if (enc == MAX_BS or bd.items.len >= SIZE_BUDGET_BYTES or j == rows.len - 1) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.transactions, TX_COLS, ptrs[0..enc]);
+            bd.items.len = 0;
+            enc = 0;
+        }
     }
 }
 
 fn saveLogs(conn: *CqlConn, rows: []const LogRow, bs: usize) !void {
+    _ = bs;
     if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
     var v = preallocBuf(512);
     defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 512);
+    var bd = preallocBuf(SIZE_BUDGET_BYTES + 4096);
     defer bd.deinit(tempAllocator);
     var starts: [MAX_BS + 1]usize = undefined;
     var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valInt32(&v, r.chunk);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valInt32(&v, r.transactionIndex);
-            try pool.valInt32(&v, r.logIndex);
-            try pool.valBigint(&v, r.blockTimestampS);
-            try pool.valBigint(&v, r.blockTimestampMs);
-            try pool.valTextRequired(&v, r.address);
-            try pool.valTextRequired(&v, r.data);
-            try pool.valText(&v, r.topicZeroth);
-            try pool.valText(&v, r.topicFirst);
-            try pool.valText(&v, r.topicSecond);
-            try pool.valText(&v, r.topicThird);
-            try pool.valListText(&v, r.restTopics);
-            try pool.valTextRequired(&v, r.transactionHash);
-            try pool.valBool(&v, r.removed);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
+    var enc: usize = 0;
+    bd.items.len = 0;
+    for (rows, 0..) |r, j| {
+        v.items.len = 0;
+        try pool.valInt32(&v, r.chunk);
+        try pool.valBigint(&v, r.blockNumber);
+        try pool.valInt32(&v, r.transactionIndex);
+        try pool.valInt32(&v, r.logIndex);
+        try pool.valBigint(&v, r.blockTimestampS);
+        try pool.valBigint(&v, r.blockTimestampMs);
+        try pool.valTextRequired(&v, r.address);
+        try pool.valTextRequired(&v, r.data);
+        try pool.valText(&v, r.topicZeroth);
+        try pool.valText(&v, r.topicFirst);
+        try pool.valText(&v, r.topicSecond);
+        try pool.valText(&v, r.topicThird);
+        try pool.valListText(&v, r.restTopics);
+        try pool.valTextRequired(&v, r.transactionHash);
+        try pool.valBool(&v, r.removed);
         starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.logs, LOG_COLS, ptrs[0..enc]);
-        i = end;
+        try bd.appendSlice(tempAllocator, v.items);
+        enc += 1;
+
+        if (enc == MAX_BS or bd.items.len >= SIZE_BUDGET_BYTES or j == rows.len - 1) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.logs, LOG_COLS, ptrs[0..enc]);
+            bd.items.len = 0;
+            enc = 0;
+        }
     }
 }
 
 fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow, bs: usize) !void {
+    _ = bs;
     if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
     var v = preallocBuf(192);
     defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 192);
+    var bd = preallocBuf(SIZE_BUDGET_BYTES + 4096);
     defer bd.deinit(tempAllocator);
     var starts: [MAX_BS + 1]usize = undefined;
     var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valInt32(&v, r.chunk);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valBigint(&v, r.blockTimestampS);
-            try pool.valBigint(&v, r.blockTimestampMs);
-            try pool.valInt32(&v, r.transactionIndex);
-            try pool.valTextRequired(&v, r.transactionHash);
-            try pool.valInt32(&v, r.traceIndex);
-            try pool.valTextRequired(&v, r.fromAddress);
-            try pool.valTextRequired(&v, r.toAddress);
-            try pool.valVarint(&v, r.value);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
+    var enc: usize = 0;
+    bd.items.len = 0;
+    for (rows, 0..) |r, j| {
+        v.items.len = 0;
+        try pool.valInt32(&v, r.chunk);
+        try pool.valBigint(&v, r.blockNumber);
+        try pool.valBigint(&v, r.blockTimestampS);
+        try pool.valBigint(&v, r.blockTimestampMs);
+        try pool.valInt32(&v, r.transactionIndex);
+        try pool.valTextRequired(&v, r.transactionHash);
+        try pool.valInt32(&v, r.traceIndex);
+        try pool.valTextRequired(&v, r.fromAddress);
+        try pool.valTextRequired(&v, r.toAddress);
+        try pool.valVarint(&v, r.value);
         starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
-        i = end;
+        try bd.appendSlice(tempAllocator, v.items);
+        enc += 1;
+
+        if (enc == MAX_BS or bd.items.len >= SIZE_BUDGET_BYTES or j == rows.len - 1) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
+            bd.items.len = 0;
+            enc = 0;
+        }
     }
 }
 
 fn saveContracts(conn: *CqlConn, rows: []const ContractRow, bs: usize) !void {
+    _ = bs;
     if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
     var v = preallocBuf(1024);
     defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% @as(usize, 1024));
+    var bd = preallocBuf(SIZE_BUDGET_BYTES + 4096);
     defer bd.deinit(tempAllocator);
     var starts: [MAX_BS + 1]usize = undefined;
     var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valInt32(&v, r.chunk);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valInt32(&v, r.transactionIndex);
-            try pool.valTextRequired(&v, r.transactionHash);
-            try pool.valInt32(&v, r.traceIndex);
-            try pool.valBigint(&v, r.blockTimestampS);
-            try pool.valBigint(&v, r.blockTimestampMs);
-            try pool.valTextRequired(&v, r.address);
-            try pool.valTinyint(&v, r.creationMethod);
-            try pool.valTextRequired(&v, r.creatorAddress);
-            try pool.valText(&v, r.contractFactory);
-            try pool.valTextRequired(&v, r.creationBytecode);
-            try pool.valTextRequired(&v, r.deployedBytecode);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
+    var enc: usize = 0;
+    bd.items.len = 0;
+    for (rows, 0..) |r, j| {
+        v.items.len = 0;
+        try pool.valInt32(&v, r.chunk);
+        try pool.valBigint(&v, r.blockNumber);
+        try pool.valInt32(&v, r.transactionIndex);
+        try pool.valTextRequired(&v, r.transactionHash);
+        try pool.valInt32(&v, r.traceIndex);
+        try pool.valBigint(&v, r.blockTimestampS);
+        try pool.valBigint(&v, r.blockTimestampMs);
+        try pool.valTextRequired(&v, r.address);
+        try pool.valTinyint(&v, r.creationMethod);
+        try pool.valTextRequired(&v, r.creatorAddress);
+        try pool.valText(&v, r.contractFactory);
+        try pool.valTextRequired(&v, r.creationBytecode);
+        try pool.valTextRequired(&v, r.deployedBytecode);
         starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
-        i = end;
+        try bd.appendSlice(tempAllocator, v.items);
+        enc += 1;
+
+        if (enc == MAX_BS or bd.items.len >= SIZE_BUDGET_BYTES or j == rows.len - 1) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
+            bd.items.len = 0;
+            enc = 0;
+        }
     }
 }
 
 fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow, bs: usize) !void {
+    _ = bs;
     if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
     var v = preallocBuf(512);
     defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 512);
+    var bd = preallocBuf(SIZE_BUDGET_BYTES + 4096);
     defer bd.deinit(tempAllocator);
     var starts: [MAX_BS + 1]usize = undefined;
     var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valTextRequired(&v, r.address);
-            try pool.valTextRequired(&v, r.creator);
-            try pool.valTextRequired(&v, r.txHash);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valBigint(&v, r.timestamp);
-            try pool.valText(&v, r.contractFactory);
-            try pool.valTextRequired(&v, r.creationBytecode);
-            try pool.valTextRequired(&v, r.deployedBytecode);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
+    var enc: usize = 0;
+    bd.items.len = 0;
+    for (rows, 0..) |r, j| {
+        v.items.len = 0;
+        try pool.valTextRequired(&v, r.address);
+        try pool.valTextRequired(&v, r.creator);
+        try pool.valTextRequired(&v, r.txHash);
+        try pool.valBigint(&v, r.blockNumber);
+        try pool.valBigint(&v, r.timestamp);
+        try pool.valText(&v, r.contractFactory);
+        try pool.valTextRequired(&v, r.creationBytecode);
+        try pool.valTextRequired(&v, r.deployedBytecode);
         starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
-        i = end;
+        try bd.appendSlice(tempAllocator, v.items);
+        enc += 1;
+
+        if (enc == MAX_BS or bd.items.len >= SIZE_BUDGET_BYTES or j == rows.len - 1) {
+            starts[enc] = bd.items.len;
+            for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+            try conn.batchSendRows(conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
+            bd.items.len = 0;
+            enc = 0;
+        }
     }
 }
 

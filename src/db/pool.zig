@@ -88,6 +88,7 @@ const OPCODE_STARTUP: u8 = 0x01;
 const OPCODE_AUTH_RESP: u8 = 0x0F;
 const OPCODE_QUERY: u8 = 0x07;
 const OPCODE_PREPARE: u8 = 0x09;
+const OPCODE_EXECUTE: u8 = 0x0A;
 const OPCODE_BATCH: u8 = 0x0D;
 const OPCODE_READY: u8 = 0x02;
 const OPCODE_AUTH: u8 = 0x03;
@@ -426,8 +427,31 @@ pub const CqlConn = struct {
         }
     }
 
+    // Single-statement EXECUTE — not subject to Scylla's batch_size_fail_threshold_in_kb,
+    // which applies even to a BATCH containing just one statement. Used as the floor for
+    // batchSendRows' size-based split, so one pathologically large row (e.g. contract
+    // bytecode) can never be rejected by the batch-size limit, only the (much larger)
+    // native protocol frame size limit.
+    pub fn executeRow(self: *CqlConn, prepId: []const u8, nVals: u16, rowBuf: []const u8) !void {
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(tempAllocator);
+        var tmp: [2]u8 = undefined;
+        std.mem.writeInt(u16, &tmp, @intCast(prepId.len), .big);
+        try frame.appendSlice(tempAllocator, &tmp);
+        try frame.appendSlice(tempAllocator, prepId);
+        std.mem.writeInt(u16, &tmp, CONSISTENCY_ONE, .big);
+        try frame.appendSlice(tempAllocator, &tmp);
+        try frame.append(tempAllocator, 0x01); // flags: VALUES present
+        std.mem.writeInt(u16, &tmp, nVals, .big);
+        try frame.appendSlice(tempAllocator, &tmp);
+        try frame.appendSlice(tempAllocator, rowBuf);
+        try self.sendFrame(OPCODE_EXECUTE, frame.items);
+        try self.recvFrameCheck();
+    }
+
     pub fn batchSendRows(self: *CqlConn, prepId: []const u8, nVals: u16, rowBufs: []const []const u8) !void {
         if (rowBufs.len == 0) return;
+        if (rowBufs.len == 1) return self.executeRow(prepId, nVals, rowBufs[0]);
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(tempAllocator);
         frame.ensureTotalCapacity(tempAllocator, 10 + rowBufs.len * (5 + prepId.len + 300)) catch {};
