@@ -100,6 +100,65 @@ const CONSISTENCY_ONE: u16 = 0x0001;
 // Temporary allocator for CQL frame buffers. Lifetime: within each function call.
 pub const tempAllocator = std.heap.page_allocator;
 
+// ─── Best-effort GELF alert for CqlError ──────────────────────────────────────
+// CqlConn has no Logger (would need a TCP socket per save-worker thread); instead
+// main.zig sets these once at startup, before any worker threads are spawned, and
+// every connection's recvFrameCheck fires a one-shot GELF send on CqlError. This is
+// the only place "Batch too large" (and any other Scylla-side rejection) becomes
+// visible in GrayLog — previously it only ever reached the raw stdout log file.
+var alertHost: []const u8 = "127.0.0.1";
+var alertPort: u16 = 12201;
+var alertApp: []const u8 = "indexer";
+var alertEnabled: bool = false;
+
+pub fn configureAlerts(host: []const u8, port: u16, app: []const u8, enabled: bool) void {
+    alertHost = host;
+    alertPort = port;
+    alertApp = app;
+    alertEnabled = enabled;
+}
+
+fn alertCqlError(code: i32, msg: []const u8) void {
+    if (!alertEnabled) return;
+    const fd = tcpConnect(alertHost, alertPort) catch return;
+    defer _ = linux.close(fd);
+
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    const tsFrac: u32 = @intCast(@divTrunc(ts.nsec, 1_000_000));
+
+    var escBuf: [400]u8 = undefined;
+    var escLen: usize = 0;
+    for (msg) |c| {
+        if (escLen + 2 > escBuf.len) break;
+        switch (c) {
+            '"' => {
+                escBuf[escLen] = '\\';
+                escBuf[escLen + 1] = '"';
+                escLen += 2;
+            },
+            '\\' => {
+                escBuf[escLen] = '\\';
+                escBuf[escLen + 1] = '\\';
+                escLen += 2;
+            },
+            '\n', '\r', '\t' => {},
+            else => {
+                escBuf[escLen] = c;
+                escLen += 1;
+            },
+        }
+    }
+
+    var payloadBuf: [600]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payloadBuf,
+        "{{\"version\":\"1.1\",\"host\":\"{s}\",\"short_message\":\"CqlError code=0x{x:0>4}: {s}\",\"level\":3,\"timestamp\":{d}.{d:0>3}}}\x00",
+        .{ alertApp, code, escBuf[0..escLen], ts.sec, tsFrac },
+    ) catch return;
+    tcpWrite(fd, payload) catch {};
+}
+
 // ─── CQL value encoding ───────────────────────────────────────────────────────
 
 fn appendShort(list: *std.ArrayList(u8), v: u16) !void {
@@ -405,7 +464,10 @@ pub const CqlConn = struct {
         const opcode = header[4];
         const bodyLen = std.mem.readInt(u32, header[5..9], .big);
         if (bodyLen == 0) {
-            if (opcode == OPCODE_ERROR) return error.CqlError;
+            if (opcode == OPCODE_ERROR) {
+                alertCqlError(-1, "");
+                return error.CqlError;
+            }
             return;
         }
         var tmp: [512]u8 = undefined;
@@ -416,6 +478,7 @@ pub const CqlConn = struct {
             const msgLen = if (readLen >= 6) std.mem.readInt(u16, tmp[4..6], .big) else 0;
             const msg = tmp[6..@min(6 + @as(usize, msgLen), readLen)];
             std.debug.print("[CQL ERROR] code=0x{x:0>4} msg={s}\n", .{ code, msg });
+            alertCqlError(code, msg);
             return error.CqlError;
         }
         var remain: usize = bodyLen -| readLen;

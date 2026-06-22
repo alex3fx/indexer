@@ -248,10 +248,25 @@ pub fn main(init: Init) !void {
     defer log.deinit();
     log.info("EVM indexer starting");
 
-    const chain = core.getEvmChainConfig(runtime.details.evmChainId) orelse {
+    // CqlConn save-worker threads have no Logger of their own — let pool.zig fire
+    // its own one-shot GELF alert on CqlError ("Batch too large" etc.) using the
+    // same GrayLog endpoint, set once here before any worker threads spawn.
+    pool.configureAlerts(env.LOGS_GRAYLOG_HOST, env.LOGS_GRAYLOG_PORT, env.LOGS_GRAYLOG_APP, runtime.details.isDev or runtime.details.isProd);
+
+    var chain = core.getEvmChainConfig(runtime.details.evmChainId) orelse {
         log.err("Unsupported chain");
         return error.UnsupportedChain;
     };
+
+    // RPC_URL/RPC_WSS override the hardcoded primary node (chain config default) —
+    // needed to run independent indexer processes against different physical RPC
+    // nodes (e.g. dual-node split), since the static chain config only has one.
+    if (init.environ_map.get("RPC_URL")) |url| {
+        if (url.len > 0) chain.rpcNodes.lotosArchiveNode.https = url;
+    }
+    if (init.environ_map.get("RPC_WSS")) |wss| {
+        if (wss.len > 0) chain.rpcNodes.lotosArchiveNode.wss = wss;
+    }
 
     const cli = try parseCli(init);
 
@@ -301,6 +316,12 @@ pub fn main(init: Init) !void {
     );
 
     // ── Backup RPC node (optional) ────────────────────────────────────────────
+    // NOTE: dynamic_tuner.py actually sets RESERVE_RPC_URL (not BACKUP_RPC_HTTPS),
+    // so this has been silently inert in production. Tried wiring RESERVE_RPC_URL
+    // in here too, but the configured reserve (https://polygon-bor-rpc.publicnode.com)
+    // crashes node_probe.detect() with SIGILL — the RPC client/probe path doesn't
+    // handle https:// (TLS) correctly. Left reading only BACKUP_RPC_HTTPS for now
+    // (still inert, but safe) until the HTTPS path is fixed separately.
     const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
         if (url.len > 0) EvmRpcNodeConfig{
             .https = url,
