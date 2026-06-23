@@ -496,6 +496,22 @@ ML-KEM патча в проде — ReleaseFast всё равно бы краш�
 После этого `.63` успешно продолжил с `38155358`. Этот приём (дописать `[watermark] N` строку
 вручную) — рабочий способ форсированно продвинуть resume-точку в будущем, если #7 не выручит.
 
+**✅ Блок `37343867` восстановлен (2026-06-23, после деплоя задачи #4)**: запущен изолированный
+одноблочный прогон (`--from=37343867 --to=37343867`, отдельный throwaway Redis `db=13`, чтобы не
+трогать прод-watermark/checkpoint) с `RPC_URL=http://100.64.0.62:8545` (primary) и
+`RESERVE_RPC_URL=https://polygon.drpc.org` (backup). Перед этим напрямую curl'ом перебрано
+несколько публичных Polygon RPC на предмет того, кто реально отдаёт `trace`/`debug_trace` без
+платной подписки: `polygon-bor-rpc.publicnode.com` и `polygon-pokt.nodies.app` — `trace_block`
+требует платный план (`-32602`/`-32601`); **`polygon.drpc.org` (Geth-style,
+`debug_traceBlockByNumber`) и `polygon.gateway.tenderly.co`** — оба отдали полный трейс (115
+вызовов, ~574KB) за ~2.9с без авторизации. Прогон: primary `.62` ожидаемо хватил `FetchTimeout`
+(45с) на этом блоке, переключился на backup `drpc.org` и сохранил блок за один проход
+(`T:115 L:465 IT:511`, `Accum 37343867→37343867: saved=1`, `[watermark] integrity check passed`).
+Проверено напрямую в Scylla: `pol.blocks`/`pol.transactions`(115)/`pol.logs`(465)/
+`pol.internal_transactions`(511) по `chunk=74683, block_number=37343867` — все совпадают с логом.
+`pol.skipped_blocks` обновлена (`resolved=true`). Повторный `find_missing_blocks.py` на
+`[31124774, 38780012]` — **0 пропусков**. Диапазон `.63` полностью цел.
+
 ## Задача #7 — решена
 
 Реализовано как и планировалось: добавлены `Conn.incr(key) !i64` и `Conn.del(key)` (RESP
