@@ -1,6 +1,106 @@
 # Контекст проекта — Polygon indexer, миграция на новую chunk-схему
 
-_Последнее обновление: 2026-06-22 (вечер)_
+_Последнее обновление: 2026-06-23 (вечер)_
+
+## 🔧 ШПАРГАЛКА — критические операции (читать первым в новой сессии)
+
+Сервер: `ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.64`. Рабочая директория на сервере:
+`/data/pol_index/full_index_run/`. Текущий боевой бинарь: **`/data/pol_index/raw_pol_v3_neighbor`**
+(timeout-фикс + neighbor-fallback + explicit skip, см. историю ниже — это НЕ финальное имя, при
+следующем фиксе появится новый суффикс; всегда проверяй `ps aux | grep raw_pol_v3` чтобы узнать
+актуальный). Канонический тюнер-скрипт — `tools/dynamic_tuner.py` в репо `task1` (закоммичен), на
+сервере развёрнут как `dynamic_tuner_62_v7.py`/`dynamic_tuner_63_v7.py` (копии с разным `NODE` в
+имени — это нормально, см. историю ниже про why-копии-а-не-один-файл).
+
+### Проверить прогресс
+```bash
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.64 "
+grep -oP '\[watermark\] \K\d+' /data/pol_index/full_index_run/run_62_v3.log | tail -1
+grep -oP '\[watermark\] \K\d+' /data/pol_index/full_index_run/run_63_v3.log | tail -1
+grep -c 'Batch too large' /data/pol_index/full_index_run/run_62_v3.log /data/pol_index/full_index_run/run_63_v3.log
+ps aux | grep -E 'raw_pol_v3|dynamic_tuner' | grep -v grep
+"
+```
+`.62` диапазон `[0, 31124773]`, `.63` диапазон `[31124774, 89000000]` (~текущая голова цепи, растёт).
+`[watermark] N` — это ИСТИННАЯ безопасная resume-точка (не путать с `Accum X→Y` — это просто
+лог одного save-батча, может быть НЕ contiguous). Скорость/нагрузку — через `tail tuner_NN.log`
+(там `load_ratio`, для `.63` ещё `disk_busy`).
+
+### Перезапустить узел (смена бинаря/конфига/потеря процесса)
+1. Узнать текущий PID-ы: `ps aux | grep -E 'dynamic_tuner_NN|raw_pol_v3' | grep -v grep`
+2. **Получить безопасную resume-точку**: `grep -oP '\[watermark\] \K\d+' run_NN_v3.log | tail -1`
+   (НЕ из `Accum` — то может пропустить недосохранённый блок при гонке воркеров)
+3. `kill -9 <tuner_pid> <binary_pid>` (на сервере процессы не имеют graceful SIGTERM handler,
+   `kill -9` безопасен — watermark гарантирует, что resume не потеряет данные)
+4. Запустить ОТДЕЛЬНЫМ ssh-вызовом (баг: два `nohup ... &` в одной ssh-команде — второй часто не
+   стартует):
+   ```bash
+   ssh ... "cd /data/pol_index/full_index_run && export GRAFANA_USER='alexey.smolyakov@lotos.io' && export GRAFANA_PASS='OX8OYykA2!jtWv' && nohup python3 dynamic_tuner_NN_v7.py NN http://100.64.0.NN:8545 <RESUME_POINT> <TO_BLOCK> >> tuner_NN.log 2>&1 &"
+   ```
+5. **⚠️ КРИТИЧНО**: если перезапускаешь ради диагностики/тестов — сразу после получения нужного
+   результата ВОССТАНОВИ боевой процесс. Был инцидент: 3.5 часа простоя `.63` из-за того, что
+   увлёкся TLS-диагностикой и забыл перезапустить. См. память `feedback_restore_after_diagnostics`.
+
+### Проверить целостность (нет ли пропущенных блоков)
+```bash
+ssh ... "cd /data/pol_index/full_index_run && python3 find_missing_blocks.py FROM_BLOCK TO_BLOCK 64 32000 blocks 96 > /tmp/missing.txt 2>&1; tail -1 /tmp/missing.txt"
+# 0 строк в выводе (кроме "Total missing: N" в stderr) = всё цело
+```
+Журнал прошлых проверок — `SELECT * FROM pol.integrity_checks;` (через `cqlsh` или `reader`
+read-only пользователя, см. `docs/SCYLLA_READONLY_ACCESS.md`). Явно пропущенные (after retry-chain
+exhausted) блоки — `SELECT * FROM pol.skipped_blocks WHERE resolved=false;`. Подробная методология
+— `docs/INTEGRITY_CHECKS.md`.
+
+### Backfill найденных пропусков
+1. `find_missing_blocks.py FROM TO ... > missing.txt` → получить список номеров
+2. Сгруппировать в диапазоны (gap_threshold ~2000), записать в `spans.txt` как `"FROM TO"` построчно
+3. `tools/backfill_spans.sh <node> <rpc_url> spans.txt backfill.log <FETCH_WORKERS~5-10> <SPAN_TIMEOUT~3600>`
+   — перезапускает индексер на каждый span. Идемпотентно (PK=chunk+block_number), безопасно
+   зацепить уже-целые блоки по краям диапазона.
+4. **⚠️ Не гнать backfill с заметным `FETCH_WORKERS` ОДНОВРЕМЕННО с живой индексацией на ТОЙ ЖЕ
+   RPC-ноде** — может задушить и то, и другое (см. инцидент 2026-06-23, диск `.63` на 100%).
+   Держать `FETCH_WORKERS=5-10` для backfill, проверять живую скорость не упала.
+5. Финальная верификация — снова `find_missing_blocks.py` на том же диапазоне, должно быть 0.
+
+### Восстановить/форсировать resume-точку вручную (когда автоматика не справилась)
+`dynamic_tuner.py`'s `resume_from()` **приоритезирует последнюю `[watermark] N` строку В ЛОГЕ**
+над любым явным `--from`/CLI-аргументом, который ты передашь тюнеру при запуске! Просто передать
+новый `from_block` тюнеру НЕ сработает, если лог уже содержит более раннюю watermark-строку.
+Чтобы форсировать новую resume-точку (например, после ручной записи "битого" блока в
+`pol.skipped_blocks`):
+```bash
+ssh ... "echo '[watermark] <NEW_POINT>  # manual: причина' >> /data/pol_index/full_index_run/run_NN_v3.log"
+```
+Затем перезапустить как обычно — `resume_from()` подхватит новую строку. **Перед этим всегда**
+прогнать `find_missing_blocks.py` на диапазон до `NEW_POINT`, чтобы убедиться, что пропуск только
+ожидаемый (тот, что записываешь в `skipped_blocks`), а не что-то ещё.
+
+### Записать явный пропуск вручную в БД
+```bash
+ssh ... "docker exec scylla cqlsh -u cassandra -p cassandra -e \"INSERT INTO pol.skipped_blocks (block_number, chunk, skipped_at, reason, resolved) VALUES (<N>, <CHUNK>, toTimestamp(now()), '<reason>', false);\""
+```
+`CHUNK = (N % 64) + 64 * (N // 32000)`.
+
+### Доступы
+- Scylla: `100.64.0.64:9042`, keyspace `pol`, superuser `cassandra/cassandra` (на сервере через
+  `docker exec scylla cqlsh -u cassandra -p cassandra -e "..."`), read-only `reader` (пароль выдан
+  пользователю отдельно, не в репо/памяти) — см. `docs/SCYLLA_READONLY_ACCESS.md`.
+- Grafana: `grafana.lotos-team.com`, `alexey.smolyakov@lotos.io` / `OX8OYykA2!jtWv` — node metrics
+  (`node_load1`, disk busy/IOPS), см. `reference_graylog_grafana_polygon` память.
+- GrayLog: `144.76.108.185:12201` (GELF), UI `graylog.lotos-team.com`.
+
+### Известные грабли
+- `nohup cmd1 & ; nohup cmd2 &` в ОДНОЙ ssh-команде — второй часто не стартует. Раздельные вызовы.
+- `resume_from()` приоритет `[watermark]`-строки лога над CLI `--from` — см. выше.
+- `Task.joinTimeout` (45с) на каждый HTTP под-запрос (block/receipts/traces) — если ВСЕ ТРИ висят,
+  один блок может занять до ~135с до отказа от primary, прежде чем попробовать neighbor.
+- give-up-счётчик (`cycleCount` в `worker()`) НЕ переживает рестарт процесса (задача #7, не
+  решена) — если тюнер часто перезапускает процесс, "тяжёлый" блок может никогда не дойти до
+  автоматического skip. Решение — ручное вмешательство (см. выше) пока #7 не реализована.
+- HTTPS (паблик/backup RPC) крашит ReleaseFast (SIGILL, ML-KEM баг в Zig stdlib) — отключено в
+  проде, см. задачу #4. Не пытаться включать `RESERVE_RPC_URL`/backup без предупреждения.
+- Сборка **только** `-Doptimize=ReleaseFast` (Debug вешает pool workers — баг Zig 0.17-dev).
+  Команда: `zig build -p .zig/build --cache-dir .zig/.cache -Doptimize=ReleaseFast`.
 
 ## Задача
 
