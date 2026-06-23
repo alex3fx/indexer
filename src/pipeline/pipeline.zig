@@ -581,6 +581,50 @@ fn saveAccumFn(args: *SaveArgs) void {
     }
 }
 
+// ─── Watermark ────────────────────────────────────────────────────────────────
+// Tracks the true contiguous-from-`from` durably-saved frontier, independent of
+// save-batch boundaries. Workers complete out of order under concurrency (a slow
+// worker on block N can still be retrying while workers on N+1..N+50 finish first,
+// land in an earlier-flushed batch, and get printed in an "Accum X→Y" line with
+// Y > N) — resuming from that batch's Y would skip N forever if the process is
+// killed/crashes before N's worker finally succeeds. This tracker only ever
+// reports a block number as safe-to-resume-past once every block from `from` up
+// to it has actually been saved, regardless of arrival/save order. Confirmed via
+// a real data scan 2026-06-23: kill -9 restarts during this exact race window
+// silently dropped ~2000+ blocks even after the worker-level "never skip" fix.
+const Watermark = struct {
+    gpa: Allocator,
+    nextExpected: u64,
+    pending: std.AutoHashMap(u64, void),
+
+    fn init(gpa: Allocator, from: u64) Watermark {
+        return .{ .gpa = gpa, .nextExpected = from, .pending = std.AutoHashMap(u64, void).init(gpa) };
+    }
+
+    fn deinit(self: *Watermark) void {
+        self.pending.deinit();
+    }
+
+    /// Returns true if the contiguous frontier advanced (caller should log/print it).
+    fn markSaved(self: *Watermark, blockNum: u64) !bool {
+        if (blockNum < self.nextExpected) return false; // already covered, defensive
+        if (blockNum == self.nextExpected) {
+            self.nextExpected += 1;
+            while (self.pending.remove(self.nextExpected)) {
+                self.nextExpected += 1;
+            }
+            return true;
+        }
+        try self.pending.put(blockNum, {});
+        return false;
+    }
+
+    /// The safe resume point: every block strictly below this is durably saved.
+    fn resumePoint(self: *const Watermark) u64 {
+        return self.nextExpected;
+    }
+};
+
 const PrevSave = struct {
     thread: std.Thread,
     accum: *AccumState,
@@ -596,7 +640,7 @@ const PrevSave = struct {
         return .{ .thread = thread, .accum = args.accum, .args = heapArgs };
     }
 
-    fn finish(self: *PrevSave, gpa: Allocator, blocksDone: *u64, t0: i64) !void {
+    fn finish(self: *PrevSave, gpa: Allocator, blocksDone: *u64, t0: i64, watermark: *Watermark) !void {
         self.thread.join();
         gpa.destroy(self.args);
         defer {
@@ -610,6 +654,20 @@ const PrevSave = struct {
             "\nAccum {d}→{d}: saved={d} save={d:.0}ms | {d:.1} blk/s avg\n\n",
             .{ self.accum.blockStart, self.accum.blockEnd, self.accum.savedCount(), self.accum.saveMs, @as(f64, @floatFromInt(blocksDone.*)) / ms * 1000.0 },
         );
+
+        // Feed every durably-saved block number (this batch may be a disjoint subset
+        // of [from,to], arrived out of order) into the contiguous tracker, then
+        // report the resume-safe frontier — NOT this batch's own max — so a crash
+        // right after this print can never skip a still-in-flight earlier block.
+        var advanced = false;
+        for (self.accum.sources.items) |r| {
+            if (r.ok) {
+                if (try watermark.markSaved(r.blockNum)) advanced = true;
+            }
+        }
+        if (advanced) {
+            std.debug.print("[watermark] {d}\n", .{watermark.resumePoint()});
+        }
     }
 };
 
@@ -818,6 +876,9 @@ pub fn runHistorical(
     var accum = try gpa.create(AccumState);
     accum.* = AccumState.init(gpa);
 
+    var watermark = Watermark.init(gpa, from);
+    defer watermark.deinit();
+
     // Collect block numbers that workers could not fetch from any node.
     var skippedBlocks: std.ArrayList(u64) = .empty;
     defer skippedBlocks.deinit(gpa);
@@ -832,7 +893,7 @@ pub fn runHistorical(
 
         if (accum.entPtrs.items.len >= saveEvery) {
             if (prevSave) |*ps| {
-                try ps.finish(gpa, &blocksDone, t0);
+                try ps.finish(gpa, &blocksDone, t0, &watermark);
                 prevSave = null;
             }
             prevSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs));
@@ -844,13 +905,13 @@ pub fn runHistorical(
     for (threads) |t| t.join();
 
     if (prevSave) |*ps| {
-        try ps.finish(gpa, &blocksDone, t0);
+        try ps.finish(gpa, &blocksDone, t0, &watermark);
         prevSave = null;
     }
 
     if (accum.savedCount() > 0) {
         var finalSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs));
-        try finalSave.finish(gpa, &blocksDone, t0);
+        try finalSave.finish(gpa, &blocksDone, t0, &watermark);
     } else {
         accum.deinit();
         gpa.destroy(accum);
@@ -858,6 +919,25 @@ pub fn runHistorical(
 
     const elapsedMs = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
     std.debug.print("\nHistorical sync done: {d:.0}ms  saved_blocks={d}\n", .{ elapsedMs, blocksDone });
+
+    // Final integrity check: a clean run (every worker thread joined, every result
+    // drained from the channel) must have a contiguous saved frontier reaching all
+    // the way to `to+1` — any gap left in `watermark.pending` here is not a
+    // resume-point race (those are now impossible by construction), it would be a
+    // genuine logic bug. Loud and visible, never silent, per data-integrity policy —
+    // do not proceed to realtime with an unexplained hole.
+    const safeResumePoint = watermark.resumePoint();
+    if (safeResumePoint != to + 1) {
+        std.debug.print(
+            "[INTEGRITY ERROR] watermark={d} but expected {d} after a clean run — " ++
+                "{d} block(s) completed out of order but the gap below them was never filled. " ++
+                "This should be impossible after a full clean pass — investigate before resuming.\n",
+            .{ safeResumePoint, to + 1, watermark.pending.count() },
+        );
+        log.err("historical sync integrity check FAILED — watermark gap, see stdout log");
+        return error.WatermarkIntegrityGap;
+    }
+    std.debug.print("[watermark] integrity check passed: contiguous through {d}\n", .{to});
 
     const requested = to - from + 1;
     const totalConnErrors = connErrors.load(.monotonic);
