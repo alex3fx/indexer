@@ -88,7 +88,13 @@ ssh ... "docker exec scylla cqlsh -u cassandra -p cassandra -e \"INSERT INTO pol
   пользователю отдельно, не в репо/памяти) — см. `docs/SCYLLA_READONLY_ACCESS.md`.
 - Grafana: `grafana.lotos-team.com`, `alexey.smolyakov@lotos.io` / `OX8OYykA2!jtWv` — node metrics
   (`node_load1`, disk busy/IOPS), см. `reference_graylog_grafana_polygon` память.
-- GrayLog: `144.76.108.185:12201` (GELF), UI `graylog.lotos-team.com`.
+- GrayLog: `144.76.108.185:12201` (GELF), UI `graylog.lotos-team.com`, REST API login
+  `alexey.smolyakov` / `OX8OYykA2!jtWv` (без `@lotos.io`, в отличие от Grafana!). Чтение истории
+  heartbeat (прогресс/blk_s с реальными timestamp) без браузера:
+  `curl -sS -u "alexey.smolyakov:PASS" "https://graylog.lotos-team.com/api/search/universal/relative?query=source%3Aindexer-pol-monitor-v3%20AND%20heartbeat&range=86400&limit=2000&fields=message,timestamp" -k`
+  (`range` в секундах). Это спасло один раз при разборе "почему скорость деградировала" —
+  позволило восстановить полный timeline blk/s по обоим узлам с точными timestamp, когда в самих
+  логах индексера/тюнера таймштампов нет.
 
 ### Известные грабли
 - `nohup cmd1 & ; nohup cmd2 &` в ОДНОЙ ssh-команде — второй часто не стартует. Раздельные вызовы.
@@ -335,7 +341,17 @@ nohup python3 dynamic_tuner.py 63 http://100.64.0.63:8545 <FROM> 89000000 >> tun
 4. **✅ Публичная (резервная) RPC-нода** — задача #4 решена 2026-06-23 (curl-subprocess вместо
    `std.http.Client` для `https://`, см. ниже). `RESERVE_RPC_URL` подключена в проде.
 
-5. **Мониторинг скорости** — задача #5, продолжается (ScheduleWakeup-проверки, blk/s, ошибки).
+5. **✅ Мониторинг скорости** — задача #5 решена 2026-06-23/24: прогресс/скорость уже писались в
+   GrayLog через `monitor_pol_v3.py` (heartbeat раз в 5 циклов ≈5 мин, app
+   `indexer-pol-monitor-v3`), но было 2 бага: (a) `proc`-regex для `is_alive()` требовал
+   литеральный пробел сразу после `raw_pol_v3`, что ломалось при каждом редеплое с новым
+   суффиксом бинаря (`raw_pol_v3_reserve` и т.п.) — heartbeat месяцами слал `alive=False` даже
+   при живом процессе; (b) перезапуск самого монитора перечитывал лог с байта 0 и **повторно
+   слал в GrayLog старые исторические `[ALERT]`** как новые. Оба исправлены
+   (`tools/monitor_pol_v3.py`: regex без анкера на пробел + seed позиции на текущий EOF при
+   старте), задеплоено и подтверждено — `alive=True` корректно, без повторной отправки старых
+   алертов. История прогресса доступна через GrayLog API (см. ниже "Как читать историю
+   прогресса из GrayLog").
 
 ## Найдено и исправлено 2026-06-23 (после первой версии плана)
 
