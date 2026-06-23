@@ -142,6 +142,7 @@ const WorkerArgs = struct {
     backupNode: ?EvmRpcNodeConfig,
     neighborNode: ?EvmRpcNodeConfig,
     connErrors: *std.atomic.Value(u64),
+    redisUrl: cursor.ParsedUrl,
 };
 
 // Errors that indicate the RPC node itself is unreachable/refusing connections
@@ -345,6 +346,26 @@ fn giveUpAndRecord(gpa: Allocator, blockNum: u64, chunkSize: u64, chunkBuckets: 
     result.ok = true;
 }
 
+// Persistent (Redis-backed) replacement for a local cycleCount variable: a worker
+// that crashes/restarts mid-block (e.g. via dynamic_tuner.py during a tuning change)
+// used to lose its cycle count and start back at 0, so a genuinely unfetchable block
+// could outlive many restarts without ever reaching MAX_GIVE_UP_CYCLES. Key is scoped
+// to this node's Redis db (see selectDb in worker()), so .62/.63 don't collide.
+fn bumpGiveupCycle(rdb: ?*cursor.Conn, blockNum: u64) u32 {
+    const conn = rdb orelse return 1;
+    var keyBuf: [48]u8 = undefined;
+    const key = std.fmt.bufPrint(&keyBuf, "giveup:{d}", .{blockNum}) catch return 1;
+    const n = conn.incr(key) catch return 1;
+    return if (n < 0) 1 else @intCast(n);
+}
+
+fn clearGiveupCycle(rdb: ?*cursor.Conn, blockNum: u64) void {
+    const conn = rdb orelse return;
+    var keyBuf: [48]u8 = undefined;
+    const key = std.fmt.bufPrint(&keyBuf, "giveup:{d}", .{blockNum}) catch return;
+    conn.del(key);
+}
+
 fn worker(args: *WorkerArgs) !void {
     const gpa = args.gpa;
     const chain = args.chain;
@@ -360,6 +381,19 @@ fn worker(args: *WorkerArgs) !void {
     defer rClient.deinit();
     defer tClient.deinit();
 
+    // Own Redis connection per worker thread (cursor.Conn is not safe to share across
+    // threads) — used only for the restart-surviving giveup cycle counter. Best-effort:
+    // if it fails to connect, bumpGiveupCycle/clearGiveupCycle fall back to a no-op that
+    // never forces a give-up, so a Redis hiccup can't cause a false data-loss skip.
+    var rdbOpt: ?cursor.Conn = blk: {
+        var c = cursor.Conn.init(gpa, args.redisUrl.host, args.redisUrl.port) catch break :blk null;
+        if (args.redisUrl.password.len > 0) c.auth(args.redisUrl.password) catch {};
+        if (args.redisUrl.db > 0) c.selectDb(args.redisUrl.db) catch {};
+        break :blk c;
+    };
+    defer if (rdbOpt) |*c| c.deinit();
+    const rdb: ?*cursor.Conn = if (rdbOpt) |*c| c else null;
+
     while (true) {
         if (args.cancel.load(.acquire)) break;
         const blockNum = args.next.fetchAdd(1, .monotonic);
@@ -371,7 +405,10 @@ fn worker(args: *WorkerArgs) !void {
 
         const MAX_RETRY_LATER: u32 = 25; // ~5s of 200ms sleeps before escalating to neighbor/backup
         var retryCount: u32 = 0;
-        var cycleCount: u32 = 0; // full primary+neighbor+backup-exhausted cycles, bounded by MAX_GIVE_UP_CYCLES
+        // Full primary+neighbor+backup-exhausted cycles, bounded by MAX_GIVE_UP_CYCLES.
+        // Backed by Redis (giveup:{blockNum}) so it survives this worker process being
+        // restarted mid-block (see bumpGiveupCycle) instead of resetting to 0 each time.
+        var cycleCount: u32 = 0;
 
         // Retry chain per block: primary (short transient-retry loop below) -> neighbor
         // node -> backup/public node -> a few backed-off full cycles of the above ->
@@ -382,6 +419,7 @@ fn worker(args: *WorkerArgs) !void {
             switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result)) {
                 .ok => {
                     result.ok = true;
+                    clearGiveupCycle(rdb, blockNum);
                     std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
                         blockNum,
                         result.ent.txs.items.len,
@@ -391,11 +429,15 @@ fn worker(args: *WorkerArgs) !void {
                     break :retry;
                 },
                 .skip_missing => {
-                    if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) break :retry;
-                    cycleCount += 1;
+                    if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) {
+                        clearGiveupCycle(rdb, blockNum);
+                        break :retry;
+                    }
+                    cycleCount = bumpGiveupCycle(rdb, blockNum);
                     if (cycleCount >= MAX_GIVE_UP_CYCLES) {
                         resetResult(result);
                         giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "skip_missing on primary+neighbor+backup", result);
+                        clearGiveupCycle(rdb, blockNum);
                         break :retry;
                     }
                     std.debug.print("[worker] block={d} skip_missing on primary+neighbor+backup — retry cycle #{d}/{d}\n", .{ blockNum, cycleCount, MAX_GIVE_UP_CYCLES });
@@ -408,11 +450,15 @@ fn worker(args: *WorkerArgs) !void {
                     retryCount += 1;
                     if (retryCount >= MAX_RETRY_LATER) {
                         std.debug.print("[worker] block={d} stuck retry_later x{d} — trying neighbor/backup\n", .{ blockNum, retryCount });
-                        if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) break :retry;
-                        cycleCount += 1;
+                        if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) {
+                            clearGiveupCycle(rdb, blockNum);
+                            break :retry;
+                        }
+                        cycleCount = bumpGiveupCycle(rdb, blockNum);
                         if (cycleCount >= MAX_GIVE_UP_CYCLES) {
                             resetResult(result);
                             giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "stuck retry_later on primary+neighbor+backup", result);
+                            clearGiveupCycle(rdb, blockNum);
                             break :retry;
                         }
                         std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — retry cycle #{d}/{d}\n", .{ blockNum, retryCount, cycleCount, MAX_GIVE_UP_CYCLES });
@@ -441,13 +487,17 @@ fn worker(args: *WorkerArgs) !void {
                         std.debug.print("[worker] block={d} conn issue persisted x{d}: {s}\n", .{ blockNum, retryCount, @errorName(e) });
                     }
                     std.debug.print("[worker] block={d} primary error: {s} — trying neighbor/backup\n", .{ blockNum, @errorName(e) });
-                    if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) break :retry;
-                    cycleCount += 1;
+                    if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) {
+                        clearGiveupCycle(rdb, blockNum);
+                        break :retry;
+                    }
+                    cycleCount = bumpGiveupCycle(rdb, blockNum);
                     if (cycleCount >= MAX_GIVE_UP_CYCLES) {
                         resetResult(result);
                         var reasonBuf: [128]u8 = undefined;
                         const reason = std.fmt.bufPrint(&reasonBuf, "error {s} on primary+neighbor+backup", .{@errorName(e)}) catch "error on primary+neighbor+backup";
                         giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, reason, result);
+                        clearGiveupCycle(rdb, blockNum);
                         break :retry;
                     }
                     std.debug.print("[worker] block={d} error: {s} on all nodes — retry cycle #{d}/{d}\n", .{ blockNum, @errorName(e), cycleCount, MAX_GIVE_UP_CYCLES });
@@ -756,6 +806,7 @@ fn spawnHistoricalWorkers(
     backupNode: ?EvmRpcNodeConfig,
     neighborNode: ?EvmRpcNodeConfig,
     connErrors: *std.atomic.Value(u64),
+    redisUrl: cursor.ParsedUrl,
 ) !void {
     for (0..threads.len) |w| {
         const wargs = try gpa.create(WorkerArgs);
@@ -772,6 +823,7 @@ fn spawnHistoricalWorkers(
             .backupNode = backupNode,
             .neighborNode = neighborNode,
             .connErrors = connErrors,
+            .redisUrl = redisUrl,
         };
         _ = from; // from is encoded in next (already set to from by caller)
         threads[w] = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
@@ -941,7 +993,7 @@ pub fn runHistorical(
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
     var connErrors = std.atomic.Value(u64).init(0);
-    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, chunkEra, &cancel, &next, threads, backupNode, neighborNode, &connErrors);
+    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, chunkEra, &cancel, &next, threads, backupNode, neighborNode, &connErrors, rUrl);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
