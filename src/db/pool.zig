@@ -118,6 +118,74 @@ pub fn configureAlerts(host: []const u8, port: u16, app: []const u8, enabled: bo
     alertEnabled = enabled;
 }
 
+// ─── pol.skipped_blocks — explicit, visible record of "gave up on this block" ──
+// Set once at startup (main.zig), read by recordSkippedBlock() from any worker
+// thread. A block only reaches recordSkippedBlock after exhausting primary AND
+// neighbor RPC nodes — at that point pipeline.zig marks it ok=true with empty
+// entities (so the watermark can advance past it instead of blocking the whole
+// run forever), and this is the durable, queryable trail of which blocks that
+// happened to. See docs/INTEGRITY_CHECKS.md.
+var scyllaHost: []const u8 = "127.0.0.1";
+var scyllaPort: u16 = 9042;
+var scyllaKeyspace: []const u8 = "pol";
+var scyllaUser: []const u8 = "cassandra";
+var scyllaPass: []const u8 = "cassandra";
+
+pub fn configureScylla(host: []const u8, port: u16, keyspace: []const u8, user: []const u8, pass: []const u8) void {
+    scyllaHost = host;
+    scyllaPort = port;
+    scyllaKeyspace = keyspace;
+    scyllaUser = user;
+    scyllaPass = pass;
+}
+
+/// Best-effort: opens a one-shot connection, inserts one row, closes. Failure to
+/// record is logged but never propagated — losing the audit trail is bad, but
+/// must never be worse than the gap it's recording.
+pub fn recordSkippedBlock(gpa: std.mem.Allocator, blockNumber: i64, chunk: i32, reason: []const u8) void {
+    var conn = CqlConn.init(gpa, scyllaHost, scyllaPort, scyllaKeyspace, scyllaUser, scyllaPass) catch |e| {
+        std.debug.print("[skipped_blocks] connect failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer conn.deinit();
+
+    var escBuf: [400]u8 = undefined;
+    var escLen: usize = 0;
+    for (reason) |c| {
+        if (escLen + 2 > escBuf.len) break;
+        switch (c) {
+            '\'' => {
+                escBuf[escLen] = '\'';
+                escBuf[escLen + 1] = '\'';
+                escLen += 2;
+            },
+            '\n', '\r' => {},
+            else => {
+                escBuf[escLen] = c;
+                escLen += 1;
+            },
+        }
+    }
+
+    var queryBuf: [700]u8 = undefined;
+    const query = std.fmt.bufPrint(
+        &queryBuf,
+        "INSERT INTO skipped_blocks (block_number, chunk, skipped_at, reason, resolved) VALUES ({d}, {d}, toTimestamp(now()), '{s}', false)",
+        .{ blockNumber, chunk, escBuf[0..escLen] },
+    ) catch {
+        std.debug.print("[skipped_blocks] query format failed for block={d}\n", .{blockNumber});
+        return;
+    };
+
+    conn.sendQuery(query) catch |e| {
+        std.debug.print("[skipped_blocks] insert failed for block={d}: {s}\n", .{ blockNumber, @errorName(e) });
+        return;
+    };
+    conn.recvFrameCheck() catch |e| {
+        std.debug.print("[skipped_blocks] insert response error for block={d}: {s}\n", .{ blockNumber, @errorName(e) });
+    };
+}
+
 fn alertCqlError(code: i32, msg: []const u8) void {
     if (!alertEnabled) return;
     const fd = tcpConnect(alertHost, alertPort) catch return;
@@ -422,7 +490,7 @@ pub const CqlConn = struct {
         try self.sendFrame(OPCODE_AUTH_RESP, body.items);
     }
 
-    fn sendQuery(self: *CqlConn, query: []const u8) !void {
+    pub fn sendQuery(self: *CqlConn, query: []const u8) !void {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(tempAllocator);
         try appendLongString(&body, query);

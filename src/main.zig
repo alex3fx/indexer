@@ -252,6 +252,10 @@ pub fn main(init: Init) !void {
     // its own one-shot GELF alert on CqlError ("Batch too large" etc.) using the
     // same GrayLog endpoint, set once here before any worker threads spawn.
     pool.configureAlerts(env.LOGS_GRAYLOG_HOST, env.LOGS_GRAYLOG_PORT, env.LOGS_GRAYLOG_APP, runtime.details.isDev or runtime.details.isProd);
+    // Lets pool.recordSkippedBlock() (called from worker threads, which have no
+    // Scylla connection of their own) open its own one-shot connection to record
+    // explicitly-given-up blocks into pol.skipped_blocks.
+    pool.configureScylla(env.SCYLLA_DB_HOST, env.SCYLLA_DB_PORT, env.SCYLLA_DB_KEYSPACE, env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD);
 
     var chain = core.getEvmChainConfig(runtime.details.evmChainId) orelse {
         log.err("Unsupported chain");
@@ -334,6 +338,23 @@ pub fn main(init: Init) !void {
         std.debug.print("Backup RPC: {s}\n", .{bn.https});
     }
 
+    // ── Neighbor RPC node (optional) ───────────────────────────────────────────
+    // Second retry tier for historical sync, between primary and "give up and
+    // record as skipped" (see pipeline.zig worker()). dynamic_tuner.py sets this
+    // to the OTHER dual-node split partner's RPC (.62<->.63) — both are plain
+    // HTTP, so unlike backupNode this doesn't hit the HTTPS/SIGILL issue (#4).
+    const neighborNode: ?EvmRpcNodeConfig = if (init.environ_map.get("NEIGHBOR_RPC_URL")) |url|
+        if (url.len > 0) EvmRpcNodeConfig{
+            .https = url,
+            .wss = "",
+        } else null
+    else
+        null;
+
+    if (neighborNode) |nn| {
+        std.debug.print("Neighbor RPC: {s}\n", .{nn.https});
+    }
+
     // ── Pre-detect node type from main thread ─────────────────────────────────
     // Must run before any worker threads or pool workers start, so all subsequent
     // detect() calls are cache hits (no HTTP from thread-pool context).
@@ -343,6 +364,9 @@ pub fn main(init: Init) !void {
         _ = node_probe.detect(gpa, &detectClient, chain.rpcNodes.lotosArchiveNode.https);
         if (backupNode) |bn| {
             _ = node_probe.detect(gpa, &detectClient, bn.https);
+        }
+        if (neighborNode) |nn| {
+            _ = node_probe.detect(gpa, &detectClient, nn.https);
         }
     }
 
@@ -411,6 +435,7 @@ pub fn main(init: Init) !void {
             chunkEra,
             saveEvery,
             backupNode,
+            neighborNode,
             &log,
             txsLanes,
             logsLanes,

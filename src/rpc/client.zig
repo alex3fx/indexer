@@ -1,8 +1,17 @@
 const std = @import("std");
+const linux = std.os.linux;
 
 const core = @import("indexer/core");
 const utils = core.utils;
 const node_probe = @import("node_probe.zig");
+
+// std.time.nanoTimestamp doesn't exist in this Zig 0.17-dev (see feedback_zig_017dev) — same
+// raw-syscall pattern used elsewhere in this codebase (e.g. pipeline.zig's nowNs()).
+fn nowNs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return ts.sec * 1_000_000_000 + ts.nsec;
+}
 
 const Allocator = std.mem.Allocator;
 const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
@@ -51,6 +60,36 @@ pub const Task = struct {
         const result = context.result orelse return error.ThreadResultMissing;
         return result;
     }
+
+    /// Like `join`, but gives up after `timeout_ns` instead of blocking forever.
+    /// `std.http.Client`'s underlying connection can wedge (observed in production:
+    /// a worker stuck >1.5h on a single block after a transient ConnectionRefused,
+    /// with zero retry-log output — the request thread never returned control to
+    /// the retry loop). `Task.join()` has no way to interrupt a syscall blocked
+    /// inside another thread, so on timeout this ABANDONS the spawned thread
+    /// (never joined, never freed — context/number/response leak deliberately)
+    /// rather than risk touching memory a still-running thread might write to.
+    /// Caller MUST treat the client passed to this request as tainted afterward
+    /// (deinit+reinit it) — `std.http.Client` only guarantees individual Requests
+    /// are non-threadsafe, and an abandoned in-flight request plus a fresh one on
+    /// the same Client would be exactly that.
+    pub fn joinTimeout(self: *Task, timeout_ns: u64) !?Response {
+        const context = self.context;
+        const deadline = nowNs() + @as(i64, @intCast(timeout_ns));
+        while (!context.done.load(.acquire)) {
+            if (nowNs() >= deadline) {
+                // detach so the OS reclaims the thread's resources whenever it
+                // does eventually finish/unblock, instead of leaving it in a
+                // permanently-joinable (never reaped) state.
+                self.thread.detach();
+                self.* = undefined; // caller must not touch this Task again — thread abandoned
+                return error.FetchTimeout;
+            }
+            const ts = linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+            _ = linux.nanosleep(&ts, null);
+        }
+        return self.join();
+    }
 };
 
 const ThreadContext = struct {
@@ -59,6 +98,11 @@ const ThreadContext = struct {
     method: Method,
     options: WorkerOptions,
     result: ?(anyerror!?Response) = null,
+    // Set after `result` is written, with release ordering, so a thread polling
+    // `done` via acquire is guaranteed to see the `result` write — `joinTimeout`
+    // reads `result` (indirectly, via `join`) without going through `thread.join()`
+    // first, which is the usual happens-before edge for this pattern.
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 pub const WorkerOptions = struct {
@@ -108,6 +152,7 @@ pub fn requestWithRpcNode(
 
 fn runRequest(context: *ThreadContext) void {
     defer context.allocator.free(context.options.number);
+    defer context.done.store(true, .release);
 
     context.result = requestSync(
         context.allocator,

@@ -140,6 +140,7 @@ const WorkerArgs = struct {
     chunkEra: u64,
     cancel: *std.atomic.Value(bool),
     backupNode: ?EvmRpcNodeConfig,
+    neighborNode: ?EvmRpcNodeConfig,
     connErrors: *std.atomic.Value(u64),
 };
 
@@ -263,6 +264,87 @@ pub fn resetResult(result: *BlockResult) void {
     result.ent = transformer.initEntities();
 }
 
+// Same chunk formula as transformer.zig's transformBlockWithRemap — needed here
+// (independent of a successful transform) so a block we're about to give up on
+// can still be recorded against its correct partition in pol.skipped_blocks.
+fn computeChunk(blockNum: u64, chunkSize: u64, chunkBuckets: u64, chunkEra: u64) i32 {
+    const number: i64 = @intCast(blockNum);
+    if (chunkBuckets > 0 and chunkEra > 0) {
+        return @intCast(@mod(number, @as(i64, @intCast(chunkBuckets))) +
+            @as(i64, @intCast(chunkBuckets)) * @divFloor(number, @as(i64, @intCast(chunkEra))));
+    } else if (chunkBuckets > 0) {
+        return @intCast(@mod(number, @as(i64, @intCast(chunkBuckets))));
+    } else {
+        return @intCast(@divFloor(number, @as(i64, @intCast(chunkSize))));
+    }
+}
+
+// After exhausting primary + neighbor + backup this many full cycles (with
+// sleepBackoff between: 1s,2s,4s,8s,16s ≈ 31s total), give up for good instead
+// of retrying forever — see worker()'s give-up path below. Bounded so one truly
+// unfetchable block (RPC node genuinely doesn't have it, not a transient blip)
+// can't park a worker indefinitely; the gap is explicitly recorded in
+// pol.skipped_blocks (docs/INTEGRITY_CHECKS.md) instead of silently lost or
+// silently retried forever.
+const MAX_GIVE_UP_CYCLES: u32 = 5;
+
+/// Tries neighbor then backup (whichever are configured) once each. Returns true
+/// and sets result.ok=true if either succeeds.
+fn tryFallbackNodes(
+    gpa: Allocator,
+    io: std.Io,
+    blockNum: u64,
+    chunkSize: u64,
+    chunkBuckets: u64,
+    chunkEra: u64,
+    bClient: *FetchClient,
+    rClient: *FetchClient,
+    tClient: *FetchClient,
+    neighborNode: ?EvmRpcNodeConfig,
+    backupNode: ?EvmRpcNodeConfig,
+    result: *BlockResult,
+) bool {
+    if (neighborNode) |neighbor| {
+        resetResult(result);
+        if (fetchParseTransform(gpa, io, neighbor, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, null, result) == .ok) {
+            result.ok = true;
+            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (neighbor)\n", .{
+                blockNum,                  result.ent.txs.items.len,
+                result.ent.logs.items.len, result.ent.internalTxs.items.len,
+            });
+            return true;
+        }
+    }
+    if (backupNode) |backup| {
+        resetResult(result);
+        if (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, null, result) == .ok) {
+            result.ok = true;
+            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
+                blockNum,                  result.ent.txs.items.len,
+                result.ent.logs.items.len, result.ent.internalTxs.items.len,
+            });
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Records the block as explicitly skipped (pol.skipped_blocks) and marks it
+/// ok=true with empty entities — it flows through the normal accum/save/watermark
+// pipeline as a (real, durable) zero-row block, so the watermark can advance
+/// instead of blocking the whole run on one unfetchable block forever. Caller
+/// must resetResult() before this so result.ent is empty.
+fn giveUpAndRecord(gpa: Allocator, blockNum: u64, chunkSize: u64, chunkBuckets: u64, chunkEra: u64, reason: []const u8, result: *BlockResult) void {
+    const chunk = computeChunk(blockNum, chunkSize, chunkBuckets, chunkEra);
+    std.debug.print(
+        "[worker] block={d} GIVING UP after {d} cycles (primary+neighbor+backup exhausted each time) — " ++
+            "recording in pol.skipped_blocks and moving on ({s})\n",
+        .{ blockNum, MAX_GIVE_UP_CYCLES, reason },
+    );
+    pool.recordSkippedBlock(gpa, @intCast(blockNum), chunk, reason);
+    result.ok = true;
+}
+
 fn worker(args: *WorkerArgs) !void {
     const gpa = args.gpa;
     const chain = args.chain;
@@ -287,15 +369,14 @@ fn worker(args: *WorkerArgs) !void {
         result.* = BlockResult.init(gpa);
         result.blockNum = blockNum;
 
-        const MAX_RETRY_LATER: u32 = 25; // ~5s of 200ms sleeps before escalating to a full primary+backup cycle retry
+        const MAX_RETRY_LATER: u32 = 25; // ~5s of 200ms sleeps before escalating to neighbor/backup
         var retryCount: u32 = 0;
-        var cycleCount: u32 = 0; // full primary(+backup)-exhausted cycles — drives backoff, never gives up
+        var cycleCount: u32 = 0; // full primary+neighbor+backup-exhausted cycles, bounded by MAX_GIVE_UP_CYCLES
 
-        // Historical sync must never silently drop a block: giving up here would let the
-        // accumulator's watermark advance past it (neighboring blocks still succeed), and a
-        // crash before end-of-run retryMissingBlocks runs would lose it permanently — exactly
-        // the gap class this loop exists to prevent. So "exhausted primary+backup" escalates
-        // to a backed-off full-cycle retry instead of ever marking the block skipped.
+        // Retry chain per block: primary (short transient-retry loop below) -> neighbor
+        // node -> backup/public node -> a few backed-off full cycles of the above ->
+        // explicit recorded give-up (pol.skipped_blocks). Never silently drop a block:
+        // either it's saved for real, or its absence is a durable, queryable fact.
         retry: while (true) {
             if (args.cancel.load(.acquire)) break :retry;
             switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result)) {
@@ -310,19 +391,14 @@ fn worker(args: *WorkerArgs) !void {
                     break :retry;
                 },
                 .skip_missing => {
-                    if (args.backupNode) |backup| {
-                        resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
-                            result.ok = true;
-                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                blockNum,                  result.ent.txs.items.len,
-                                result.ent.logs.items.len, result.ent.internalTxs.items.len,
-                            });
-                            break :retry;
-                        }
-                    }
+                    if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) break :retry;
                     cycleCount += 1;
-                    std.debug.print("[worker] block={d} skip_missing on primary and backup — retry cycle #{d}, never giving up\n", .{ blockNum, cycleCount });
+                    if (cycleCount >= MAX_GIVE_UP_CYCLES) {
+                        resetResult(result);
+                        giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "skip_missing on primary+neighbor+backup", result);
+                        break :retry;
+                    }
+                    std.debug.print("[worker] block={d} skip_missing on primary+neighbor+backup — retry cycle #{d}/{d}\n", .{ blockNum, cycleCount, MAX_GIVE_UP_CYCLES });
                     sleepBackoff(cycleCount);
                     retryCount = 0;
                     resetResult(result);
@@ -331,20 +407,15 @@ fn worker(args: *WorkerArgs) !void {
                     if (args.cancel.load(.acquire)) break :retry;
                     retryCount += 1;
                     if (retryCount >= MAX_RETRY_LATER) {
-                        if (args.backupNode) |backup| {
-                            std.debug.print("[worker] block={d} stuck retry_later x{d} — trying backup\n", .{ blockNum, retryCount });
-                            resetResult(result);
-                            if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
-                                result.ok = true;
-                                std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                    blockNum,                  result.ent.txs.items.len,
-                                    result.ent.logs.items.len, result.ent.internalTxs.items.len,
-                                });
-                                break :retry;
-                            }
-                        }
+                        std.debug.print("[worker] block={d} stuck retry_later x{d} — trying neighbor/backup\n", .{ blockNum, retryCount });
+                        if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) break :retry;
                         cycleCount += 1;
-                        std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — retry cycle #{d}, never giving up\n", .{ blockNum, retryCount, cycleCount });
+                        if (cycleCount >= MAX_GIVE_UP_CYCLES) {
+                            resetResult(result);
+                            giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "stuck retry_later on primary+neighbor+backup", result);
+                            break :retry;
+                        }
+                        std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — retry cycle #{d}/{d}\n", .{ blockNum, retryCount, cycleCount, MAX_GIVE_UP_CYCLES });
                         sleepBackoff(cycleCount);
                         retryCount = 0;
                         resetResult(result);
@@ -369,20 +440,17 @@ fn worker(args: *WorkerArgs) !void {
                         }
                         std.debug.print("[worker] block={d} conn issue persisted x{d}: {s}\n", .{ blockNum, retryCount, @errorName(e) });
                     }
-                    if (args.backupNode) |backup| {
-                        std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
-                        resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, null, result) == .ok) {
-                            result.ok = true;
-                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                blockNum,                  result.ent.txs.items.len,
-                                result.ent.logs.items.len, result.ent.internalTxs.items.len,
-                            });
-                            break :retry;
-                        }
-                    }
+                    std.debug.print("[worker] block={d} primary error: {s} — trying neighbor/backup\n", .{ blockNum, @errorName(e) });
+                    if (tryFallbackNodes(gpa, args.io, blockNum, chunkSize, chunkBuckets, chunkEra, &bClient, &rClient, &tClient, args.neighborNode, args.backupNode, result)) break :retry;
                     cycleCount += 1;
-                    std.debug.print("[worker] block={d} error: {s} on all nodes — retry cycle #{d}, never giving up\n", .{ blockNum, @errorName(e), cycleCount });
+                    if (cycleCount >= MAX_GIVE_UP_CYCLES) {
+                        resetResult(result);
+                        var reasonBuf: [128]u8 = undefined;
+                        const reason = std.fmt.bufPrint(&reasonBuf, "error {s} on primary+neighbor+backup", .{@errorName(e)}) catch "error on primary+neighbor+backup";
+                        giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, reason, result);
+                        break :retry;
+                    }
+                    std.debug.print("[worker] block={d} error: {s} on all nodes — retry cycle #{d}/{d}\n", .{ blockNum, @errorName(e), cycleCount, MAX_GIVE_UP_CYCLES });
                     sleepBackoff(cycleCount);
                     retryCount = 0;
                     resetResult(result);
@@ -686,6 +754,7 @@ fn spawnHistoricalWorkers(
     next: *std.atomic.Value(u64),
     threads: []std.Thread,
     backupNode: ?EvmRpcNodeConfig,
+    neighborNode: ?EvmRpcNodeConfig,
     connErrors: *std.atomic.Value(u64),
 ) !void {
     for (0..threads.len) |w| {
@@ -701,6 +770,7 @@ fn spawnHistoricalWorkers(
             .chunkEra = chunkEra,
             .cancel = cancel,
             .backupNode = backupNode,
+            .neighborNode = neighborNode,
             .connErrors = connErrors,
         };
         _ = from; // from is encoded in next (already set to from by caller)
@@ -840,6 +910,7 @@ pub fn runHistorical(
     chunkEra: u64,
     saveEvery: usize,
     backupNode: ?EvmRpcNodeConfig,
+    neighborNode: ?EvmRpcNodeConfig,
     log: *Logger,
     txsLanes: usize,
     logsLanes: usize,
@@ -870,7 +941,7 @@ pub fn runHistorical(
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
     var connErrors = std.atomic.Value(u64).init(0);
-    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, chunkEra, &cancel, &next, threads, backupNode, &connErrors);
+    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, chunkEra, &cancel, &next, threads, backupNode, neighborNode, &connErrors);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
