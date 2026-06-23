@@ -100,8 +100,14 @@ ssh ... "docker exec scylla cqlsh -u cassandra -p cassandra -e \"INSERT INTO pol
   `cycleCount`; счётчик переживает рестарт процесса. При успехе/skip ключ удаляется (`del`), чтобы
   повторная обработка того же блока (например, backfill) не унаследовала старое значение. При сбое
   Redis (insert/connect ошибка) — fail-soft на `1` (не форсирует ложный give-up).
-- HTTPS (паблик/backup RPC) крашит ReleaseFast (SIGILL, ML-KEM баг в Zig stdlib) — отключено в
-  проде, см. задачу #4. Не пытаться включать `RESERVE_RPC_URL`/backup без предупреждения.
+- HTTPS (паблик/backup RPC) — задача #4 решена 2026-06-23: вместо `std.http.Client` (TLS-стек
+  которого крашит ReleaseFast, ML-KEM баг в Zig stdlib) для `https://`-урлов теперь используется
+  `curl`-subprocess (`fetchViaCurl` в `src/core/common/fetch.zig`), полностью прозрачно для
+  вызывающего кода (`client.zig`, `node_probe.zig` не менялись по сути). `RESERVE_RPC_URL`
+  (которую `dynamic_tuner.py` и так выставляет) теперь реально подключена в `main.zig` как
+  backup-нода. Подтверждено `zig test` напрямую на реальном паблик RPC
+  (`polygon-bor-rpc.publicnode.com`) под `-OReleaseFast` — без SIGILL. Локальный патч Zig-тулчейна
+  (удаление `x25519_ml_kem768`) оставлен как есть (безвреден, уже не критичен для прода).
 - Сборка **только** `-Doptimize=ReleaseFast` (Debug вешает pool workers — баг Zig 0.17-dev).
   Команда: `zig build -p .zig/build --cache-dir .zig/.cache -Doptimize=ReleaseFast`.
 
@@ -325,11 +331,8 @@ nohup python3 dynamic_tuner.py 63 http://100.64.0.63:8545 <FROM> 89000000 >> tun
    `to+1`, иначе `[INTEGRITY ERROR]` + `log.err` + `error.WatermarkIntegrityGap` (не тихий переход
    к realtime). См. ниже п.7 про сам watermark-механизм.
 
-4. **Публичная (резервная) RPC-нода** — задача #4, ещё ОТКРЫТА. SIGILL на `node_probe.detect()`
-   при HTTPS внутри реального бинаря, изолированный репро (`/tmp/tlstest/`, не сохранён) НЕ
-   воспроизводит проблему (ни одиночный HTTPS-вызов, ни HTTP→HTTPS на одном клиенте). Нужно
-   воспроизвести с тем же `gpa`/`io` что в `main.zig` (через `init: Init`) или собрать в Debug на
-   1 блок ради трейса вместо `Illegal instruction`. Отложено, не блокирует текущий прогон.
+4. **✅ Публичная (резервная) RPC-нода** — задача #4 решена 2026-06-23 (curl-subprocess вместо
+   `std.http.Client` для `https://`, см. ниже). `RESERVE_RPC_URL` подключена в проде.
 
 5. **Мониторинг скорости** — задача #5, продолжается (ScheduleWakeup-проверки, blk/s, ошибки).
 
@@ -369,7 +372,7 @@ nohup python3 dynamic_tuner.py 63 http://100.64.0.63:8545 <FROM> 89000000 >> tun
      старому критерию!) — то есть без диск-сигнала тюнер продолжил бы поднимать нагрузку обратно
      в ту же ловушку даже после отката `load_ratio`-цели.
 
-Порядок: 1,2,3,6,7 — ✅ закрыты. Осталось: 4 (публичная нода), 5 (продолжается фоном).
+Порядок: 1,2,3,4,6,7 — ✅ закрыты. Осталось: 5 (продолжается фоном).
 
 4. **Tuner не повышает FETCH_WORKERS обратно после backoff** (см. выше) — можно доработать, если
    окажется, что это реальная проблема на практике (пока не критично, раз ёще не roll out на

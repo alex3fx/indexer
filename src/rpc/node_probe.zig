@@ -48,21 +48,13 @@ pub fn detect(gpa: Allocator, client: *FetchClient, url: []const u8) TraceMethod
     muUnlock();
     if (cached) |m| return m;
 
-    // HTTPS probing crashes (SIGILL) inside this binary's real runtime — reproduced
-    // directly (not just in the paired main.zig pre-detect path): a one-block run
-    // with RPC_URL=https://... hits "Illegal instruction" here. An isolated repro
-    // outside the binary did NOT reproduce it, so the root cause is still open
-    // (see CONTEXT.md task #4) — this sidesteps it by skipping the HTTP probe
-    // entirely for https:// and using the existing "probe failed" default, since
-    // every https endpoint we've used so far (public Polygon RPCs) is Bor/Erigon
-    // and trace_block-compatible anyway.
-    const method = if (std.mem.startsWith(u8, url, "https://"))
-        TraceMethod.trace_block
-    else
-        probeNode(gpa, client, url) catch blk: {
-            std.debug.print("[node_probe] {s}: probe failed, defaulting to trace_block\n", .{url});
-            break :blk TraceMethod.trace_block;
-        };
+    // https:// now goes through fetch.zig's curl-subprocess path (see task #4 — the
+    // ReleaseFast SIGILL was in std.http.Client's TLS stack, not here), so this can
+    // probe normally instead of defaulting blind.
+    const method = probeNode(gpa, client, url) catch blk: {
+        std.debug.print("[node_probe] {s}: probe failed, defaulting to trace_block\n", .{url});
+        break :blk TraceMethod.trace_block;
+    };
 
     muLock();
     const cached2 = cacheLookup(h); // another thread may have stored while we probed

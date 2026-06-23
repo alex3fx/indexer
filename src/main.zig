@@ -320,13 +320,11 @@ pub fn main(init: Init) !void {
     );
 
     // ── Backup RPC node (optional) ────────────────────────────────────────────
-    // NOTE: dynamic_tuner.py actually sets RESERVE_RPC_URL (not BACKUP_RPC_HTTPS),
-    // so this has been silently inert in production. Tried wiring RESERVE_RPC_URL
-    // in here too, but the configured reserve (https://polygon-bor-rpc.publicnode.com)
-    // crashes node_probe.detect() with SIGILL — the RPC client/probe path doesn't
-    // handle https:// (TLS) correctly. Left reading only BACKUP_RPC_HTTPS for now
-    // (still inert, but safe) until the HTTPS path is fixed separately.
-    const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
+    // https:// fetches now go through fetch.zig's curl-subprocess path (task #4 —
+    // the ReleaseFast SIGILL was in std.http.Client's TLS stack), so RESERVE_RPC_URL
+    // (what dynamic_tuner.py actually sets) is safe to wire in now. BACKUP_RPC_HTTPS
+    // kept as a manual override/alias for the same slot.
+    const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("RESERVE_RPC_URL") orelse init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
         if (url.len > 0) EvmRpcNodeConfig{
             .https = url,
             .wss = "",
