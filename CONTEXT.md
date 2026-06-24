@@ -85,7 +85,19 @@ ssh ... "docker exec scylla cqlsh -u cassandra -p cassandra -e \"INSERT INTO pol
 ### Доступы
 - Scylla: `100.64.0.64:9042`, keyspace `pol`, superuser `cassandra/cassandra` (на сервере через
   `docker exec scylla cqlsh -u cassandra -p cassandra -e "..."`), read-only `reader` (пароль выдан
-  пользователю отдельно, не в репо/памяти) — см. `docs/SCYLLA_READONLY_ACCESS.md`.
+  пользователю отдельно, не в репо/памяти) — см. `docs/SCYLLA_READONLY_ACCESS.md`. **Внешний
+  (не localhost) доступ на `9042` исправлен 2026-06-24** — раньше контейнер `scylla` был запущен с
+  `--rpc-address 127.0.0.1`/`--broadcast-rpc-address 127.0.0.1` (захардкожено в `Cmd` контейнера,
+  НЕ в `scylla.yaml` — простой `docker restart` это не лечит, нужен `docker rm`+`docker run` с
+  новыми флагами), из-за чего CQL-порт не слушал снаружи вообще (`connection refused` аналитику).
+  Пересоздан с `--rpc-address 0.0.0.0 --broadcast-rpc-address 100.64.0.64` (остальные флаги
+  идентичны: `--network host`, volume `/data/scylla:/var/lib/scylla`, image `scylladb/scylla:6.2`,
+  `--listen-address 127.0.0.1` не менялся — это для inter-node gossip, не для клиентов, у нас
+  single-node). Подтверждено реальным внешним `cqlsh 100.64.0.64 9042` (не через `docker exec`).
+  Перед пересозданием контейнера **обязательно останавливать наши индексеры** (`kill -9` тюнер+
+  бинарь на обоих узлах, сохранить watermark) — иначе они получат поток ошибок записи на время
+  простоя Scylla; restart/recreate занимает несколько минут (`iotune` benchmark на свежем
+  контейнере + компакция).
 - Grafana: `grafana.lotos-team.com`, `alexey.smolyakov@lotos.io` / `OX8OYykA2!jtWv` — node metrics
   (`node_load1`, disk busy/IOPS), см. `reference_graylog_grafana_polygon` память.
 - GrayLog: `144.76.108.185:12201` (GELF), UI `graylog.lotos-team.com`, REST API login
