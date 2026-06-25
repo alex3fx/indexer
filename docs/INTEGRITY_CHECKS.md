@@ -87,7 +87,7 @@ python3 tools/find_missing_blocks.py FROM_BLOCK TO_BLOCK [LANES=64] [ERA=32000] 
 
 Оба узла продолжают историческую синхронизацию — таблица выше отражает состояние **на момент
 последней проверки**, не текущий live-прогресс (его смотреть через `[watermark]` в
-`run_NN_v3.log`, см. `CONTEXT.md`).
+`run_NN_v3.log`, см. §8 в `docs/HOWTOSTART.md`).
 
 ## Известные инциденты и их разбор
 
