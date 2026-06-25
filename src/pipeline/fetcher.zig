@@ -218,8 +218,8 @@ fn fetchResponseSet(
     // joinTimeout, not join: a hung connection inside one of these threads has
     // no way to be interrupted, so without a deadline a single wedged request
     // permanently parks this worker (observed in production: >1.5h stuck on one
-    // block after a transient ConnectionRefused, see CONTEXT.md). On timeout the
-    // thread is abandoned (leaked, not corrupted — see Task.joinTimeout) and the
+    // block after a transient ConnectionRefused). On timeout the thread is
+    // abandoned (leaked, not corrupted — see Task.joinTimeout) and the
     // client it was using must be discarded, since std.http.Client only
     // guarantees individual Requests are non-threadsafe and a still-running
     // abandoned request plus a fresh one on the same Client would violate that.

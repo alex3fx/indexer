@@ -127,9 +127,9 @@ pub fn configureAlerts(host: []const u8, port: u16, app: []const u8, enabled: bo
 // happened to. See docs/INTEGRITY_CHECKS.md.
 var scyllaHost: []const u8 = "127.0.0.1";
 var scyllaPort: u16 = 9042;
-var scyllaKeyspace: []const u8 = "pol";
-var scyllaUser: []const u8 = "cassandra";
-var scyllaPass: []const u8 = "cassandra";
+var scyllaKeyspace: []const u8 = "";
+var scyllaUser: []const u8 = "";
+var scyllaPass: []const u8 = "";
 
 pub fn configureScylla(host: []const u8, port: u16, keyspace: []const u8, user: []const u8, pass: []const u8) void {
     scyllaHost = host;

@@ -118,11 +118,11 @@ const SIZE_BUDGET_BYTES: usize = 64 * 1024;
 
 pub fn saveBlock(conn: *CqlConn, ent: *const Entities, bs: BatchSizes) !void {
     try saveBlocks(conn, ent.blocks.items, bs.blocks);
-    try saveTxs(conn, ent.txs.items, bs.txs);
-    try saveLogs(conn, ent.logs.items, bs.logs);
-    try saveInternalTxs(conn, ent.internalTxs.items, bs.itxs);
-    try saveContracts(conn, ent.contracts.items, bs.contracts);
-    try saveContractsByAddr(conn, ent.contractsByAddr.items, bs.contracts);
+    try saveTxs(conn, ent.txs.items);
+    try saveLogs(conn, ent.logs.items);
+    try saveInternalTxs(conn, ent.internalTxs.items);
+    try saveContracts(conn, ent.contracts.items);
+    try saveContractsByAddr(conn, ent.contractsByAddr.items);
     try saveBlockCompletions(conn, ent);
 }
 
@@ -146,11 +146,11 @@ pub fn saveBlockRowsForEntities(g: *TableSave) void {
 
 pub fn saveContractRowsForEntities(g: *TableSave) void {
     for (g.ents) |ent| {
-        saveContracts(g.conn, ent.contracts.items, g.bs.contracts) catch |e| {
+        saveContracts(g.conn, ent.contracts.items) catch |e| {
             g.err = e;
             return;
         };
-        saveContractsByAddr(g.conn, ent.contractsByAddr.items, g.bs.contracts) catch |e| {
+        saveContractsByAddr(g.conn, ent.contractsByAddr.items) catch |e| {
             g.err = e;
             return;
         };
@@ -160,7 +160,6 @@ pub fn saveContractRowsForEntities(g: *TableSave) void {
 pub const TableLaneSave = struct {
     conn: *CqlConn,
     ents: []*const Entities,
-    bs: BatchSizes,
     lane: usize,
     nLanes: usize,
     err: ?anyerror = null,
@@ -178,7 +177,7 @@ pub fn saveLogRowsForLane(g: *TableLaneSave) void {
             return;
         };
     }
-    saveLogs(g.conn, rows.items, g.bs.logs) catch |e| {
+    saveLogs(g.conn, rows.items) catch |e| {
         g.err = e;
         return;
     };
@@ -196,7 +195,7 @@ pub fn saveItxRowsForLane(g: *TableLaneSave) void {
             return;
         };
     }
-    saveInternalTxs(g.conn, rows.items, g.bs.itxs) catch |e| {
+    saveInternalTxs(g.conn, rows.items) catch |e| {
         g.err = e;
         return;
     };
@@ -214,7 +213,7 @@ pub fn saveTxRowsForLane(g: *TableLaneSave) void {
             return;
         };
     }
-    saveTxs(g.conn, rows.items, g.bs.txs) catch |e| {
+    saveTxs(g.conn, rows.items) catch |e| {
         g.err = e;
         return;
     };
@@ -287,11 +286,11 @@ pub fn saveEntitiesParallel(
     defer tempAllocator.free(gItxs);
 
     for (0..txsN) |i|
-        gTxs[i] = .{ .conn = &connTxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = txsN };
+        gTxs[i] = .{ .conn = &connTxs[i], .ents = ents, .lane = i, .nLanes = txsN };
     for (0..logsN) |i|
-        gLogs[i] = .{ .conn = &connLogs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = logsN };
+        gLogs[i] = .{ .conn = &connLogs[i], .ents = ents, .lane = i, .nLanes = logsN };
     for (0..itxsN) |i|
-        gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = itxsN };
+        gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .lane = i, .nLanes = itxsN };
 
     // 1 (blocks) + txsN (txs) + logsN (logs) + itxsN (itxs); contracts run inline.
     const nSpawn = 1 + txsN + logsN + itxsN;
@@ -371,8 +370,7 @@ fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
     }
 }
 
-fn saveTxs(conn: *CqlConn, rows: []const TxRow, bs: usize) !void {
-    _ = bs;
+fn saveTxs(conn: *CqlConn, rows: []const TxRow) !void {
     if (rows.len == 0) return;
     var v = preallocBuf(512);
     defer v.deinit(tempAllocator);
@@ -419,8 +417,7 @@ fn saveTxs(conn: *CqlConn, rows: []const TxRow, bs: usize) !void {
     }
 }
 
-fn saveLogs(conn: *CqlConn, rows: []const LogRow, bs: usize) !void {
-    _ = bs;
+fn saveLogs(conn: *CqlConn, rows: []const LogRow) !void {
     if (rows.len == 0) return;
     var v = preallocBuf(512);
     defer v.deinit(tempAllocator);
@@ -461,8 +458,7 @@ fn saveLogs(conn: *CqlConn, rows: []const LogRow, bs: usize) !void {
     }
 }
 
-fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow, bs: usize) !void {
-    _ = bs;
+fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow) !void {
     if (rows.len == 0) return;
     var v = preallocBuf(192);
     defer v.deinit(tempAllocator);
@@ -498,8 +494,7 @@ fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow, bs: usize) !void
     }
 }
 
-fn saveContracts(conn: *CqlConn, rows: []const ContractRow, bs: usize) !void {
-    _ = bs;
+fn saveContracts(conn: *CqlConn, rows: []const ContractRow) !void {
     if (rows.len == 0) return;
     var v = preallocBuf(1024);
     defer v.deinit(tempAllocator);
@@ -538,8 +533,7 @@ fn saveContracts(conn: *CqlConn, rows: []const ContractRow, bs: usize) !void {
     }
 }
 
-fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow, bs: usize) !void {
-    _ = bs;
+fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow) !void {
     if (rows.len == 0) return;
     var v = preallocBuf(512);
     defer v.deinit(tempAllocator);

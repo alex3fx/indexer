@@ -27,12 +27,12 @@ pub const polygon: EvmChainConfig = .{
     },
     .rpcNodes = .{
         .lotosArchiveNode = .{
-            .https = "http://100.64.0.62:8545",
-            .wss = "ws://100.64.0.62:8546",
+            .https = "http://5.0.0.0:8545",
+            .wss = "ws://5.0.0.0:8546",
         },
         .lotosFullNode = .{
-            .https = "http://100.64.0.62:8545",
-            .wss = "ws://100.64.0.62:8546",
+            .https = "http://6.0.0.0:8545",
+            .wss = "ws://6.0.0.0:8546",
         },
         .mevFullNode = .{
             .https = "https://polygon-rpc.com",

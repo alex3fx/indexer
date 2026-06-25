@@ -707,9 +707,9 @@ fn saveAccumFn(args: *SaveArgs) void {
 // Y > N) — resuming from that batch's Y would skip N forever if the process is
 // killed/crashes before N's worker finally succeeds. This tracker only ever
 // reports a block number as safe-to-resume-past once every block from `from` up
-// to it has actually been saved, regardless of arrival/save order. Confirmed via
-// a real data scan 2026-06-23: kill -9 restarts during this exact race window
-// silently dropped ~2000+ blocks even after the worker-level "never skip" fix.
+// to it has actually been saved, regardless of arrival/save order. A resume
+// point based on `Accum X→Y` alone is NOT safe to use for this reason — always
+// resume from the last printed `[watermark] N` line instead.
 const Watermark = struct {
     gpa: Allocator,
     nextExpected: u64,

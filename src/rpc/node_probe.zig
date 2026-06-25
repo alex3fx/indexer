@@ -48,9 +48,9 @@ pub fn detect(gpa: Allocator, client: *FetchClient, url: []const u8) TraceMethod
     muUnlock();
     if (cached) |m| return m;
 
-    // https:// now goes through fetch.zig's curl-subprocess path (see task #4 — the
-    // ReleaseFast SIGILL was in std.http.Client's TLS stack, not here), so this can
-    // probe normally instead of defaulting blind.
+    // https:// goes through fetch.zig's curl-subprocess path (the ReleaseFast
+    // SIGILL is in std.http.Client's TLS stack, not here — see TODO.md), so this
+    // can probe normally instead of defaulting blind.
     const method = probeNode(gpa, client, url) catch blk: {
         std.debug.print("[node_probe] {s}: probe failed, defaulting to trace_block\n", .{url});
         break :blk TraceMethod.trace_block;

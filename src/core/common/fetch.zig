@@ -49,12 +49,11 @@ pub const Client = struct {
 
     /// https:// goes through a `curl` subprocess instead of std.http.Client's TLS
     /// stack: Zig 0.17-dev's std.crypto.ml_kem has a vectorized-codegen bug that
-    /// SIGILLs during the TLS handshake under -Doptimize=ReleaseFast (confirmed
-    /// root cause, see CONTEXT.md task #4 — a local toolchain patch fixes
-    /// ReleaseSafe but a second, unfound codegen bug still crashes ReleaseFast,
-    /// which is the only mode the production binary can use). HTTPS is only ever
-    /// the backup/public-RPC fallback tier here, never the hot path, so the extra
-    /// subprocess overhead is irrelevant and far simpler than chasing a compiler bug.
+    /// SIGILLs during the TLS handshake under -Doptimize=ReleaseFast — the only
+    /// optimize mode the production binary can use, so the compiler bug can't be
+    /// worked around by switching modes (see TODO.md). HTTPS is only ever the
+    /// backup/public-RPC fallback tier here, never the hot path, so the extra
+    /// subprocess overhead is irrelevant and far simpler than chasing the bug.
     pub fn fetch(self: *Client, options: Options) !Response {
         if (std.mem.startsWith(u8, options.url, "https://"))
             return fetchViaCurl(self.allocator, self.io, options);

@@ -85,7 +85,6 @@ const RealtimeContext = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         env: anytype,
-        chain: anytype,
         redisUrl: []const u8,
         chunkBuckets: u64,
         chunkEra: u64,
@@ -127,8 +126,6 @@ const RealtimeContext = struct {
             std.fmt.parseInt(u64, v, 10) catch 2000
         else
             2000;
-
-        _ = chain;
 
         return .{
             .rtConns = rtConns,
@@ -320,10 +317,10 @@ pub fn main(init: Init) !void {
     );
 
     // ── Backup RPC node (optional) ────────────────────────────────────────────
-    // https:// fetches now go through fetch.zig's curl-subprocess path (task #4 —
-    // the ReleaseFast SIGILL was in std.http.Client's TLS stack), so RESERVE_RPC_URL
-    // (what dynamic_tuner.py actually sets) is safe to wire in now. BACKUP_RPC_HTTPS
-    // kept as a manual override/alias for the same slot.
+    // https:// fetches go through fetch.zig's curl-subprocess path (works around a
+    // ReleaseFast SIGILL in std.http.Client's TLS stack — see TODO.md), so it's
+    // safe to point this at an https:// backup. RESERVE_RPC_URL is the canonical
+    // env var; BACKUP_RPC_HTTPS is kept as an alias for the same slot.
     const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("RESERVE_RPC_URL") orelse init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
         if (url.len > 0) EvmRpcNodeConfig{
             .https = url,
@@ -338,9 +335,9 @@ pub fn main(init: Init) !void {
 
     // ── Neighbor RPC node (optional) ───────────────────────────────────────────
     // Second retry tier for historical sync, between primary and "give up and
-    // record as skipped" (see pipeline.zig worker()). dynamic_tuner.py sets this
-    // to the OTHER dual-node split partner's RPC (.62<->.63) — both are plain
-    // HTTP, so unlike backupNode this doesn't hit the HTTPS/SIGILL issue (#4).
+    // record as skipped" (see pipeline.zig worker()) — typically the other half
+    // of a dual-node split, plain HTTP so it never hits the HTTPS SIGILL issue
+    // that backupNode works around.
     const neighborNode: ?EvmRpcNodeConfig = if (init.environ_map.get("NEIGHBOR_RPC_URL")) |url|
         if (url.len > 0) EvmRpcNodeConfig{
             .https = url,
@@ -448,7 +445,7 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     log.info("Realtime mode — listening for new blocks via WSS...");
 
-    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, chunkEra, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
+    var ctx = try RealtimeContext.init(gpa, io, env, redisUrl, chunkBuckets, chunkEra, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
 
     try runRealtimeLoop(io, gpa, &chain, &wsConnOpt.?, wsParsed, &ctx, toBlock, &log);

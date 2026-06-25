@@ -5,7 +5,7 @@ const core = @import("indexer/core");
 const utils = core.utils;
 const node_probe = @import("node_probe.zig");
 
-// std.time.nanoTimestamp doesn't exist in this Zig 0.17-dev (see feedback_zig_017dev) — same
+// std.time.nanoTimestamp doesn't exist in this Zig 0.17-dev snapshot — same
 // raw-syscall pattern used elsewhere in this codebase (e.g. pipeline.zig's nowNs()).
 fn nowNs() i64 {
     var ts: linux.timespec = undefined;

@@ -181,7 +181,6 @@ pub const Logger = struct {
         self.emit(msg, .err, "❌");
     }
 
-
     pub fn success(self: *Logger, msg: []const u8) void {
         self.emit(msg, .info, "✅");
     }
