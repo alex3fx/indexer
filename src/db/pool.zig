@@ -139,13 +139,14 @@ pub fn configureScylla(host: []const u8, port: u16, keyspace: []const u8, user: 
     scyllaPass = pass;
 }
 
-/// Best-effort: opens a one-shot connection, inserts one row, closes. Failure to
-/// record is logged but never propagated — losing the audit trail is bad, but
-/// must never be worse than the gap it's recording.
-pub fn recordSkippedBlock(gpa: std.mem.Allocator, blockNumber: i64, chunk: i32, reason: []const u8) void {
+/// Opens a one-shot connection, inserts one row, closes. Propagates failure to
+/// the caller (pipeline.zig's giveUpAndRecord) instead of swallowing it — a
+/// failed write here must NOT be treated as "recorded", or an explicit skip
+/// silently degrades into an untracked data gap.
+pub fn recordSkippedBlock(gpa: std.mem.Allocator, blockNumber: i64, chunk: i32, reason: []const u8) !void {
     var conn = CqlConn.init(gpa, scyllaHost, scyllaPort, scyllaKeyspace, scyllaUser, scyllaPass) catch |e| {
         std.debug.print("[skipped_blocks] connect failed: {s}\n", .{@errorName(e)});
-        return;
+        return e;
     };
     defer conn.deinit();
 
@@ -172,17 +173,18 @@ pub fn recordSkippedBlock(gpa: std.mem.Allocator, blockNumber: i64, chunk: i32, 
         &queryBuf,
         "INSERT INTO skipped_blocks (block_number, chunk, skipped_at, reason, resolved) VALUES ({d}, {d}, toTimestamp(now()), '{s}', false)",
         .{ blockNumber, chunk, escBuf[0..escLen] },
-    ) catch {
+    ) catch |e| {
         std.debug.print("[skipped_blocks] query format failed for block={d}\n", .{blockNumber});
-        return;
+        return e;
     };
 
     conn.sendQuery(query) catch |e| {
         std.debug.print("[skipped_blocks] insert failed for block={d}: {s}\n", .{ blockNumber, @errorName(e) });
-        return;
+        return e;
     };
     conn.recvFrameCheck() catch |e| {
         std.debug.print("[skipped_blocks] insert response error for block={d}: {s}\n", .{ blockNumber, @errorName(e) });
+        return e;
     };
 }
 

@@ -161,6 +161,29 @@ fn delayMs(ms: u64) void {
     _ = std.os.linux.nanosleep(&ts, null);
 }
 
+// Reconnect with backoff (1s,2s,4s,...30s) until it succeeds — never gives up,
+// since a transient WSS outage shouldn't permanently end realtime indexing.
+fn reconnectWss(gpa: std.mem.Allocator, wsConn: *ws.Conn, wsParsed: ws.ParsedUrl, log: *Logger) void {
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        wsConn.* = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch |err| {
+            const msg = std.fmt.allocPrint(gpa, "WSS reconnect attempt {d} failed: {s} — retrying", .{ attempt, @errorName(err) }) catch "";
+            defer if (msg.len > 0) gpa.free(msg);
+            log.warn(if (msg.len > 0) msg else "WSS reconnect failed — retrying");
+            delayMs(@as(u64, 1000) << @intCast(@min(attempt, 5)));
+            continue;
+        };
+        if (wsConn.subscribeNewHeads()) |_| return else |err| {
+            wsConn.deinit();
+            const msg = std.fmt.allocPrint(gpa, "WSS subscribe attempt {d} failed: {s} — retrying", .{ attempt, @errorName(err) }) catch "";
+            defer if (msg.len > 0) gpa.free(msg);
+            log.warn(if (msg.len > 0) msg else "WSS subscribe failed — retrying");
+            delayMs(@as(u64, 1000) << @intCast(@min(attempt, 5)));
+        }
+    }
+}
+
 fn runRealtimeLoop(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -179,8 +202,7 @@ fn runRealtimeLoop(
             defer if (msg.len > 0) gpa.free(msg);
             log.warn(if (msg.len > 0) msg else "WSS disconnected — reconnecting");
             wsConn.deinit();
-            wsConn.* = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch break;
-            _ = wsConn.subscribeNewHeads() catch break;
+            reconnectWss(gpa, wsConn, wsParsed, log);
             continue;
         };
 

@@ -330,20 +330,27 @@ fn tryFallbackNodes(
     return false;
 }
 
-/// Records the block as explicitly skipped (pol.skipped_blocks) and marks it
-/// ok=true with empty entities — it flows through the normal accum/save/watermark
-// pipeline as a (real, durable) zero-row block, so the watermark can advance
-/// instead of blocking the whole run on one unfetchable block forever. Caller
-/// must resetResult() before this so result.ent is empty.
-fn giveUpAndRecord(gpa: Allocator, blockNum: u64, chunkSize: u64, chunkBuckets: u64, chunkEra: u64, reason: []const u8, result: *BlockResult) void {
+/// Records the block as explicitly skipped (pol.skipped_blocks) and, only if that
+/// record durably lands, marks it ok=true with empty entities — it then flows
+/// through the normal accum/save/watermark pipeline as a (real, durable) zero-row
+/// block, so the watermark can advance instead of blocking the whole run on one
+/// unfetchable block forever. Returns false if the record itself failed (e.g.
+/// Scylla unreachable) — caller must NOT advance the watermark past this block in
+/// that case, or an explicit skip silently degrades into an untracked data gap.
+/// Caller must resetResult() before this so result.ent is empty.
+fn giveUpAndRecord(gpa: Allocator, blockNum: u64, chunkSize: u64, chunkBuckets: u64, chunkEra: u64, reason: []const u8, result: *BlockResult) bool {
     const chunk = computeChunk(blockNum, chunkSize, chunkBuckets, chunkEra);
     std.debug.print(
         "[worker] block={d} GIVING UP after {d} cycles (primary+neighbor+backup exhausted each time) — " ++
             "recording in pol.skipped_blocks and moving on ({s})\n",
         .{ blockNum, MAX_GIVE_UP_CYCLES, reason },
     );
-    pool.recordSkippedBlock(gpa, @intCast(blockNum), chunk, reason);
+    pool.recordSkippedBlock(gpa, @intCast(blockNum), chunk, reason) catch |e| {
+        std.debug.print("[worker] block={d} FAILED to record skip ({s}) — NOT giving up, will keep retrying\n", .{ blockNum, @errorName(e) });
+        return false;
+    };
     result.ok = true;
+    return true;
 }
 
 // Persistent (Redis-backed) replacement for a local cycleCount variable: a worker
@@ -436,9 +443,14 @@ fn worker(args: *WorkerArgs) !void {
                     cycleCount = bumpGiveupCycle(rdb, blockNum);
                     if (cycleCount >= MAX_GIVE_UP_CYCLES) {
                         resetResult(result);
-                        giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "skip_missing on primary+neighbor+backup", result);
-                        clearGiveupCycle(rdb, blockNum);
-                        break :retry;
+                        if (giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "skip_missing on primary+neighbor+backup", result)) {
+                            clearGiveupCycle(rdb, blockNum);
+                            break :retry;
+                        }
+                        sleepBackoff(cycleCount);
+                        retryCount = 0;
+                        resetResult(result);
+                        continue :retry;
                     }
                     std.debug.print("[worker] block={d} skip_missing on primary+neighbor+backup — retry cycle #{d}/{d}\n", .{ blockNum, cycleCount, MAX_GIVE_UP_CYCLES });
                     sleepBackoff(cycleCount);
@@ -457,9 +469,14 @@ fn worker(args: *WorkerArgs) !void {
                         cycleCount = bumpGiveupCycle(rdb, blockNum);
                         if (cycleCount >= MAX_GIVE_UP_CYCLES) {
                             resetResult(result);
-                            giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "stuck retry_later on primary+neighbor+backup", result);
-                            clearGiveupCycle(rdb, blockNum);
-                            break :retry;
+                            if (giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, "stuck retry_later on primary+neighbor+backup", result)) {
+                                clearGiveupCycle(rdb, blockNum);
+                                break :retry;
+                            }
+                            sleepBackoff(cycleCount);
+                            retryCount = 0;
+                            resetResult(result);
+                            continue :retry;
                         }
                         std.debug.print("[worker] block={d} unavailable on all nodes after {d} retries — retry cycle #{d}/{d}\n", .{ blockNum, retryCount, cycleCount, MAX_GIVE_UP_CYCLES });
                         sleepBackoff(cycleCount);
@@ -496,9 +513,14 @@ fn worker(args: *WorkerArgs) !void {
                         resetResult(result);
                         var reasonBuf: [128]u8 = undefined;
                         const reason = std.fmt.bufPrint(&reasonBuf, "error {s} on primary+neighbor+backup", .{@errorName(e)}) catch "error on primary+neighbor+backup";
-                        giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, reason, result);
-                        clearGiveupCycle(rdb, blockNum);
-                        break :retry;
+                        if (giveUpAndRecord(gpa, blockNum, chunkSize, chunkBuckets, chunkEra, reason, result)) {
+                            clearGiveupCycle(rdb, blockNum);
+                            break :retry;
+                        }
+                        sleepBackoff(cycleCount);
+                        retryCount = 0;
+                        resetResult(result);
+                        continue :retry;
                     }
                     std.debug.print("[worker] block={d} error: {s} on all nodes — retry cycle #{d}/{d}\n", .{ blockNum, @errorName(e), cycleCount, MAX_GIVE_UP_CYCLES });
                     sleepBackoff(cycleCount);
