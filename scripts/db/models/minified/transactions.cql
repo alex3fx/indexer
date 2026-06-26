@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   input text,
   from_address text,
   to_address text,
-  value bigint,
+  value varint,
   gas_limit bigint,
   gas_price bigint,
   gas_used bigint,

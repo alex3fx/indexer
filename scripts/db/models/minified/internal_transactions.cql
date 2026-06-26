@@ -8,6 +8,6 @@ CREATE TABLE IF NOT EXISTS internal_transactions (
   trace_index int,
   from_address text,
   to_address text,
-  value bigint,
+  value varint,
   PRIMARY KEY ((chunk), block_number, transaction_index, trace_index)
 ) WITH CLUSTERING ORDER BY (block_number ASC, transaction_index ASC, trace_index ASC);
