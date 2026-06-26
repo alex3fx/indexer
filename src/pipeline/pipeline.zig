@@ -16,6 +16,7 @@ const fetcher = @import("fetcher.zig");
 const parser = @import("parser.zig");
 const transformer = @import("transformer.zig");
 const Bloom = @import("bloom.zig").Bloom;
+const BytecodeBloom = @import("bytecode_bloom.zig").BytecodeBloom;
 const erc20 = @import("erc20.zig");
 const pool = @import("indexer/db").pool;
 const http_pool = @import("indexer/rpc").pool;
@@ -142,6 +143,7 @@ const WorkerArgs = struct {
     cancel: *std.atomic.Value(bool),
     backupNode: ?EvmRpcNodeConfig,
     bloom: *Bloom,
+    bytecodeBloom: *BytecodeBloom,
 };
 
 pub const FetchTransformStatus = union(enum) {
@@ -167,6 +169,7 @@ pub fn fetchParseTransform(
     tClient: *FetchClient,
     httpPool: ?*http_pool.HttpPool,
     bloom: *Bloom,
+    bytecodeBloom: *BytecodeBloom,
     result: *BlockResult,
 ) FetchTransformStatus {
     const t0 = nowNs();
@@ -206,6 +209,7 @@ pub fn fetchParseTransform(
         chunkSize,
         chunkBuckets,
         bloom,
+        bytecodeBloom,
         &result.ent,
     ) catch |e| return .{ .fatal = e };
     result.transformNs = nowNs() - t2;
@@ -256,7 +260,7 @@ fn worker(args: *WorkerArgs) !void {
         result.blockNum = blockNum;
 
         retry: while (true) {
-            switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, result)) {
+            switch (fetchParseTransform(gpa, args.io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result)) {
                 .ok => {
                     result.ok = true;
                     std.debug.print("[{d}] T:{d} L:{d} IT:{d}\n", .{
@@ -271,7 +275,7 @@ fn worker(args: *WorkerArgs) !void {
                     // Block null on primary — try backup before giving up.
                     if (args.backupNode) |backup| {
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, result) == .ok) {
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
                             result.ok = true;
                             std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
                                 blockNum,                  result.ent.txs.items.len,
@@ -296,7 +300,7 @@ fn worker(args: *WorkerArgs) !void {
                     if (args.backupNode) |backup| {
                         std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, result) == .ok) {
+                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
                             result.ok = true;
                             std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
                                 blockNum,                  result.ent.txs.items.len,
@@ -373,6 +377,7 @@ const HistoricalConns = struct {
     itxs: []pool.CqlConn,
     comp: pool.CqlConn,
     erc20: pool.CqlConn,
+    bytecode: pool.CqlConn,
 
     fn open(
         gpa: Allocator,
@@ -396,6 +401,8 @@ const HistoricalConns = struct {
         errdefer self.comp.deinit();
         self.erc20 = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.erc20.deinit();
+        self.bytecode = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer self.bytecode.deinit();
 
         self.txs = try gpa.alloc(pool.CqlConn, txsN);
         var txsOpened: usize = 0;
@@ -438,6 +445,7 @@ const HistoricalConns = struct {
         self.contracts.deinit();
         self.comp.deinit();
         self.erc20.deinit();
+        self.bytecode.deinit();
         for (self.txs) |*c| c.deinit();
         self.gpa.free(self.txs);
         for (self.logs) |*c| c.deinit();
@@ -463,6 +471,7 @@ const HistoricalConns = struct {
             .cItxs = self.itxs,
             .cComp = &self.comp,
             .cErc20 = &self.erc20,
+            .cBytecode = &self.bytecode,
             .rdb = rdb,
             .bs = bs,
             .chain = chain,
@@ -482,6 +491,7 @@ const SaveArgs = struct {
     cItxs: []pool.CqlConn,
     cComp: *pool.CqlConn,
     cErc20: *pool.CqlConn,
+    cBytecode: *pool.CqlConn,
     rdb: *cursor.Conn,
     bs: pool.BatchSizes,
     chain: *const EvmChainConfig,
@@ -532,6 +542,7 @@ fn saveAccumFn(args: *SaveArgs) void {
         args.cItxs,
         args.cComp,
         args.cErc20,
+        args.cBytecode,
         ac.entPtrs.items,
         args.bs,
     ) catch |e| {
@@ -599,6 +610,7 @@ fn spawnHistoricalWorkers(
     threads: []std.Thread,
     backupNode: ?EvmRpcNodeConfig,
     bloom: *Bloom,
+    bytecodeBloom: *BytecodeBloom,
 ) !void {
     for (0..threads.len) |w| {
         const wargs = try gpa.create(WorkerArgs);
@@ -613,6 +625,7 @@ fn spawnHistoricalWorkers(
             .cancel = cancel,
             .backupNode = backupNode,
             .bloom = bloom,
+            .bytecodeBloom = bytecodeBloom,
         };
         threads[w] = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
     }
@@ -661,6 +674,7 @@ fn retryMissingBlocks(
     bs: pool.BatchSizes,
     chunkBuckets: u64,
     bloom: *Bloom,
+    bytecodeBloom: *BytecodeBloom,
 ) !void {
     if (skipped.len == 0) return;
     std.debug.print("\n[historical] {d} skipped block(s) — retrying...\n", .{skipped.len});
@@ -683,7 +697,7 @@ fn retryMissingBlocks(
         result.blockNum = blockNum;
 
         // Try primary.
-        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, &result)) {
+        var found = switch (fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, bytecodeBloom, &result)) {
             .ok => true,
             else => false,
         };
@@ -692,7 +706,7 @@ fn retryMissingBlocks(
         if (!found) {
             if (backupNode) |backup| {
                 resetResult(&result);
-                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, &result)) {
+                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, bytecodeBloom, &result)) {
                     .ok => true,
                     else => false,
                 };
@@ -715,6 +729,7 @@ fn retryMissingBlocks(
                 conns.itxs,
                 &conns.comp,
                 &conns.erc20,
+                &conns.bytecode,
                 ents[0..],
                 bs,
             ) catch |e| {
@@ -779,7 +794,7 @@ pub fn runHistorical(
 
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
-    try spawnHistoricalWorkers(gpa, io, chain, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &erc20Ctx.bloom);
+    try spawnHistoricalWorkers(gpa, io, chain, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
@@ -831,5 +846,5 @@ pub fn runHistorical(
 
     // Retry any blocks that were skipped during the main pass, then verify
     // all are present before the caller transitions to realtime mode.
-    try retryMissingBlocks(gpa, io, chain, backupNode, skippedBlocks.items, &conns, bs, chunkBuckets, &erc20Ctx.bloom);
+    try retryMissingBlocks(gpa, io, chain, backupNode, skippedBlocks.items, &conns, bs, chunkBuckets, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom);
 }

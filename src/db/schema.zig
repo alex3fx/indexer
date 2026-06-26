@@ -179,6 +179,21 @@ pub const Erc20SelfDestructRow = struct {
     atTimestamp: i64,
 };
 
+// Deduplicated bytecode store: one row per unique sha256(deployed_bytecode).
+pub const BytecodeStoreRow = struct {
+    bytecodeHash: [32]u8, // raw sha256 output
+    bytecode: []const u8, // raw binary bytecode (hex-decoded from RPC)
+    size: i32,
+    firstSeenBlock: i64,
+};
+
+// contracts_by_bytecode_hash: hash → set of addresses that share this bytecode.
+pub const ContractsByHashRow = struct {
+    bytecodeHash: [32]u8, // raw sha256 output
+    address: []const u8,  // hex text, consistent with other tables
+    creationBlock: i64,
+};
+
 pub const Entities = struct {
     blocks: std.ArrayList(BlockRow),
     txs: std.ArrayList(TxRow),
@@ -193,5 +208,7 @@ pub const Entities = struct {
     erc20Supplies: std.ArrayList(Erc20SupplyRow),
     erc20Owners: std.ArrayList(Erc20OwnerRow),
     erc20SelfDestructs: std.ArrayList(Erc20SelfDestructRow),
+    bytecodeStore: std.ArrayList(BytecodeStoreRow),
+    contractsByHash: std.ArrayList(ContractsByHashRow),
     lastBlock: u64,
 };

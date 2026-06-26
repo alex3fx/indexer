@@ -68,14 +68,14 @@ pub fn processBlock(
 
     const t_recv_ms = realtimeMs();
 
-    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &erc20Ctx.bloom, &result);
+    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result);
 
     const fetched = switch (primaryStatus) {
         .ok => true,
         .retry_later, .skip_missing => blk: {
             if (backupNode) |backup| {
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
             }
             break :blk false;
         },
@@ -84,7 +84,7 @@ pub fn processBlock(
             if (backupNode) |backup| {
                 std.debug.print(" — trying backup\n", .{});
                 pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &result) == .ok;
+                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
             }
             std.debug.print("\n", .{});
             break :blk false;

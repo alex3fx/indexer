@@ -43,7 +43,7 @@ if [ "$SCYLLA_DB_PORT" -gt 65535 ]; then
   exit 1
 fi
 
-keyspace="i${EVM_CHAIN_ID}"
+keyspace="${SCYLLA_DB_KEYSPACE:-i${EVM_CHAIN_ID}}"
 init_query="CREATE KEYSPACE IF NOT EXISTS \"$keyspace\" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};"
 
 cqlsh_args=(
@@ -65,6 +65,9 @@ models=(
   "db/models/lookups/erc20_total_supplies.cql"
   "db/models/lookups/erc20_owners.cql"
   "db/models/lookups/erc20_self_destructed.cql"
+  "db/models/lookups/bytecode_store.cql"
+  "db/models/lookups/contracts_by_bytecode_hash.cql"
+  "db/models/lookups/bytecode_collision_registry.cql"
 )
 
 echo "sync.sh: initializing keyspace $keyspace"

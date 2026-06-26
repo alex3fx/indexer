@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("indexer/rpc").types;
 const schema = @import("indexer/db").schema;
 const Bloom = @import("bloom.zig").Bloom;
+const BytecodeBloom = @import("bytecode_bloom.zig").BytecodeBloom;
 
 const RpcBlock = types.RpcBlock;
 const RpcReceipt = types.RpcReceipt;
@@ -19,6 +20,41 @@ pub const ContractRow = schema.ContractRow;
 pub const ContractByAddrRow = schema.ContractByAddrRow;
 pub const Erc20Candidate = schema.Erc20Candidate;
 pub const Entities = schema.Entities;
+pub const BytecodeStoreRow = schema.BytecodeStoreRow;
+pub const ContractsByHashRow = schema.ContractsByHashRow;
+
+// ─── Bytecode SHA-256 helpers ─────────────────────────────────────────────────
+
+inline fn hexNibble(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => 0,
+    };
+}
+
+// Decode a hex bytecode string ("0x..." or raw hex) into raw bytes using arena.
+// Odd-length or invalid nibbles: best-effort (treat as 0).
+fn decodeHexBytecode(arena: std.mem.Allocator, hex: []const u8) ![]u8 {
+    var h = hex;
+    if (h.len >= 2 and h[0] == '0' and (h[1] == 'x' or h[1] == 'X')) h = h[2..];
+    const byteLen = h.len / 2;
+    const out = try arena.alloc(u8, byteLen);
+    var i: usize = 0;
+    while (i < byteLen) : (i += 1) {
+        out[i] = (hexNibble(h[i * 2]) << 4) | hexNibble(h[i * 2 + 1]);
+    }
+    return out;
+}
+
+// Compute sha256 of the raw (decoded) bytecode. hexStr is the "0x..." RPC string.
+fn sha256OfBytecode(arena: std.mem.Allocator, hexStr: []const u8) ![32]u8 {
+    const raw = try decodeHexBytecode(arena, hexStr);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+    return digest;
+}
 
 // ─── ERC-20 selector scan ───────────────────────────────────────────────────
 // EIP-20 function selectors (keccak256(signature)[0..4]), lowercase hex, no "0x".
@@ -145,6 +181,8 @@ pub fn initEntities() Entities {
         .erc20Supplies = .empty,
         .erc20Owners = .empty,
         .erc20SelfDestructs = .empty,
+        .bytecodeStore = .empty,
+        .contractsByHash = .empty,
         .lastBlock = 0,
     };
 }
@@ -159,9 +197,10 @@ pub fn transformBlock(
     traces: []const RpcTrace,
     chunkSize: u64,
     bloom: *Bloom,
+    bytecodeBloom: *BytecodeBloom,
     ent: *Entities,
 ) !void {
-    return transformBlockWithRemap(arena, block, receipts, traces, chunkSize, 0, bloom, ent);
+    return transformBlockWithRemap(arena, block, receipts, traces, chunkSize, 0, bloom, bytecodeBloom, ent);
 }
 
 pub fn transformBlockWithRemap(
@@ -172,6 +211,7 @@ pub fn transformBlockWithRemap(
     chunkSize: u64,
     remapMod: u64,
     bloom: *Bloom,
+    bytecodeBloom: *BytecodeBloom,
     ent: *Entities,
 ) !void {
     if (receipts.len != block.transactions.len) return error.IncompleteBlock;
@@ -341,6 +381,23 @@ pub fn transformBlockWithRemap(
                     .contractFactory = factory,
                     .creationBytecode = creationBc,
                     .deployedBytecode = deployedBc,
+                });
+
+                const bcHash = sha256OfBytecode(arena, deployedBc) catch std.mem.zeroes([32]u8);
+                if (!bytecodeBloom.mightContain(&bcHash)) {
+                    const rawBytes = decodeHexBytecode(arena, deployedBc) catch &.{};
+                    try ent.bytecodeStore.append(arena, .{
+                        .bytecodeHash = bcHash,
+                        .bytecode = rawBytes,
+                        .size = @intCast(rawBytes.len),
+                        .firstSeenBlock = number,
+                    });
+                    bytecodeBloom.insert(&bcHash);
+                }
+                try ent.contractsByHash.append(arena, .{
+                    .bytecodeHash = bcHash,
+                    .address = addrLower,
+                    .creationBlock = number,
                 });
 
                 const sel = scanErc20Selectors(deployedBc);

@@ -243,6 +243,14 @@ pub fn valBool(list: *std.ArrayList(u8), v: bool) !void {
     try list.appendSlice(tempAllocator, &b);
 }
 
+// CQL blob: 4-byte length prefix + raw bytes. Same wire encoding as text.
+pub fn valBlob(list: *std.ArrayList(u8), data: []const u8) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b, @intCast(data.len), .big);
+    try list.appendSlice(tempAllocator, &b);
+    try list.appendSlice(tempAllocator, data);
+}
+
 pub fn valListText(list: *std.ArrayList(u8), items: []const []const u8) !void {
     var total: usize = 4;
     for (items) |item| total += 4 + item.len;
@@ -285,6 +293,8 @@ pub const PreparedIds = struct {
     erc20OwnerInsert: Prepared,
     erc20OwnerUpdate: Prepared,
     erc20SelfDestruct: Prepared,
+    bytecodeStore: Prepared,
+    contractsByHash: Prepared,
 };
 
 const INSERT_BLOCKS = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
@@ -300,6 +310,8 @@ const UPDATE_ERC20_SUPPLY = "UPDATE erc20_total_supplies SET latest_total_supply
 const INSERT_ERC20_OWNER = "INSERT INTO erc20_owners (address,chain_id,initial_owner,latest_owner,is_ownership_renounced,updated_at_block,updated_at_timestamp) VALUES (?,?,?,?,?,?,?)";
 const UPDATE_ERC20_OWNER = "UPDATE erc20_owners SET latest_owner=?,is_ownership_renounced=?,updated_at_block=?,updated_at_timestamp=? WHERE address=?";
 const INSERT_ERC20_SELFDESTRUCT = "INSERT INTO erc20_self_destructed (address,chain_id,at_block,at_timestamp) VALUES (?,?,?,?)";
+const INSERT_BYTECODE_STORE = "INSERT INTO bytecode_store (bytecode_hash,bytecode,size,first_seen_block,has_collision) VALUES (?,?,?,?,?)";
+const INSERT_CONTRACTS_BY_HASH = "INSERT INTO contracts_by_bytecode_hash (bytecode_hash,address,creation_block) VALUES (?,?,?)";
 
 // ─── CqlConn ──────────────────────────────────────────────────────────────────
 
@@ -563,6 +575,8 @@ fn freePreparedIds(gpa: std.mem.Allocator, ids: PreparedIds) void {
     gpa.free(ids.erc20OwnerInsert.id);
     gpa.free(ids.erc20OwnerUpdate.id);
     gpa.free(ids.erc20SelfDestruct.id);
+    gpa.free(ids.bytecodeStore.id);
+    gpa.free(ids.contractsByHash.id);
 }
 
 fn makePrepared(conn: *CqlConn, query: []const u8) !Prepared {
@@ -584,5 +598,7 @@ pub fn prepareAll(conn: *CqlConn) !PreparedIds {
         .erc20OwnerInsert = try makePrepared(conn, INSERT_ERC20_OWNER),
         .erc20OwnerUpdate = try makePrepared(conn, UPDATE_ERC20_OWNER),
         .erc20SelfDestruct = try makePrepared(conn, INSERT_ERC20_SELFDESTRUCT),
+        .bytecodeStore = try makePrepared(conn, INSERT_BYTECODE_STORE),
+        .contractsByHash = try makePrepared(conn, INSERT_CONTRACTS_BY_HASH),
     };
 }

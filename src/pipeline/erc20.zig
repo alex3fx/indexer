@@ -13,6 +13,7 @@ const core = @import("indexer/core");
 const rpcMod = @import("indexer/rpc");
 const dbMod = @import("indexer/db");
 const Bloom = @import("bloom.zig").Bloom;
+const BytecodeBloom = @import("bytecode_bloom.zig").BytecodeBloom;
 const transformer = @import("transformer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -38,6 +39,7 @@ pub const MULTICALL_CHUNK_SIZE_DEFAULT: usize = 200;
 pub const Erc20Context = struct {
     gpa: Allocator,
     bloom: Bloom,
+    bytecodeBloom: BytecodeBloom,
     client: FetchClient,
     multicall3Bytecode: ?[]u8,
     multicallChunkSize: usize,
@@ -45,6 +47,9 @@ pub const Erc20Context = struct {
     pub fn init(gpa: Allocator, io: std.Io, chain: *const EvmChainConfig, multicallChunkSize: usize) !Erc20Context {
         var bloom = try Bloom.init(gpa);
         errdefer bloom.deinit(gpa);
+
+        var bytecodeBloom = try BytecodeBloom.init(gpa);
+        errdefer bytecodeBloom.deinit(gpa);
 
         var client = FetchClient.init(gpa, io);
         errdefer client.deinit();
@@ -71,6 +76,7 @@ pub const Erc20Context = struct {
         return .{
             .gpa = gpa,
             .bloom = bloom,
+            .bytecodeBloom = bytecodeBloom,
             .client = client,
             .multicall3Bytecode = multicall3Bytecode,
             .multicallChunkSize = if (multicallChunkSize > 0) multicallChunkSize else MULTICALL_CHUNK_SIZE_DEFAULT,
@@ -81,6 +87,7 @@ pub const Erc20Context = struct {
         if (self.multicall3Bytecode) |bc| self.gpa.free(bc);
         self.client.deinit();
         self.bloom.deinit(self.gpa);
+        self.bytecodeBloom.deinit(self.gpa);
     }
 
     fn overrideFor(self: *const Erc20Context, mc: EvmContractConfig, blockNumber: u64) ?[]const u8 {

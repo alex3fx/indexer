@@ -19,6 +19,8 @@ const Erc20TokenRow = schema.Erc20TokenRow;
 const Erc20SupplyRow = schema.Erc20SupplyRow;
 const Erc20OwnerRow = schema.Erc20OwnerRow;
 const Erc20SelfDestructRow = schema.Erc20SelfDestructRow;
+const BytecodeStoreRow = schema.BytecodeStoreRow;
+const ContractsByHashRow = schema.ContractsByHashRow;
 
 // ─── RealtimeConns ────────────────────────────────────────────────────────────
 // 32 persistent CQL connections for parallel per-table writes in realtime mode.
@@ -44,6 +46,7 @@ pub const RealtimeConns = struct {
     contracts: CqlConn,
     comp: CqlConn,
     erc20: CqlConn,
+    bytecode: CqlConn,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -78,7 +81,9 @@ pub const RealtimeConns = struct {
         errdefer contracts.deinit();
         var comp = try CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer comp.deinit();
-        const erc20 = try CqlConn.init(gpa, host, port, ks, user, pass);
+        var erc20 = try CqlConn.init(gpa, host, port, ks, user, pass);
+        errdefer erc20.deinit();
+        const bytecode = try CqlConn.init(gpa, host, port, ks, user, pass);
         return .{
             .gpa = gpa,
             .host = host,
@@ -93,6 +98,7 @@ pub const RealtimeConns = struct {
             .contracts = contracts,
             .comp = comp,
             .erc20 = erc20,
+            .bytecode = bytecode,
         };
     }
 
@@ -104,6 +110,7 @@ pub const RealtimeConns = struct {
         self.contracts.deinit();
         self.comp.deinit();
         self.erc20.deinit();
+        self.bytecode.deinit();
         self.gpa.free(self.txs);
         self.gpa.free(self.logs);
         self.gpa.free(self.itxs);
@@ -118,6 +125,7 @@ pub const RealtimeConns = struct {
         self.contracts.ping() catch return false;
         self.comp.ping() catch return false;
         self.erc20.ping() catch return false;
+        self.bytecode.ping() catch return false;
         return true;
     }
 
@@ -147,6 +155,9 @@ pub const RealtimeConns = struct {
         self.erc20.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
             firstErr = firstErr orelse e;
         };
+        self.bytecode.reopen(self.host, self.port, self.ks, self.user, self.pass) catch |e| {
+            firstErr = firstErr orelse e;
+        };
         if (firstErr) |e| return e;
     }
 };
@@ -161,6 +172,7 @@ pub fn saveBlockRt(conns: *RealtimeConns, ent: *const Entities, bs: BatchSizes) 
         conns.itxs,
         &conns.comp,
         &conns.erc20,
+        &conns.bytecode,
         @constCast(&ents),
         bs,
     );
@@ -237,6 +249,19 @@ pub fn saveErc20RowsForEntities(g: *TableSave) void {
             return;
         };
         saveErc20SelfDestructs(g.conn, ent.erc20SelfDestructs.items, g.bs.contracts) catch |e| {
+            g.err = e;
+            return;
+        };
+    }
+}
+
+pub fn saveBytecodeRowsForEntities(g: *TableSave) void {
+    for (g.ents) |ent| {
+        saveBytecodeStore(g.conn, ent.bytecodeStore.items, g.bs.contracts) catch |e| {
+            g.err = e;
+            return;
+        };
+        saveContractsByHash(g.conn, ent.contractsByHash.items, g.bs.contracts) catch |e| {
             g.err = e;
             return;
         };
@@ -355,6 +380,7 @@ pub fn saveEntitiesParallel(
     connItxs: []CqlConn,
     connComp: *CqlConn,
     connErc20: *CqlConn,
+    connBytecode: *CqlConn,
     ents: []*const Entities,
     bs: BatchSizes,
 ) !void {
@@ -367,6 +393,7 @@ pub fn saveEntitiesParallel(
     var gBlocks = TableSave{ .conn = connBlocks, .ents = ents, .bs = bs };
     var gContracts = TableSave{ .conn = connContracts, .ents = ents, .bs = bs };
     var gErc20 = TableSave{ .conn = connErc20, .ents = ents, .bs = bs };
+    var gBytecode = TableSave{ .conn = connBytecode, .ents = ents, .bs = bs };
     const gTxs = try tempAllocator.alloc(TableLaneSave, txsN);
     defer tempAllocator.free(gTxs);
     const gLogs = try tempAllocator.alloc(TableLaneSave, logsN);
@@ -381,8 +408,8 @@ pub fn saveEntitiesParallel(
     for (0..itxsN) |i|
         gItxs[i] = .{ .conn = &connItxs[i], .ents = ents, .bs = bs, .lane = i, .nLanes = itxsN };
 
-    // 1 (blocks) + 1 (erc20) + txsN (txs) + logsN (logs) + itxsN (itxs); contracts run inline.
-    const nSpawn = 2 + txsN + logsN + itxsN;
+    // 1 (blocks) + 1 (erc20) + 1 (bytecode) + txsN (txs) + logsN (logs) + itxsN (itxs); contracts run inline.
+    const nSpawn = 3 + txsN + logsN + itxsN;
     const threads = try tempAllocator.alloc(std.Thread, nSpawn);
     defer tempAllocator.free(threads);
     var spawned: usize = 0;
@@ -411,6 +438,8 @@ pub fn saveEntitiesParallel(
     spawned += 1;
     threads[spawned] = try std.Thread.spawn(.{}, saveErc20RowsForEntities, .{&gErc20});
     spawned += 1;
+    threads[spawned] = try std.Thread.spawn(.{}, saveBytecodeRowsForEntities, .{&gBytecode});
+    spawned += 1;
 
     saveContractRowsForEntities(&gContracts);
 
@@ -420,6 +449,7 @@ pub fn saveEntitiesParallel(
     if (gBlocks.err) |e| return e;
     if (gContracts.err) |e| return e;
     if (gErc20.err) |e| return e;
+    if (gBytecode.err) |e| return e;
     for (gTxs) |g| if (g.err) |e| return e;
     for (gLogs) |g| if (g.err) |e| return e;
     for (gItxs) |g| if (g.err) |e| return e;
@@ -441,6 +471,8 @@ const ERC20_SUPPLY_UPDATE_COLS: u16 = 4;
 const ERC20_OWNER_INSERT_COLS: u16 = 7;
 const ERC20_OWNER_UPDATE_COLS: u16 = 5;
 const ERC20_SELFDESTRUCT_COLS: u16 = 4;
+const BYTECODE_STORE_COLS: u16 = 5;
+const CONTRACTS_BY_HASH_COLS: u16 = 3;
 
 fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
     if (rows.len == 0) return;
@@ -929,5 +961,69 @@ fn saveBlockCompletions(conn: *CqlConn, ent: *const Entities) !void {
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
         try conn.batchSendRows(&conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
         i = bEnd;
+    }
+}
+
+fn saveBytecodeStore(conn: *CqlConn, rows: []const BytecodeStoreRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v = preallocBuf(256);
+    defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 256);
+    defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs: [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            const r = &rows[j];
+            try pool.valBlob(&v, r.bytecodeHash[0..]);
+            try pool.valBlob(&v, r.bytecode);
+            try pool.valInt32(&v, r.size);
+            try pool.valBigint(&v, r.firstSeenBlock);
+            try pool.valBool(&v, false); // has_collision: always false at write time
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(&conn.prepIds.bytecodeStore, BYTECODE_STORE_COLS, ptrs[0..enc]);
+        i = end;
+    }
+}
+
+fn saveContractsByHash(conn: *CqlConn, rows: []const ContractsByHashRow, bs: usize) !void {
+    if (rows.len == 0) return;
+    const chunk = @min(bs, MAX_BS);
+    var v = preallocBuf(128);
+    defer v.deinit(tempAllocator);
+    var bd = preallocBuf(chunk *% 128);
+    defer bd.deinit(tempAllocator);
+    var starts: [MAX_BS + 1]usize = undefined;
+    var ptrs: [MAX_BS][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const end = @min(i + chunk, rows.len);
+        bd.items.len = 0;
+        var enc: usize = 0;
+        for (i..end) |j| {
+            v.items.len = 0;
+            starts[enc] = bd.items.len;
+            const r = &rows[j];
+            try pool.valBlob(&v, r.bytecodeHash[0..]);
+            try pool.valTextRequired(&v, r.address);
+            try pool.valBigint(&v, r.creationBlock);
+            try bd.appendSlice(tempAllocator, v.items);
+            enc += 1;
+        }
+        starts[enc] = bd.items.len;
+        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
+        try conn.batchSendRows(&conn.prepIds.contractsByHash, CONTRACTS_BY_HASH_COLS, ptrs[0..enc]);
+        i = end;
     }
 }
