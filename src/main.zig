@@ -349,17 +349,26 @@ pub fn main(init: Init) !void {
         (readCursorBlock(&rdb, gpa) orelse 0);
 
     // ── WSS: get current head ─────────────────────────────────────────────────
+    // Only opened when `--to` is absent (realtime/head-discovery path needs it).
+    // In pure historical mode (--to given, e.g. benchmarks) the connection was
+    // never read after subscribeNewHeads() — its receive buffer fills up with
+    // unread newHeads pushes for the whole run and can eventually stall the
+    // process (observed live: throughput collapsed to ~0 after the socket's
+    // backlog grew unbounded over a long historical run).
     const wssUrl = chain.rpcNodes.lotosArchiveNode.wss;
     const wsParsed = ws.parseUrl(wssUrl);
 
-    var wsConn = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch |err| {
-        std.debug.print("WSS connect failed ({s}): {s}\n", .{ wssUrl, @errorName(err) });
-        return err;
-    };
-    defer wsConn.deinit();
-    _ = try wsConn.subscribeNewHeads();
+    var wsConn: ws.Conn = undefined;
+    var wsConnInit = false;
+    defer if (wsConnInit) wsConn.deinit();
 
     const toBlock: u64 = cli.to orelse blk: {
+        wsConn = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch |err| {
+            std.debug.print("WSS connect failed ({s}): {s}\n", .{ wssUrl, @errorName(err) });
+            return err;
+        };
+        wsConnInit = true;
+        _ = try wsConn.subscribeNewHeads();
         const head = wsConn.nextBlockNum() catch 0;
         break :blk if (head > 0) head else {
             std.debug.print("Could not get current head from WSS\n", .{});

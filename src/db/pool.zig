@@ -260,20 +260,31 @@ pub fn valListText(list: *std.ArrayList(u8), items: []const []const u8) !void {
 
 // ─── Prepared statement IDs ───────────────────────────────────────────────────
 
+// Scylla can evict a prepared statement from its cache under pressure (e.g.
+// many concurrent connections each preparing the same query) without the
+// connection itself dying — the server replies UNPREPARED (code 0x2500) on
+// the next EXECUTE/BATCH using that id. The CQL-correct response is to
+// transparently re-PREPARE and retry, not fail the whole batch — so each
+// cached id carries its source query text for that purpose.
+pub const Prepared = struct {
+    id: []u8,
+    query: []const u8,
+};
+
 pub const PreparedIds = struct {
-    blocks: []u8,
-    transactions: []u8,
-    logs: []u8,
-    internalTxs: []u8,
-    contracts: []u8,
-    contractsByAddr: []u8,
-    blockCompletions: []u8,
-    erc20Tokens: []u8,
-    erc20SupplyInsert: []u8,
-    erc20SupplyUpdate: []u8,
-    erc20OwnerInsert: []u8,
-    erc20OwnerUpdate: []u8,
-    erc20SelfDestruct: []u8,
+    blocks: Prepared,
+    transactions: Prepared,
+    logs: Prepared,
+    internalTxs: Prepared,
+    contracts: Prepared,
+    contractsByAddr: Prepared,
+    blockCompletions: Prepared,
+    erc20Tokens: Prepared,
+    erc20SupplyInsert: Prepared,
+    erc20SupplyUpdate: Prepared,
+    erc20OwnerInsert: Prepared,
+    erc20OwnerUpdate: Prepared,
+    erc20SelfDestruct: Prepared,
 };
 
 const INSERT_BLOCKS = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
@@ -472,6 +483,11 @@ pub const CqlConn = struct {
             const msgLen = if (readLen >= 6) std.mem.readInt(u16, tmp[4..6], .big) else 0;
             const msg = tmp[6..@min(6 + @as(usize, msgLen), readLen)];
             std.debug.print("[CQL ERROR] code=0x{x:0>4} msg={s}\n", .{ code, msg });
+            // 0x2500 = Unprepared — the server's prepared-statement cache
+            // evicted this id (normal under cache pressure, not a dead
+            // connection). Distinguish it so callers can re-PREPARE and
+            // retry instead of treating it as fatal.
+            if (code == 0x2500) return error.CqlUnprepared;
             return error.CqlError;
         }
         var remain: usize = bodyLen -| readLen;
@@ -483,7 +499,23 @@ pub const CqlConn = struct {
         }
     }
 
-    pub fn batchSendRows(self: *CqlConn, prepId: []const u8, nVals: u16, rowBufs: []const []const u8) !void {
+    /// Sends a batch using `prep.id`; on Unprepared (0x2500) — re-PREPAREs
+    /// `prep.query` on this connection, updates `prep.id` in place, and
+    /// retries once. Scylla can evict a prepared statement from cache under
+    /// pressure without the connection dying, so this is expected/recoverable,
+    /// not a fatal error (verified live: a long historical run aborted on
+    /// "No prepared statement with ID ... found" while otherwise healthy).
+    pub fn batchSendRows(self: *CqlConn, prep: *Prepared, nVals: u16, rowBufs: []const []const u8) !void {
+        self.sendBatchOnce(prep.id, nVals, rowBufs) catch |err| {
+            if (err != error.CqlUnprepared) return err;
+            const newId = try self.prepare(prep.query);
+            self.gpa.free(prep.id);
+            prep.id = newId;
+            try self.sendBatchOnce(prep.id, nVals, rowBufs);
+        };
+    }
+
+    fn sendBatchOnce(self: *CqlConn, prepId: []const u8, nVals: u16, rowBufs: []const []const u8) !void {
         if (rowBufs.len == 0) return;
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(tempAllocator);
@@ -508,8 +540,8 @@ pub const CqlConn = struct {
 
         if (frame.items.len > 400 * 1024 and rowBufs.len > 1) {
             const mid = rowBufs.len / 2;
-            try self.batchSendRows(prepId, nVals, rowBufs[0..mid]);
-            try self.batchSendRows(prepId, nVals, rowBufs[mid..]);
+            try self.sendBatchOnce(prepId, nVals, rowBufs[0..mid]);
+            try self.sendBatchOnce(prepId, nVals, rowBufs[mid..]);
             return;
         }
         try self.sendFrame(OPCODE_BATCH, frame.items);
@@ -518,35 +550,39 @@ pub const CqlConn = struct {
 };
 
 fn freePreparedIds(gpa: std.mem.Allocator, ids: PreparedIds) void {
-    gpa.free(ids.blocks);
-    gpa.free(ids.transactions);
-    gpa.free(ids.logs);
-    gpa.free(ids.internalTxs);
-    gpa.free(ids.contracts);
-    gpa.free(ids.contractsByAddr);
-    gpa.free(ids.blockCompletions);
-    gpa.free(ids.erc20Tokens);
-    gpa.free(ids.erc20SupplyInsert);
-    gpa.free(ids.erc20SupplyUpdate);
-    gpa.free(ids.erc20OwnerInsert);
-    gpa.free(ids.erc20OwnerUpdate);
-    gpa.free(ids.erc20SelfDestruct);
+    gpa.free(ids.blocks.id);
+    gpa.free(ids.transactions.id);
+    gpa.free(ids.logs.id);
+    gpa.free(ids.internalTxs.id);
+    gpa.free(ids.contracts.id);
+    gpa.free(ids.contractsByAddr.id);
+    gpa.free(ids.blockCompletions.id);
+    gpa.free(ids.erc20Tokens.id);
+    gpa.free(ids.erc20SupplyInsert.id);
+    gpa.free(ids.erc20SupplyUpdate.id);
+    gpa.free(ids.erc20OwnerInsert.id);
+    gpa.free(ids.erc20OwnerUpdate.id);
+    gpa.free(ids.erc20SelfDestruct.id);
+}
+
+fn makePrepared(conn: *CqlConn, query: []const u8) !Prepared {
+    return .{ .id = try conn.prepare(query), .query = query };
 }
 
 pub fn prepareAll(conn: *CqlConn) !PreparedIds {
     return .{
-        .blocks = try conn.prepare(INSERT_BLOCKS),
-        .transactions = try conn.prepare(INSERT_TXS),
-        .logs = try conn.prepare(INSERT_LOGS),
-        .internalTxs = try conn.prepare(INSERT_INT_TXS),
-        .contracts = try conn.prepare(INSERT_CONTRACTS),
-        .contractsByAddr = try conn.prepare(INSERT_CONTRACTS_BY_ADDR),
-        .blockCompletions = try conn.prepare(INSERT_BLOCK_COMPLETIONS),
-        .erc20Tokens = try conn.prepare(INSERT_ERC20_TOKENS),
-        .erc20SupplyInsert = try conn.prepare(INSERT_ERC20_SUPPLY),
-        .erc20SupplyUpdate = try conn.prepare(UPDATE_ERC20_SUPPLY),
-        .erc20OwnerInsert = try conn.prepare(INSERT_ERC20_OWNER),
-        .erc20OwnerUpdate = try conn.prepare(UPDATE_ERC20_OWNER),
-        .erc20SelfDestruct = try conn.prepare(INSERT_ERC20_SELFDESTRUCT),
+        .blocks = try makePrepared(conn, INSERT_BLOCKS),
+        .transactions = try makePrepared(conn, INSERT_TXS),
+        .logs = try makePrepared(conn, INSERT_LOGS),
+        .internalTxs = try makePrepared(conn, INSERT_INT_TXS),
+        .contracts = try makePrepared(conn, INSERT_CONTRACTS),
+        .contractsByAddr = try makePrepared(conn, INSERT_CONTRACTS_BY_ADDR),
+        .blockCompletions = try makePrepared(conn, INSERT_BLOCK_COMPLETIONS),
+        .erc20Tokens = try makePrepared(conn, INSERT_ERC20_TOKENS),
+        .erc20SupplyInsert = try makePrepared(conn, INSERT_ERC20_SUPPLY),
+        .erc20SupplyUpdate = try makePrepared(conn, UPDATE_ERC20_SUPPLY),
+        .erc20OwnerInsert = try makePrepared(conn, INSERT_ERC20_OWNER),
+        .erc20OwnerUpdate = try makePrepared(conn, UPDATE_ERC20_OWNER),
+        .erc20SelfDestruct = try makePrepared(conn, INSERT_ERC20_SELFDESTRUCT),
     };
 }

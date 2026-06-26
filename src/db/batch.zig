@@ -339,7 +339,7 @@ pub fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const Entities) !void 
         if (enc > 0) {
             starts[enc] = batchBuf.items.len;
             for (0..enc) |k| ptrs[k] = batchBuf.items[starts[k]..starts[k + 1]];
-            try conn.batchSendRows(conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
+            try conn.batchSendRows(&conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
         }
         i = end;
     }
@@ -470,7 +470,7 @@ fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.blocks, BLOCK_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.blocks, BLOCK_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -519,7 +519,7 @@ fn saveTxs(conn: *CqlConn, rows: []const TxRow, bs: usize) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.transactions, TX_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.transactions, TX_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -562,7 +562,7 @@ fn saveLogs(conn: *CqlConn, rows: []const LogRow, bs: usize) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.logs, LOG_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.logs, LOG_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -600,7 +600,7 @@ fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow, bs: usize) !void
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -641,7 +641,7 @@ fn saveContracts(conn: *CqlConn, rows: []const ContractRow, bs: usize) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -677,7 +677,7 @@ fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow, bs: usiz
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -721,7 +721,7 @@ fn saveErc20Tokens(conn: *CqlConn, rows: []const Erc20TokenRow, bs: usize) !void
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.erc20Tokens, ERC20_TOKEN_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.erc20Tokens, ERC20_TOKEN_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -758,7 +758,7 @@ fn saveErc20Supplies(conn: *CqlConn, rows: []const Erc20SupplyRow, bs: usize) !v
         if (enc > 0) {
             starts[enc] = bd.items.len;
             for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-            try conn.batchSendRows(conn.prepIds.erc20SupplyInsert, ERC20_SUPPLY_INSERT_COLS, ptrs[0..enc]);
+            try conn.batchSendRows(&conn.prepIds.erc20SupplyInsert, ERC20_SUPPLY_INSERT_COLS, ptrs[0..enc]);
         }
         i = end;
     }
@@ -783,7 +783,7 @@ fn saveErc20Supplies(conn: *CqlConn, rows: []const Erc20SupplyRow, bs: usize) !v
         if (enc > 0) {
             starts[enc] = bd.items.len;
             for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-            try conn.batchSendRows(conn.prepIds.erc20SupplyUpdate, ERC20_SUPPLY_UPDATE_COLS, ptrs[0..enc]);
+            try conn.batchSendRows(&conn.prepIds.erc20SupplyUpdate, ERC20_SUPPLY_UPDATE_COLS, ptrs[0..enc]);
         }
         i = end;
     }
@@ -822,7 +822,7 @@ fn saveErc20Owners(conn: *CqlConn, rows: []const Erc20OwnerRow, bs: usize) !void
         if (enc > 0) {
             starts[enc] = bd.items.len;
             for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-            try conn.batchSendRows(conn.prepIds.erc20OwnerInsert, ERC20_OWNER_INSERT_COLS, ptrs[0..enc]);
+            try conn.batchSendRows(&conn.prepIds.erc20OwnerInsert, ERC20_OWNER_INSERT_COLS, ptrs[0..enc]);
         }
         i = end;
     }
@@ -848,7 +848,7 @@ fn saveErc20Owners(conn: *CqlConn, rows: []const Erc20OwnerRow, bs: usize) !void
         if (enc > 0) {
             starts[enc] = bd.items.len;
             for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-            try conn.batchSendRows(conn.prepIds.erc20OwnerUpdate, ERC20_OWNER_UPDATE_COLS, ptrs[0..enc]);
+            try conn.batchSendRows(&conn.prepIds.erc20OwnerUpdate, ERC20_OWNER_UPDATE_COLS, ptrs[0..enc]);
         }
         i = end;
     }
@@ -881,7 +881,7 @@ fn saveErc20SelfDestructs(conn: *CqlConn, rows: []const Erc20SelfDestructRow, bs
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.erc20SelfDestruct, ERC20_SELFDESTRUCT_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.erc20SelfDestruct, ERC20_SELFDESTRUCT_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -927,7 +927,7 @@ fn saveBlockCompletions(conn: *CqlConn, ent: *const Entities) !void {
         }
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
+        try conn.batchSendRows(&conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
         i = bEnd;
     }
 }
