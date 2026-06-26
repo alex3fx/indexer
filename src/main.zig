@@ -93,7 +93,6 @@ const RealtimeContext = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         env: anytype,
-        chain: anytype,
         redisUrl: []const u8,
         chunkBuckets: u64,
         environ: anytype,
@@ -140,8 +139,6 @@ const RealtimeContext = struct {
             std.fmt.parseInt(u64, v, 10) catch 2000
         else
             2000;
-
-        _ = chain;
 
         return .{
             .rtConns = rtConns,
@@ -210,6 +207,30 @@ fn delayMs(ms: u64) void {
     _ = std.os.linux.nanosleep(&ts, null);
 }
 
+// Retries ws.Conn.init + subscribeNewHeads with capped exponential backoff
+// (1s→2s→4s→...→30s) until both succeed. Never gives up — a transient WSS
+// outage should not permanently end realtime indexing.
+fn reconnectWss(gpa: std.mem.Allocator, wsConn: *ws.Conn, wsParsed: ws.ParsedUrl, log: *Logger) void {
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        wsConn.* = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch |err| {
+            const msg = std.fmt.allocPrint(gpa, "WSS reconnect attempt {d} failed: {s} — retrying", .{ attempt, @errorName(err) }) catch "";
+            defer if (msg.len > 0) gpa.free(msg);
+            log.warn(if (msg.len > 0) msg else "WSS reconnect failed — retrying");
+            delayMs(@as(u64, 1000) << @intCast(@min(attempt, 5)));
+            continue;
+        };
+        if (wsConn.subscribeNewHeads()) |_| return else |err| {
+            wsConn.deinit();
+            const msg = std.fmt.allocPrint(gpa, "WSS subscribe attempt {d} failed: {s} — retrying", .{ attempt, @errorName(err) }) catch "";
+            defer if (msg.len > 0) gpa.free(msg);
+            log.warn(if (msg.len > 0) msg else "WSS subscribe failed — retrying");
+            delayMs(@as(u64, 1000) << @intCast(@min(attempt, 5)));
+        }
+    }
+}
+
 fn runRealtimeLoop(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -246,8 +267,7 @@ fn runRealtimeLoop(
             defer if (msg.len > 0) gpa.free(msg);
             log.warn(if (msg.len > 0) msg else "WSS disconnected — reconnecting");
             wsConn.deinit();
-            wsConn.* = ws.Conn.init(gpa, wsParsed.host, wsParsed.port, wsParsed.path) catch break;
-            _ = wsConn.subscribeNewHeads() catch break;
+            reconnectWss(gpa, wsConn, wsParsed, log);
             continue;
         };
 
@@ -489,7 +509,7 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     log.info("Realtime mode — listening for new blocks via WSS...");
 
-    var ctx = try RealtimeContext.init(gpa, io, env, &chain, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
+    var ctx = try RealtimeContext.init(gpa, io, env, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
     // Must run after `ctx` is at its final address — see the comment in
     // RealtimeContext.init() next to where HttpPool.init() is called.

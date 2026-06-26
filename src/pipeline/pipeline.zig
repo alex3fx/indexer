@@ -591,7 +591,6 @@ fn spawnHistoricalWorkers(
     gpa: Allocator,
     io: std.Io,
     chain: *const EvmChainConfig,
-    from: u64,
     to: u64,
     chan: *ResultChan,
     chunkBuckets: u64,
@@ -615,7 +614,6 @@ fn spawnHistoricalWorkers(
             .backupNode = backupNode,
             .bloom = bloom,
         };
-        _ = from; // from is encoded in next (already set to from by caller)
         threads[w] = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, workerEntry, .{wargs});
     }
 }
@@ -781,7 +779,7 @@ pub fn runHistorical(
 
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
-    try spawnHistoricalWorkers(gpa, io, chain, from, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &erc20Ctx.bloom);
+    try spawnHistoricalWorkers(gpa, io, chain, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &erc20Ctx.bloom);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
