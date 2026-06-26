@@ -1,181 +1,161 @@
-# HOWTOSTART — Quick start guide
+# HOWTOSTART — build, configure, run, recover
 
-## 1. Prerequisites
+See `docs/ABOUT.md` for the architecture overview this guide assumes.
 
-### Zig compiler
-
-```bash
-# Download Zig 0.17.0-dev.263+0add2dfc4 for linux-x86_64
-wget https://ziglang.org/builds/zig-linux-x86_64-0.17.0-dev.263+0add2dfc4.tar.xz
-tar xf zig-linux-x86_64-0.17.0-dev.263+0add2dfc4.tar.xz
-export ZIG=$PWD/zig-linux-x86_64-0.17.0-dev.263+0add2dfc4/zig
-$ZIG version   # should print: 0.17.0-dev.263+0add2dfc4
-```
-
-### ScyllaDB
-
-Install ScyllaDB 6.x. Recommended config (`/etc/default/scylla-server`):
-
-```
-SCYLLA_ARGS="--smp=16 --memory=10G --unsafe-bypass-fsync=1 --overprovisioned \
-  --max-concurrent-requests-per-shard=65536"
-```
-
-Set `smp` to the number of CPU cores you want Scylla to use.
-`REMAP_MOD` should equal `smp` for optimal shard distribution.
-
-Create the schema:
+## 1. Build
 
 ```bash
-cqlsh <scylla_host> <scylla_port> -f schema.cql
-# verify:
-cqlsh <scylla_host> <scylla_port> -e "USE eth; DESCRIBE TABLES;"
+zig build -p .zig/build --cache-dir .zig/.cache -Doptimize=ReleaseFast
+# binary -> .zig/build/bin/raw
 ```
 
-### Redis / DragonflyDB
+Always `-Doptimize=ReleaseFast` — `Debug` hangs the pool workers on this Zig dev snapshot.
+`zig build test --cache-dir .zig/.cache -Doptimize=ReleaseFast` runs the unit tests (logger
+date/GELF formatting, etc.).
 
-The indexer uses Redis to store the cursor (`LATEST_PROCESSED_BLOCK_NUMBER`).
+## 2. Environment variables
+
+### Required — binary refuses to start without these, no hardcoded defaults
+
+| Variable | Meaning |
+|---|---|
+| `MODE` | `production` \| `development` \| `local` |
+| `EVM_CHAIN_ID` | e.g. `137` (Polygon), `1` (Ethereum), `56` (BSC) — must be a chain configured in `src/core/constants/chains/evm/` |
+| `CM_CONNECTION_URL` | Redis connection string: `redis://[:password@]host:port/db` |
+| `SCYLLA_DB_HOST`, `SCYLLA_DB_PORT` | Scylla contact point, e.g. `127.0.0.1` / `9042` |
+| `SCYLLA_DB_USERNAME`, `SCYLLA_DB_PASSWORD` | Scylla auth — never commit these, never hardcode a default |
+
+### Optional — sensible defaults baked into the binary
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCYLLA_DB_KEYSPACE` | `eth` | target keyspace |
+| `SCYLLA_DB_LOCAL_DATACENTER` | `datacenter1` | DC-aware load balancing |
+| `LOGS_GRAYLOG_HOST` / `_PORT` / `_APP` | `127.0.0.1` / `12201` / `indexer` | GELF/TCP log sink |
+| `TIME_ZONE` | `0` | integer hour offset from UTC, used only for local-mode stdout timestamps |
+| `RPC_URL` / `RPC_WSS` | chain config default | override the primary RPC node (needed to run independent processes against different physical nodes, e.g. a dual-node split) |
+| `NEIGHBOR_RPC_URL` | unset → disabled | second retry tier, historical sync only |
+| `RESERVE_RPC_URL` / `BACKUP_RPC_HTTPS` | unset → disabled | third retry tier; same slot, `RESERVE_RPC_URL` is canonical |
+| `SCYLLA_CHUNK_BUCKETS` | chain config default (flat scheme) | lane count for the chunk partition formula, e.g. `64` |
+| `SCYLLA_CHUNK_ERA` | `0` (flat scheme) | block-era size for the chunk partition formula, e.g. `32000` |
+| `FETCH_WORKERS` | chain config default | historical-sync fetch concurrency |
+| `SAVE_EVERY` | chain config default | blocks accumulated per Scylla save batch |
+| `ACCUM_TXS_LANES` / `ACCUM_LOG_LANES` / `ACCUM_ITX_LANES` | chain config default | parallel Scylla write connections per entity type |
+| `WS_DELAY_MS` | `100` | realtime: delay after a new head notification before fetching (lets the RPC node catch up) |
+| `RT_RETRY_DELAY_MS` | `2000` | realtime: delay between retries when a block is unavailable on all nodes |
+
+## 3. CLI flags
+
+```
+raw --from=<block> --to=<block>
+```
+
+Historical sync over `[from, to]`. Omitting `--to` switches to realtime mode (follows chain head
+via WSS) once `--from` catches up to the head. If `--from` is omitted, it resumes from the Redis
+cursor (`LATEST_PROCESSED_BLOCK_NUMBER + 1`), or `0` if no cursor exists yet.
+
+## 4. Historical sync
 
 ```bash
-# DragonflyDB via Docker (host network for direct 127.0.0.1 access):
-docker run --rm -d --name dragonfly --network host \
-  docker.dragonflydb.io/dragonflydb/dragonfly \
-  --requirepass yourpassword
+MODE=production EVM_CHAIN_ID=137 \
+CM_CONNECTION_URL='redis://127.0.0.1:6379/0' \
+SCYLLA_DB_HOST=127.0.0.1 SCYLLA_DB_PORT=9042 SCYLLA_DB_KEYSPACE=pol \
+SCYLLA_DB_USERNAME="$SCYLLA_DB_USERNAME" SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
+SCYLLA_CHUNK_BUCKETS=64 SCYLLA_CHUNK_ERA=32000 \
+FETCH_WORKERS=64 ACCUM_TXS_LANES=3 ACCUM_LOG_LANES=6 ACCUM_ITX_LANES=20 \
+RPC_URL=http://<node>:8545 RESERVE_RPC_URL=https://<public-fallback> \
+./raw --from=<block> --to=<block>
 ```
 
-## 2. Build
+If interrupted (crash, restart, intentional stop), resume from the **last `[watermark] N` line**
+in stdout/the log file — not the last `Accum X→Y` line. Workers complete out of order under
+concurrency, so a save batch can be printed with a higher block number than one that's still
+in-flight; the watermark is the actual contiguous-safe frontier (see `docs/ABOUT.md`). Resume
+with `--from=<watermark+1>`.
+
+A clean historical run ends with an integrity self-check (`[watermark] integrity check passed:
+contiguous through <to>` on success, or `[INTEGRITY ERROR] ...` + a non-zero exit if the
+watermark didn't reach `to+1` — this should be impossible after a clean run and means
+investigate before resuming).
+
+## 5. Realtime mode
+
+Omit `--to` (or let `--from` catch up to a previous `--to`):
 
 ```bash
-cd indexer/
-$ZIG build -Doptimize=ReleaseFast
-# binary at: ./zig-out/bin/indexer
+MODE=production EVM_CHAIN_ID=137 \
+CM_CONNECTION_URL='redis://127.0.0.1:6379/0' \
+SCYLLA_DB_HOST=127.0.0.1 SCYLLA_DB_PORT=9042 SCYLLA_DB_KEYSPACE=pol \
+SCYLLA_DB_USERNAME="$SCYLLA_DB_USERNAME" SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
+SCYLLA_CHUNK_BUCKETS=64 SCYLLA_CHUNK_ERA=32000 \
+RPC_URL=http://<node>:8545 RPC_WSS=ws://<node>:8546 \
+RESERVE_RPC_URL=https://<public-fallback> \
+./raw --from=<block>
 ```
 
-For a server with smp=32 and 32-connection pool (compile-time tuning):
+Connects via WSS, subscribes to `newHeads`, fills any gap between the cursor and the current
+head, then processes new blocks as they arrive. A transient WSS disconnect reconnects with
+capped exponential backoff (1s..30s) — it does not give up and exit.
+
+## 6. Supporting tools (`tools/`)
+
+All read credentials from the environment (`SCYLLA_DB_PASSWORD` required, `GRAFANA_USER`/
+`GRAFANA_PASS` optional) — see `tools/README.md` for usage of each:
+
+- `dynamic_tuner.py` — launcher + load-aware `FETCH_WORKERS` supervisor (AIMD control loop driven
+  by RPC-node `node_load1`), restarts on crash, resumes from `[watermark] N` automatically.
+- `monitor_pol_v3.py` — tails node logs, sends GELF heartbeats/alerts to GrayLog.
+- `find_missing_blocks.py` — exact-gap integrity scanner (see `docs/INTEGRITY_CHECKS.md`).
+- `backfill_spans.sh` — targeted re-sync for spans of known-missing blocks.
+
+## 7. Recovering a single explicitly-skipped block
+
+Blocks that exhaust the full retry chain are recorded in `pol.skipped_blocks`
+(`resolved=false`), never silently dropped. To manually recover one (e.g. against a different
+public RPC that happens to serve it):
 
 ```bash
-$ZIG build -Doptimize=ReleaseFast -Dpool_size=32 -Dsplit="1,3,6,20,1,1"
+SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
+MODE=production EVM_CHAIN_ID=<chain> \
+CM_CONNECTION_URL='redis://127.0.0.1:6379/<throwaway_db>' \
+SCYLLA_DB_HOST=... SCYLLA_DB_PORT=9042 SCYLLA_DB_KEYSPACE=... \
+SCYLLA_DB_USERNAME=... \
+SCYLLA_CHUNK_BUCKETS=64 SCYLLA_CHUNK_ERA=32000 \
+RPC_URL=<primary> RESERVE_RPC_URL=<alternate public RPC> \
+FETCH_WORKERS=1 \
+./raw --from=<block> --to=<block>
 ```
 
-## 3. Historical sync
+Use a **throwaway Redis DB number**, distinct from the live process's DB, so this doesn't touch
+the real cursor/give-up-cycle state. After confirming the block is saved (log line `[<block>]
+T:.. L:.. IT:.. (backup)` plus a direct `SELECT` against the `blocks` table), mark it resolved:
 
-Two chunking strategies are available:
-
-**Option A — shard-aware (`REMAP_MOD=N`, recommended)**
-
-`chunk = block_number % N` — distributes writes evenly across N Scylla shards.
-Set `N` equal to the Scylla `smp` value for optimal load distribution.
-
-```bash
-CM_CONNECTION_URL="redis://:yourpassword@127.0.0.1:6379/0" \
-SCYLLA_DB_CONTACT_POINTS='["<scylla_host>:<scylla_port>"]' \
-SCYLLA_DB_KEYSPACE=eth \
-SCYLLA_DB_CREDENTIALS='{"username":"cassandra","password":"cassandra"}' \
-RPC_URL=http://<node_host>:8545 \
-CHAIN_ID=1 \
-FROM_BLOCK=0 \
-TO_BLOCK=21000000 \
-BATCH_SIZE=10 \
-PIPELINE=2 \
-REMAP_MOD=32 \
-./zig-out/bin/indexer
+```sql
+UPDATE pol.skipped_blocks SET resolved=true WHERE block_number=<block>;
 ```
 
-**Option B — classic chunking (no `REMAP_MOD`)**
+## 8. Database access (read-only, for analysts)
 
-`chunk = block_number / RAW_CHUNK_SIZE` — groups consecutive blocks into fixed-size
-partitions (default 1000 blocks per chunk: block 0–999 → chunk 0, block 1000–1999 → chunk 1, etc.).
-Use this when you want predictable partition boundaries and don't need shard distribution.
+The Scylla CQL port (`9042`) must be bound to a reachable interface
+(`--rpc-address 0.0.0.0` + `--broadcast-rpc-address <reachable IP>` in Scylla's startup flags) for
+non-localhost clients — `rpc_address: localhost` in `scylla.yaml` is the Scylla default and
+refuses external connections. If Scylla was started with explicit `--rpc-address`/
+`--broadcast-rpc-address` flags, those override `scylla.yaml`; editing the yaml alone and
+restarting will not take effect.
 
-```bash
-CM_CONNECTION_URL="redis://:yourpassword@127.0.0.1:6379/0" \
-SCYLLA_DB_CONTACT_POINTS='["<scylla_host>:<scylla_port>"]' \
-SCYLLA_DB_KEYSPACE=eth \
-SCYLLA_DB_CREDENTIALS='{"username":"cassandra","password":"cassandra"}' \
-RPC_URL=http://<node_host>:8545 \
-CHAIN_ID=1 \
-FROM_BLOCK=0 \
-TO_BLOCK=21000000 \
-BATCH_SIZE=10 \
-PIPELINE=2 \
-RAW_CHUNK_SIZE=1000 \
-./zig-out/bin/indexer
-```
+Create a `SELECT`-only role rather than sharing the superuser credential — see
+`docs/SCYLLA_READONLY_ACCESS.md` for the exact grant and how to verify it's actually read-only.
 
-`RAW_CHUNK_SIZE=1000` is the default, so you can omit it entirely.
-Do **not** set `REMAP_MOD` when using classic chunking.
+## 9. Known limitations
 
-**Key tuning parameters:**
+See `TODO.md` for the full writeup. Summary:
 
-| Parameter | Recommendation |
-|-----------|----------------|
-| `PIPELINE` | 2 on same machine; 4+ with remote node (high RTT) |
-| `REMAP_MOD` | Equal to Scylla `smp` (e.g. 16 or 32); omit for classic chunking |
-| `RAW_CHUNK_SIZE` | 1000 (default); only used when `REMAP_MOD` is not set |
-| `BATCH_SIZE` | 10 is safe; reduce to 5 if you see "Batch too large" errors |
-| `pool_size` (build flag) | Equal to `smp` |
-
-The indexer stores progress in Redis. If interrupted, restart with the same command —
-it resumes from `LATEST_PROCESSED_BLOCK_NUMBER + 1` automatically.
-
-## 4. Realtime mode (polling)
-
-After history is synced, switch to realtime:
-
-```bash
-CM_CONNECTION_URL="redis://:yourpassword@127.0.0.1:6379/0" \
-SCYLLA_DB_CONTACT_POINTS='["<scylla_host>:<scylla_port>"]' \
-SCYLLA_DB_KEYSPACE=eth \
-RPC_URL=http://<node_host>:8545 \
-CHAIN_ID=1 \
-REALTIME=1 \
-POLL_MS=500 \
-REMAP_MOD=16 \
-./zig-out/bin/indexer
-```
-
-## 5. Realtime mode (WebSocket — recommended)
-
-Subscribe to `newHeads` for instant block notifications:
-
-```bash
-CM_CONNECTION_URL="redis://:yourpassword@127.0.0.1:6379/0" \
-SCYLLA_DB_CONTACT_POINTS='["<scylla_host>:<scylla_port>"]' \
-SCYLLA_DB_KEYSPACE=eth \
-RPC_URL=http://<node_host>:8545 \
-WS_URL=ws://<node_host>:8546/ws \
-CHAIN_ID=1 \
-REMAP_MOD=16 \
-./zig-out/bin/indexer
-```
-
-With `WS_URL` set, the indexer automatically:
-1. Subscribes to `newHeads` to buffer incoming blocks
-2. Syncs history from cursor to the first WS-notified block
-3. Switches to realtime processing of WS notifications
-
-## 6. Reserve RPC fallback
-
-If a block fetch fails, retry via a secondary endpoint:
-
-```bash
-RPC_URL=http://primary:8545 \
-RESERVE_RPC_URL=http://backup:8545 \
-...
-```
-
-## 7. Verify data
-
-```bash
-cqlsh <scylla_host> <scylla_port> << 'EOF'
-USE eth;
-SELECT count(*) FROM blocks WHERE chunk = 25079;
-SELECT count(*) FROM transactions WHERE chunk = 25079;
-SELECT count(*) FROM internal_transactions WHERE chunk = 25079;
-EOF
-```
-
-## 8. Results
-
-After each run, a JSON metrics file is written to `./zig-out/bin/results/indexer_<timestamp>.json`
-with per-block fetch/transform/save timings.
+- A Zig 0.17-dev `std.crypto.ml_kem` codegen bug SIGILLs any direct `std.http.Client` HTTPS call
+  under `-Doptimize=ReleaseFast`. Worked around by routing `https://` RPC traffic through a
+  `curl` subprocess instead of fixing the compiler bug itself.
+- Running multiple indexer instances against one Scylla cluster can shift the bottleneck from
+  RPC-node capacity to the database's own write-side capacity (CPU/disk on the Scylla host). The
+  load-aware tuner only watches RPC-node metrics, not the database host's, so it won't detect or
+  back off from this automatically — if raising `FETCH_WORKERS` stops increasing throughput
+  despite low RPC-node load, check the database host's own CPU/disk load before assuming the RPC
+  node is the limit.

@@ -152,6 +152,34 @@ pub const Conn = struct {
         }
     }
 
+    /// INCR key — returns the post-increment value. Used for restart-surviving counters
+    /// (e.g. giveup:{node}:{blockNum}) since plain local vars reset on every process restart.
+    pub fn incr(self: *Conn, key: []const u8) !i64 {
+        const cmd = try std.fmt.allocPrint(self.gpa, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key });
+        defer self.gpa.free(cmd);
+        try fdWrite(self.fd, cmd);
+
+        var buf: [64]u8 = undefined;
+        const line = try fdReadLine(self.fd, &buf);
+        if (line.len == 0) return error.EmptyResponse;
+        switch (line[0]) {
+            ':' => return std.fmt.parseInt(i64, line[1..], 10) catch error.ProtocolError,
+            '-' => return error.RedisError,
+            else => return error.ProtocolError,
+        }
+    }
+
+    /// Best-effort DEL — used to clear a giveup counter once a block is resolved
+    /// (real success or recorded give-up) so a later re-fetch of the same block
+    /// (e.g. backfill) doesn't inherit a stale cycle count.
+    pub fn del(self: *Conn, key: []const u8) void {
+        const cmd = std.fmt.allocPrint(self.gpa, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return;
+        defer self.gpa.free(cmd);
+        fdWrite(self.fd, cmd) catch return;
+        var buf: [64]u8 = undefined;
+        _ = fdReadLine(self.fd, &buf) catch {};
+    }
+
     pub fn set(self: *Conn, key: []const u8, value: []const u8) !void {
         const cmd = try std.fmt.allocPrint(self.gpa, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value });
         defer self.gpa.free(cmd);

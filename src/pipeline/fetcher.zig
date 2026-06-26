@@ -54,6 +54,16 @@ const ResponseSet = struct {
     }
 };
 
+// Generous enough for legitimately slow conditions (measured up to ~16s per call
+// during real disk-saturation incidents on one RPC node) while still bounding the
+// "stuck worker" failure mode to a fixed amount of time instead of forever.
+const FETCH_TIMEOUT_NS: u64 = 45 * std.time.ns_per_s;
+
+fn reinitClient(client: *FetchClient, allocator: Allocator, io: std.Io) void {
+    client.deinit();
+    client.* = FetchClient.init(allocator, io);
+}
+
 pub fn getConsistentBlockData(
     allocator: Allocator,
     io: std.Io,
@@ -205,14 +215,25 @@ fn fetchResponseSet(
     var traces_task_pending = true;
     errdefer if (traces_task_pending) discardTask(&traces_task, allocator);
 
-    const block_result = block_task.join();
+    // joinTimeout, not join: a hung connection inside one of these threads has
+    // no way to be interrupted, so without a deadline a single wedged request
+    // permanently parks this worker (observed in production: >1.5h stuck on one
+    // block after a transient ConnectionRefused). On timeout the thread is
+    // abandoned (leaked, not corrupted — see Task.joinTimeout) and the
+    // client it was using must be discarded, since std.http.Client only
+    // guarantees individual Requests are non-threadsafe and a still-running
+    // abandoned request plus a fresh one on the same Client would violate that.
+    const block_result = block_task.joinTimeout(FETCH_TIMEOUT_NS);
     block_task_pending = false;
+    if (block_result == error.FetchTimeout) reinitClient(block_client, allocator, io);
 
-    const receipts_result = receipts_task.join();
+    const receipts_result = receipts_task.joinTimeout(FETCH_TIMEOUT_NS);
     receipts_task_pending = false;
+    if (receipts_result == error.FetchTimeout) reinitClient(receipts_client, allocator, io);
 
-    const traces_result = traces_task.join();
+    const traces_result = traces_task.joinTimeout(FETCH_TIMEOUT_NS);
     traces_task_pending = false;
+    if (traces_result == error.FetchTimeout) reinitClient(traces_client, allocator, io);
 
     const parallel_fetch_elapsed_ns = elapsedNs(started_at_ns);
 

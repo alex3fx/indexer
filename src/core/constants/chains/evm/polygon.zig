@@ -20,19 +20,19 @@ pub const polygon: EvmChainConfig = .{
         .workerCount = 64,
         .batchSizeBlocks = 50,
         .batchSizeTxs = 100,
-        .batchSizeLogs = 1000,
-        .batchSizeItxs = 2000,
+        .batchSizeLogs = 200,
+        .batchSizeItxs = 200,
         .batchSizeContracts = 50,
         .minifiedChunkSize = 2_000,
     },
     .rpcNodes = .{
         .lotosArchiveNode = .{
-            .https = "http://100.64.0.62:8545",
-            .wss = "ws://100.64.0.62:8546",
+            .https = "http://5.0.0.0:8545",
+            .wss = "ws://5.0.0.0:8546",
         },
         .lotosFullNode = .{
-            .https = "http://100.64.0.62:8545",
-            .wss = "ws://100.64.0.62:8546",
+            .https = "http://6.0.0.0:8545",
+            .wss = "ws://6.0.0.0:8546",
         },
         .mevFullNode = .{
             .https = "https://polygon-rpc.com",
