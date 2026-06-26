@@ -142,6 +142,7 @@ const WorkerArgs = struct {
     chunkBuckets: u64,
     cancel: *std.atomic.Value(bool),
     backupNode: ?EvmRpcNodeConfig,
+    backupNode2: ?EvmRpcNodeConfig,
     bloom: *Bloom,
     bytecodeBloom: *BytecodeBloom,
 };
@@ -272,21 +273,24 @@ fn worker(args: *WorkerArgs) !void {
                     break :retry;
                 },
                 .skip_missing => {
-                    // Block null on primary — try backup before giving up.
-                    if (args.backupNode) |backup| {
+                    var fetched = false;
+                    if (!fetched) if (args.backupNode) |bn| {
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
+                        if (fetchParseTransform(gpa, args.io, bn, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
                             result.ok = true;
-                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                blockNum,                  result.ent.txs.items.len,
-                                result.ent.logs.items.len, result.ent.internalTxs.items.len,
-                            });
-                        } else {
-                            std.debug.print("[worker] block={d} skip_missing on primary and backup\n", .{blockNum});
+                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup1)\n", .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len });
+                            fetched = true;
                         }
-                    } else {
-                        std.debug.print("[worker] block={d} skip_missing\n", .{blockNum});
-                    }
+                    };
+                    if (!fetched) if (args.backupNode2) |bn2| {
+                        resetResult(result);
+                        if (fetchParseTransform(gpa, args.io, bn2, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
+                            result.ok = true;
+                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup2)\n", .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len });
+                            fetched = true;
+                        }
+                    };
+                    if (!fetched) std.debug.print("[worker] block={d} skip_missing on all nodes\n", .{blockNum});
                     break :retry;
                 },
                 .retry_later => {
@@ -296,22 +300,27 @@ fn worker(args: *WorkerArgs) !void {
                     resetResult(result);
                 },
                 .fatal => |e| {
-                    // Try backup node before marking as skipped.
-                    if (args.backupNode) |backup| {
-                        std.debug.print("[worker] block={d} primary error: {s} — trying backup\n", .{ blockNum, @errorName(e) });
+                    std.debug.print("[worker] block={d} primary error: {s}", .{ blockNum, @errorName(e) });
+                    var fetched = false;
+                    if (!fetched) if (args.backupNode) |bn| {
+                        std.debug.print(" — trying backup1\n", .{});
                         resetResult(result);
-                        if (fetchParseTransform(gpa, args.io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
+                        if (fetchParseTransform(gpa, args.io, bn, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
                             result.ok = true;
-                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup)\n", .{
-                                blockNum,                  result.ent.txs.items.len,
-                                result.ent.logs.items.len, result.ent.internalTxs.items.len,
-                            });
-                        } else {
-                            std.debug.print("[worker] block={d} unavailable on all nodes — skipping\n", .{blockNum});
+                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup1)\n", .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len });
+                            fetched = true;
                         }
-                    } else {
-                        std.debug.print("[worker] block={d} error: {s} — no backup, skipping\n", .{ blockNum, @errorName(e) });
-                    }
+                    };
+                    if (!fetched) if (args.backupNode2) |bn2| {
+                        std.debug.print(" — trying backup2\n", .{});
+                        resetResult(result);
+                        if (fetchParseTransform(gpa, args.io, bn2, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, args.bloom, args.bytecodeBloom, result) == .ok) {
+                            result.ok = true;
+                            std.debug.print("[{d}] T:{d} L:{d} IT:{d} (backup2)\n", .{ blockNum, result.ent.txs.items.len, result.ent.logs.items.len, result.ent.internalTxs.items.len });
+                            fetched = true;
+                        }
+                    };
+                    if (!fetched) std.debug.print("[worker] block={d} unavailable on all nodes — skipping\n", .{blockNum});
                     break :retry;
                 },
             }
@@ -609,6 +618,7 @@ fn spawnHistoricalWorkers(
     next: *std.atomic.Value(u64),
     threads: []std.Thread,
     backupNode: ?EvmRpcNodeConfig,
+    backupNode2: ?EvmRpcNodeConfig,
     bloom: *Bloom,
     bytecodeBloom: *BytecodeBloom,
 ) !void {
@@ -624,6 +634,7 @@ fn spawnHistoricalWorkers(
             .chunkBuckets = chunkBuckets,
             .cancel = cancel,
             .backupNode = backupNode,
+            .backupNode2 = backupNode2,
             .bloom = bloom,
             .bytecodeBloom = bytecodeBloom,
         };
@@ -669,6 +680,7 @@ fn retryMissingBlocks(
     io: std.Io,
     chain: *const EvmChainConfig,
     backupNode: ?EvmRpcNodeConfig,
+    backupNode2: ?EvmRpcNodeConfig,
     skipped: []const u64,
     conns: *HistoricalConns,
     bs: pool.BatchSizes,
@@ -702,21 +714,19 @@ fn retryMissingBlocks(
             else => false,
         };
 
-        // Try backup if primary didn't deliver.
-        if (!found) {
-            if (backupNode) |backup| {
-                resetResult(&result);
-                found = switch (fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, bytecodeBloom, &result)) {
-                    .ok => true,
-                    else => false,
-                };
-                if (!found) {
-                    std.debug.print("[historical-retry] block={d} unavailable on primary and backup\n", .{blockNum});
-                }
-            } else {
-                std.debug.print("[historical-retry] block={d} unavailable (no backup configured)\n", .{blockNum});
-            }
-        }
+        // Try backup1.
+        if (!found) if (backupNode) |bn| {
+            resetResult(&result);
+            found = fetchParseTransform(gpa, io, bn, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, bytecodeBloom, &result) == .ok;
+        };
+
+        // Try backup2.
+        if (!found) if (backupNode2) |bn2| {
+            resetResult(&result);
+            found = fetchParseTransform(gpa, io, bn2, blockNum, chunkSize, chunkBuckets, &bClient, &rClient, &tClient, null, bloom, bytecodeBloom, &result) == .ok;
+        };
+
+        if (!found) std.debug.print("[historical-retry] block={d} unavailable on all nodes\n", .{blockNum});
 
         if (found) {
             std.debug.print("[historical-retry] block={d} recovered — saving\n", .{blockNum});
@@ -765,6 +775,7 @@ pub fn runHistorical(
     chunkBuckets: u64,
     saveEvery: usize,
     backupNode: ?EvmRpcNodeConfig,
+    backupNode2: ?EvmRpcNodeConfig,
     log: *Logger,
     txsLanes: usize,
     logsLanes: usize,
@@ -794,7 +805,7 @@ pub fn runHistorical(
 
     const threads = try gpa.alloc(std.Thread, workerCount);
     defer gpa.free(threads);
-    try spawnHistoricalWorkers(gpa, io, chain, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom);
+    try spawnHistoricalWorkers(gpa, io, chain, to, &chan, chunkBuckets, &cancel, &next, threads, backupNode, backupNode2, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom);
 
     var prevSave: ?PrevSave = null;
     var accum = try gpa.create(AccumState);
@@ -846,5 +857,5 @@ pub fn runHistorical(
 
     // Retry any blocks that were skipped during the main pass, then verify
     // all are present before the caller transitions to realtime mode.
-    try retryMissingBlocks(gpa, io, chain, backupNode, skippedBlocks.items, &conns, bs, chunkBuckets, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom);
+    try retryMissingBlocks(gpa, io, chain, backupNode, backupNode2, skippedBlocks.items, &conns, bs, chunkBuckets, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom);
 }

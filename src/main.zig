@@ -88,6 +88,7 @@ const RealtimeContext = struct {
     retryDelayMs: u64,
     chunkBuckets: u64,
     backupNode: ?EvmRpcNodeConfig,
+    backupNode2: ?EvmRpcNodeConfig,
 
     fn init(
         gpa: std.mem.Allocator,
@@ -97,6 +98,7 @@ const RealtimeContext = struct {
         chunkBuckets: u64,
         environ: anytype,
         backupNode: ?EvmRpcNodeConfig,
+        backupNode2: ?EvmRpcNodeConfig,
         txsLanes: usize,
         logsLanes: usize,
         itxsLanes: usize,
@@ -155,6 +157,7 @@ const RealtimeContext = struct {
             .retryDelayMs = retryDelayMs,
             .chunkBuckets = chunkBuckets,
             .backupNode = backupNode,
+            .backupNode2 = backupNode2,
         };
     }
 
@@ -282,7 +285,7 @@ fn runRealtimeLoop(
             // processBlock tries primary, then backup on any failure.
             // Only returns .retry_later when both are unavailable.
             while (true) {
-                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode, erc20Ctx)) {
+                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.backupNode, ctx.backupNode2, erc20Ctx)) {
                     .saved => |m| {
                         const kb = @as(f64, @floatFromInt(m.kb_total));
                         const fetch_us_kb = if (kb > 0) m.fetch_ms * 1000.0 / kb else 0;
@@ -345,10 +348,23 @@ pub fn main(init: Init) !void {
     defer log.deinit();
     log.info("EVM indexer starting");
 
-    const chain = core.getEvmChainConfig(runtime.details.evmChainId) orelse {
+    var chain = core.getEvmChainConfig(runtime.details.evmChainId) orelse {
         log.err("Unsupported chain");
         return error.UnsupportedChain;
     };
+
+    // ── Primary RPC override (for dual-node split without recompiling) ─────────
+    // PRIMARY_RPC_HTTPS replaces the compiled-in lotosArchiveNode URL.
+    // PRIMARY_RPC_WSS replaces the WSS URL (optional — leave unset in --to mode).
+    if (init.environ_map.get("PRIMARY_RPC_HTTPS")) |url| {
+        if (url.len > 0) {
+            chain.rpcNodes.lotosArchiveNode.https = url;
+            std.debug.print("Primary RPC override: {s}\n", .{url});
+        }
+    }
+    if (init.environ_map.get("PRIMARY_RPC_WSS")) |url| {
+        if (url.len > 0) chain.rpcNodes.lotosArchiveNode.wss = url;
+    }
 
     const cli = try parseCli(init);
 
@@ -411,18 +427,19 @@ pub fn main(init: Init) !void {
         },
     );
 
-    // ── Backup RPC node (optional) ────────────────────────────────────────────
+    // ── Backup RPC nodes (optional) ──────────────────────────────────────────
     const backupNode: ?EvmRpcNodeConfig = if (init.environ_map.get("BACKUP_RPC_HTTPS")) |url|
-        if (url.len > 0) EvmRpcNodeConfig{
-            .https = url,
-            .wss = "",
-        } else null
+        if (url.len > 0) EvmRpcNodeConfig{ .https = url, .wss = "" } else null
     else
         null;
 
-    if (backupNode) |bn| {
-        std.debug.print("Backup RPC: {s}\n", .{bn.https});
-    }
+    const backupNode2: ?EvmRpcNodeConfig = if (init.environ_map.get("BACKUP_RPC_HTTPS_2")) |url|
+        if (url.len > 0) EvmRpcNodeConfig{ .https = url, .wss = "" } else null
+    else
+        null;
+
+    if (backupNode) |bn| std.debug.print("Backup RPC 1: {s}\n", .{bn.https});
+    if (backupNode2) |bn| std.debug.print("Backup RPC 2: {s}\n", .{bn.https});
 
     // ── Pre-detect node type from main thread ─────────────────────────────────
     // Must run before any worker threads or pool workers start, so all subsequent
@@ -431,9 +448,8 @@ pub fn main(init: Init) !void {
         var detectClient = FetchClient.init(gpa, io);
         defer detectClient.deinit();
         _ = node_probe.detect(gpa, &detectClient, chain.rpcNodes.lotosArchiveNode.https);
-        if (backupNode) |bn| {
-            _ = node_probe.detect(gpa, &detectClient, bn.https);
-        }
+        if (backupNode) |bn| _ = node_probe.detect(gpa, &detectClient, bn.https);
+        if (backupNode2) |bn| _ = node_probe.detect(gpa, &detectClient, bn.https);
     }
 
     // ── Env overrides ─────────────────────────────────────────────────────────
@@ -495,6 +511,7 @@ pub fn main(init: Init) !void {
             chunkBuckets,
             saveEvery,
             backupNode,
+            backupNode2,
             &log,
             txsLanes,
             logsLanes,
@@ -509,7 +526,7 @@ pub fn main(init: Init) !void {
     // ── Realtime loop ─────────────────────────────────────────────────────────
     log.info("Realtime mode — listening for new blocks via WSS...");
 
-    var ctx = try RealtimeContext.init(gpa, io, env, redisUrl, chunkBuckets, init.environ_map, backupNode, txsLanes, logsLanes, itxsLanes);
+    var ctx = try RealtimeContext.init(gpa, io, env, redisUrl, chunkBuckets, init.environ_map, backupNode, backupNode2, txsLanes, logsLanes, itxsLanes);
     defer ctx.deinit();
     // Must run after `ctx` is at its final address — see the comment in
     // RealtimeContext.init() next to where HttpPool.init() is called.

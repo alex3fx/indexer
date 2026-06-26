@@ -7,6 +7,31 @@ All scripts read credentials from the environment — `SCYLLA_DB_PASSWORD` is re
 hardcoded default anywhere in this directory); `GRAFANA_USER`/`GRAFANA_PASS` are optional
 (only needed for the tuner's load-aware signal).
 
+## `run_eth_07.sh` / `run_eth_60.sh` — dual-node ETH indexer launch scripts
+
+Two-instance setup: node `.7` covers `[0, 12_700_000]`, node `.60` covers `[12_700_001, HEAD]`.
+Each script runs an auto-restart loop and resumes from its own log file (not the shared Redis cursor).
+Three-tier RPC fallback: primary → neighbor → `ethereum-rpc.publicnode.com`.
+
+Before first use:
+1. Replace `YOUR_REDIS_PASSWORD` with the actual Redis password.
+2. Set `SCYLLA_DB_PASSWORD`, keyspace/user/host for the target cluster.
+3. Deploy binary as `~/raw_erc20_v7` on `100.64.0.4` (see `CONTEXT.md` for deploy commands).
+
+```bash
+# On 100.64.0.4, in separate tmux panes:
+nohup ./tools/run_eth_07.sh &
+nohup ./tools/run_eth_60.sh &
+```
+
+Env vars that matter:
+- `CM_CONNECTION_URL` — `redis://...@host:port/<DB>` — node-07 uses DB=1, node-60 uses DB=2
+- `PRIMARY_RPC_HTTPS` / `BACKUP_RPC_HTTPS` / `BACKUP_RPC_HTTPS_2` — override chain defaults
+
+**Status:** working (2026-06-26), requires binary v7+
+
+---
+
 ## `dynamic_tuner.py` — launch + load-aware concurrency supervisor
 
 Bootstrap-probes a few `FETCH_WORKERS` values, then runs a continuous AIMD control loop driven

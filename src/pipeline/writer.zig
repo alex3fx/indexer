@@ -57,6 +57,7 @@ pub fn processBlock(
     hPool: ?*http_pool.HttpPool,
     chunkBuckets: u64,
     backupNode: ?EvmRpcNodeConfig,
+    backupNode2: ?EvmRpcNodeConfig,
     erc20Ctx: *erc20.Erc20Context,
 ) ProcessBlockStatus {
     const rpcNode = chain.rpcNodes.lotosArchiveNode;
@@ -70,25 +71,23 @@ pub fn processBlock(
 
     const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result);
 
-    const fetched = switch (primaryStatus) {
-        .ok => true,
-        .retry_later, .skip_missing => blk: {
-            if (backupNode) |backup| {
-                pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
-            }
-            break :blk false;
-        },
-        .fatal => |e| blk: {
-            std.debug.print("[realtime] block={d} primary error: {s}", .{ blockNum, @errorName(e) });
-            if (backupNode) |backup| {
-                std.debug.print(" — trying backup\n", .{});
-                pipeline.resetResult(&result);
-                break :blk pipeline.fetchParseTransform(gpa, io, backup, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
-            }
-            std.debug.print("\n", .{});
-            break :blk false;
-        },
+    var fetched = primaryStatus == .ok;
+
+    if (!fetched) switch (primaryStatus) {
+        .fatal => |e| std.debug.print("[realtime] block={d} primary error: {s}\n", .{ blockNum, @errorName(e) }),
+        else => {},
+    };
+
+    if (!fetched) if (backupNode) |bn| {
+        pipeline.resetResult(&result);
+        fetched = pipeline.fetchParseTransform(gpa, io, bn, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
+        if (fetched) std.debug.print("[rt] block={d} recovered from backup1\n", .{blockNum});
+    };
+
+    if (!fetched) if (backupNode2) |bn2| {
+        pipeline.resetResult(&result);
+        fetched = pipeline.fetchParseTransform(gpa, io, bn2, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
+        if (fetched) std.debug.print("[rt] block={d} recovered from backup2\n", .{blockNum});
     };
 
     if (!fetched) return .retry_later;
