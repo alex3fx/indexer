@@ -115,8 +115,8 @@ pub fn transformBlockWithRemap(
     const number = hexToI64(block.number);
     const timestampS = hexToI64(block.timestamp);
     const timestampMs: i64 = if (block.milliTimestamp) |m| hexToI64(m) else timestampS * 1000;
-    // remapMod>0 && chunkEra>0: chunk = lane + lanes*era (v2/v3 scheme — bounds partition
-    // size by era while spreading lanes for shard parallelism).
+    // remapMod>0 && chunkEra>0: chunk = lane + lanes*era — bounds partition
+    // size by era while spreading lanes for shard parallelism.
     // remapMod>0, chunkEra==0: chunk = block % remapMod (flat scheme).
     // both 0: chunk = block / chunkSize (legacy fixed-window scheme).
     const chunk: i32 = if (remapMod > 0 and chunkEra > 0)

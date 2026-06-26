@@ -36,8 +36,8 @@ date/GELF formatting, etc.).
 | `RPC_URL` / `RPC_WSS` | chain config default | override the primary RPC node (needed to run independent processes against different physical nodes, e.g. a dual-node split) |
 | `NEIGHBOR_RPC_URL` | unset → disabled | second retry tier, historical sync only |
 | `RESERVE_RPC_URL` / `BACKUP_RPC_HTTPS` | unset → disabled | third retry tier; same slot, `RESERVE_RPC_URL` is canonical |
-| `SCYLLA_CHUNK_BUCKETS` | chain config default (flat scheme) | lane count for the v3 chunk scheme, e.g. `64` |
-| `SCYLLA_CHUNK_ERA` | `0` (flat scheme) | block-era size for the v3 chunk scheme, e.g. `32000` |
+| `SCYLLA_CHUNK_BUCKETS` | chain config default (flat scheme) | lane count for the chunk partition formula, e.g. `64` |
+| `SCYLLA_CHUNK_ERA` | `0` (flat scheme) | block-era size for the chunk partition formula, e.g. `32000` |
 | `FETCH_WORKERS` | chain config default | historical-sync fetch concurrency |
 | `SAVE_EVERY` | chain config default | blocks accumulated per Scylla save batch |
 | `ACCUM_TXS_LANES` / `ACCUM_LOG_LANES` / `ACCUM_ITX_LANES` | chain config default | parallel Scylla write connections per entity type |
@@ -60,7 +60,7 @@ cursor (`LATEST_PROCESSED_BLOCK_NUMBER + 1`), or `0` if no cursor exists yet.
 MODE=production EVM_CHAIN_ID=137 \
 CM_CONNECTION_URL='redis://127.0.0.1:6379/0' \
 SCYLLA_DB_HOST=127.0.0.1 SCYLLA_DB_PORT=9042 SCYLLA_DB_KEYSPACE=pol \
-SCYLLA_DB_USERNAME=cassandra SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
+SCYLLA_DB_USERNAME="$SCYLLA_DB_USERNAME" SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
 SCYLLA_CHUNK_BUCKETS=64 SCYLLA_CHUNK_ERA=32000 \
 FETCH_WORKERS=64 ACCUM_TXS_LANES=3 ACCUM_LOG_LANES=6 ACCUM_ITX_LANES=20 \
 RPC_URL=http://<node>:8545 RESERVE_RPC_URL=https://<public-fallback> \
@@ -86,7 +86,7 @@ Omit `--to` (or let `--from` catch up to a previous `--to`):
 MODE=production EVM_CHAIN_ID=137 \
 CM_CONNECTION_URL='redis://127.0.0.1:6379/0' \
 SCYLLA_DB_HOST=127.0.0.1 SCYLLA_DB_PORT=9042 SCYLLA_DB_KEYSPACE=pol \
-SCYLLA_DB_USERNAME=cassandra SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
+SCYLLA_DB_USERNAME="$SCYLLA_DB_USERNAME" SCYLLA_DB_PASSWORD="$SCYLLA_DB_PASSWORD" \
 SCYLLA_CHUNK_BUCKETS=64 SCYLLA_CHUNK_ERA=32000 \
 RPC_URL=http://<node>:8545 RPC_WSS=ws://<node>:8546 \
 RESERVE_RPC_URL=https://<public-fallback> \

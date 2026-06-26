@@ -28,9 +28,9 @@ Currently configured for **Ethereum**, **BSC**, and **Polygon** (chain config in
   after every save. Historical-mode resume should use the log's last `[watermark] N` instead (see
   `docs/HOWTOSTART.md` §4).
 - **Chunk/partitioning scheme** — `chunk = (block_number % SCYLLA_CHUNK_BUCKETS) +
-  SCYLLA_CHUNK_BUCKETS * (block_number / SCYLLA_CHUNK_ERA)` when both are set (v3 scheme — bounds
-  partition size by era while spreading writes across `SCYLLA_CHUNK_BUCKETS` lanes for shard
-  parallelism); falls back to a flat `block_number % SCYLLA_CHUNK_BUCKETS` if only buckets is set,
+  SCYLLA_CHUNK_BUCKETS * (block_number / SCYLLA_CHUNK_ERA)` when both are set — bounds partition
+  size by era while spreading writes across `SCYLLA_CHUNK_BUCKETS` lanes for shard parallelism;
+  falls back to a flat `block_number % SCYLLA_CHUNK_BUCKETS` if only buckets is set,
   or `block_number / chunkSize` (chain config default) if neither is set.
 - **HTTPS fallback** — any `https://` RPC URL is routed through a `curl` subprocess
   (`src/core/common/fetch.zig`) instead of `std.http.Client`, working around a Zig 0.17-dev

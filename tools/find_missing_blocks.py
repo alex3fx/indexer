@@ -2,16 +2,15 @@ import os, sys, threading
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.auth import PlainTextAuthProvider
 
-# Finds EXACT missing block numbers in the v3 chunk scheme (chunk=(block%lanes)+lanes*(block/era))
+# Finds EXACT missing block numbers (chunk=(block%lanes)+lanes*(block/era))
 # by scanning every (lane, era) chunk partition in [FROM_BLOCK, TO_BLOCK) and checking that present
 # block numbers are exactly `lanes` apart (within one lane's chunk, blocks are a strict arithmetic
-# sequence — any larger gap means missing rows). Written 2026-06-23 to recover blocks silently lost
-# by the (now-fixed) historical-sync "give up after backup fails" bug — see CONTEXT.md item #7.
+# sequence — any larger gap means missing rows).
 #
 # Usage: python3 find_missing_blocks.py FROM_BLOCK TO_BLOCK [LANES=64] [ERA=32000] [TABLE=blocks] [CONCURRENCY=64]
 # Prints one missing block number per line to stdout (so it can be piped straight into a backfill step).
-# Scylla connection: SCYLLA_DB_HOST (default 127.0.0.1), SCYLLA_DB_USERNAME (default cassandra),
-# SCYLLA_DB_PASSWORD (REQUIRED, no default), SCYLLA_DB_KEYSPACE (default pol).
+# Scylla connection: SCYLLA_DB_HOST (default 127.0.0.1), SCYLLA_DB_USERNAME (REQUIRED),
+# SCYLLA_DB_PASSWORD (REQUIRED), SCYLLA_DB_KEYSPACE (default pol).
 
 FROM_BLOCK = int(sys.argv[1])
 TO_BLOCK = int(sys.argv[2])
@@ -21,13 +20,13 @@ TABLE = sys.argv[5] if len(sys.argv) > 5 else "blocks"
 BLOCK_COL = "number" if TABLE == "blocks" else "block_number"
 CONCURRENCY = int(sys.argv[6]) if len(sys.argv) > 6 else 64
 
+SCYLLA_USERNAME = os.environ.get("SCYLLA_DB_USERNAME")
+if not SCYLLA_USERNAME:
+    sys.exit("SCYLLA_DB_USERNAME must be set in the environment (no default)")
 SCYLLA_PASSWORD = os.environ.get("SCYLLA_DB_PASSWORD")
 if not SCYLLA_PASSWORD:
-    sys.exit("SCYLLA_DB_PASSWORD must be set in the environment (no default — see RUNBOOK.md)")
-auth = PlainTextAuthProvider(
-    username=os.environ.get("SCYLLA_DB_USERNAME", "cassandra"),
-    password=SCYLLA_PASSWORD,
-)
+    sys.exit("SCYLLA_DB_PASSWORD must be set in the environment (no default)")
+auth = PlainTextAuthProvider(username=SCYLLA_USERNAME, password=SCYLLA_PASSWORD)
 profile = ExecutionProfile(request_timeout=60)
 cluster = Cluster(
     [os.environ.get("SCYLLA_DB_HOST", "127.0.0.1")],

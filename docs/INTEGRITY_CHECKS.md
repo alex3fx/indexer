@@ -63,7 +63,7 @@ UPDATE pol.skipped_blocks SET resolved = true WHERE block_number = <N>;
 
 ## Как проверяем — `tools/find_missing_blocks.py`
 
-Для v3 chunk-схемы (`chunk = (block % 64) + 64 * (block / 32000)`) каждый `lane` (`block % 64`)
+По формуле партиционирования (`chunk = (block % 64) + 64 * (block / 32000)`) каждый `lane` (`block % 64`)
 внутри одной `era` (`block / 32000`) — это арифметическая последовательность с шагом 64 в своей
 партиции. Скрипт сканирует **все 64 lanes** по каждой `era` в заданном диапазоне `[from, to)`,
 сравнивает present vs expected номера блоков и выводит точный (не оценочный) список пропущенных.

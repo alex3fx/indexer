@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Backfills missing-block spans found by find_missing_blocks.py, by re-running the
-# (fixed, never-skip) indexer binary across each span. Idempotent on overwrite —
-# safe to re-cover already-good blocks at span edges.
-# Written 2026-06-23 — see CONTEXT.md item under "Активный план" for the incident
-# this recovers from (historical-sync give-up-on-fetch-failure data loss bug).
+# indexer binary across each span. Idempotent on overwrite — safe to re-cover
+# already-good blocks at span edges. The indexer's retry chain (primary→neighbor→backup)
+# means a block that failed before may succeed now against a different RPC or after
+# a node recovers.
 #
 # Usage: backfill_spans.sh <node: 62|63> <rpc_url> <spans_file> <log_file>
 # spans_file: lines of "FROM TO" (inclusive), as produced from find_missing_blocks.py output.
@@ -20,11 +20,11 @@ SPAN_TIMEOUT="${6:-3600}"
 
 # Scylla password is REQUIRED from the environment — no hardcoded default. Other
 # Scylla/GrayLog settings have safe (non-secret) defaults matching this deployment.
-: "${SCYLLA_DB_PASSWORD:?SCYLLA_DB_PASSWORD must be set in the environment (see RUNBOOK.md)}"
+: "${SCYLLA_DB_PASSWORD:?SCYLLA_DB_PASSWORD must be set in the environment}"
 SCYLLA_DB_HOST="${SCYLLA_DB_HOST:-127.0.0.1}"
 SCYLLA_DB_PORT="${SCYLLA_DB_PORT:-9042}"
 SCYLLA_DB_KEYSPACE="${SCYLLA_DB_KEYSPACE:-pol}"
-SCYLLA_DB_USERNAME="${SCYLLA_DB_USERNAME:-cassandra}"
+: "${SCYLLA_DB_USERNAME:?SCYLLA_DB_USERNAME must be set in the environment}"
 CM_CONNECTION_URL="${CM_CONNECTION_URL:-redis://127.0.0.1:6379/5}"
 LOGS_GRAYLOG_HOST="${LOGS_GRAYLOG_HOST:-144.76.108.185}"
 LOGS_GRAYLOG_PORT="${LOGS_GRAYLOG_PORT:-12201}"

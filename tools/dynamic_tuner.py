@@ -7,19 +7,18 @@ loop driven by the RPC node's actual CPU load (via Grafana/Prometheus node_load1
 not just connection errors. Connection-error and crash-loop backoff remain as fast
 safety nets for failure modes load1 doesn't see immediately (e.g. a sudden RPC outage).
 
-Why load-based control was added (2026-06-23): the original tuner only reacted to
-connection errors, so it would happily climb FETCH_WORKERS back up to levels that
-pinned the RPC node at 100% CPU+iowait (load1 == core count) with ZERO connection
-errors — slow degraded responses aren't "errors", they're just slow, so the old logic
-was blind to the real constraint. Confirmed via Grafana: .62 (20 cores) at load1=21,
-.63 (96 cores) at load1=99 + 37% iowait, both from our own concurrent trace_block load.
-A static worker cap "fixes" that but either leaves throughput on the table (cap too
-low) or still overloads the node (cap too high, since the safe ceiling drifts with
-chain density/node state). Closed-loop control finds the actual sweet spot instead.
+Why load-based control: the original tuner only reacted to connection errors, so it
+would happily climb FETCH_WORKERS back up to levels that pinned the RPC node at 100%
+CPU+iowait (load1 == core count) with ZERO connection errors — slow degraded responses
+aren't "errors", they're just slow, so the old logic was blind to the real constraint.
+A static worker cap either leaves throughput on the table (cap too low) or still
+overloads the node (cap too high, since the safe ceiling drifts with chain density
+and node state). Closed-loop control finds the actual sweet spot instead.
 
-Resume logic matches the original bash wrapper: parse the last "Accum X->Y" line
-from this node's own log file (NOT the shared Redis checkpoint, which collides
-between the two dual-node processes).
+Resume logic: parse the last "[watermark] N" line from this node's own log file —
+that is the true contiguous-safe frontier (NOT the shared Redis checkpoint, which
+collides between the two dual-node processes, and NOT the last "Accum X->Y" line,
+which can be ahead of the watermark under concurrency).
 """
 import os, re, sys, time, socket, json, signal, subprocess, base64
 import urllib.request, urllib.parse
@@ -33,11 +32,11 @@ TO_BLOCK = int(sys.argv[4])
 # current values as defaults (NOT secrets — IPs/paths/hostnames) so the script keeps
 # working out of the box on this infra. The one exception is SCYLLA_DB_PASSWORD,
 # which has NO default — it must be set in the environment, never hardcoded/committed.
-# See RUNBOOK.md for the full list of required/optional env vars. ────────────────────
+# See docs/HOWTOSTART.md for the full list of required/optional env vars. ──────────
 BIN = os.environ.get("INDEXER_BIN", "/data/pol_index/raw_pol_v3_reserve")
 # Second retry tier (primary -> neighbor -> backup -> explicit skip+record, see
 # pipeline.zig worker()) — the OTHER dual-node split partner's RPC. Both are
-# plain HTTP, so this doesn't hit the HTTPS/ML-KEM crash (task #4).
+# plain HTTP, so this doesn't hit the HTTPS/ML-KEM SIGILL (see TODO.md).
 _NEIGHBOR_DEFAULTS = {"62": "http://100.64.0.63:8545", "63": "http://100.64.0.62:8545"}
 NEIGHBOR_RPC_URL = os.environ.get("NEIGHBOR_RPC_URL", _NEIGHBOR_DEFAULTS.get(NODE, ""))
 LOG = os.environ.get("TUNER_LOG", f"/data/pol_index/full_index_run/run_{NODE}_v3.log")
@@ -54,15 +53,17 @@ GRAYLOG_HOST = os.environ.get("LOGS_GRAYLOG_HOST", "144.76.108.185")
 GRAYLOG_PORT = int(os.environ.get("LOGS_GRAYLOG_PORT", "12201"))
 APP = f"indexer-pol-{NODE}-tuner"
 
-# Scylla credentials for the spawned indexer process — REQUIRED, no hardcoded
-# password default. Host/port/keyspace/username have safe (non-secret) defaults.
+# Scylla credentials for the spawned indexer process — both REQUIRED, no defaults.
+# Host/port/keyspace have safe (non-secret) defaults.
 SCYLLA_DB_HOST = os.environ.get("SCYLLA_DB_HOST", "127.0.0.1")
 SCYLLA_DB_PORT = os.environ.get("SCYLLA_DB_PORT", "9042")
 SCYLLA_DB_KEYSPACE = os.environ.get("SCYLLA_DB_KEYSPACE", "pol")
-SCYLLA_DB_USERNAME = os.environ.get("SCYLLA_DB_USERNAME", "cassandra")
+SCYLLA_DB_USERNAME = os.environ.get("SCYLLA_DB_USERNAME")
+if not SCYLLA_DB_USERNAME:
+    sys.exit("SCYLLA_DB_USERNAME must be set in the environment (no default)")
 SCYLLA_DB_PASSWORD = os.environ.get("SCYLLA_DB_PASSWORD")
 if not SCYLLA_DB_PASSWORD:
-    sys.exit("SCYLLA_DB_PASSWORD must be set in the environment (no default — see RUNBOOK.md)")
+    sys.exit("SCYLLA_DB_PASSWORD must be set in the environment (no default)")
 
 # ─── Grafana/Prometheus — the real congestion signal (see module docstring) ────────
 # Credentials come from env, never hardcoded here (GRAFANA_USER/GRAFANA_PASS). If
@@ -76,32 +77,21 @@ _NODE_INFO = {
     "62": {"instance": os.environ.get("NODE_62_INSTANCE", "100.64.0.62:9100"), "cores": 20},
     "63": {"instance": os.environ.get("NODE_63_INSTANCE", "100.64.0.63:9100"), "cores": 96},
 }
-# Disk-busy signal — added 2026-06-23, REMOVED for .63 on 2026-06-24 after manual
-# FETCH_WORKERS sweep (8..160, ~70s each, real watermark-delta measurement) proved
-# it was a false signal: nvme2n1's busy% reads ~99-100% essentially independent of
-# actual load (even idle/just-started it briefly read 100%, and at FW=8 it was
-# already pinned ~100%) — it reflects "queue non-empty" for this high-IOPS NVMe,
-# not "can't accept more work". Throughput scaled ALMOST LINEARLY with
-# FETCH_WORKERS up to ~55-60 (peak ~290-300 blk/s, vs ~100 blk/s the disk_busy gate
-# had us stuck at via MIN_WORKERS=15), then declined gently past ~70 — no sign of
-# the "collapse" this signal was originally added to guard against. That collapse
-# (2026-06-23, load_ratio 0.86-0.91 -> blk/s to single digits) was most likely the
-# unrelated Erigon trie-aggregation/live-sync-freeze incident happening at the same
-# time (see CONTEXT.md), not a real concurrency-driven cliff — confirmed by
-# 2026-06-24 sustained test at load_ratio~0.96 holding ~300 blk/s for 90s+ with no
-# degradation. Left _DISK_INFO/grafana_disk_busy() in place (still logged for
-# visibility) but no longer gates AIMD raise/lower decisions for .63 — see the
-# `disk_high`/`disk_low_or_unknown` computation below, now hardcoded inert.
+# Disk-busy signal — present for visibility but no longer gates AIMD decisions for .63.
+# The NVMe's busy% reads ~99-100% essentially independent of actual indexer load
+# (it reflects "queue non-empty" on a high-IOPS drive, not "can't accept more work").
+# A manual FETCH_WORKERS sweep confirmed throughput scales roughly linearly well
+# past the point where disk_busy was already pegged at 100% — the signal was a
+# false ceiling. Left in place (still logged) but `disk_high`/`disk_low_or_unknown`
+# below are now hardcoded inert for .63.
 _DISK_INFO = {
     "63": {"instance": _NODE_INFO["63"]["instance"], "device": os.environ.get("NODE_63_DISK_DEVICE", "nvme2n1")},
 }
 DISK_TARGET_LOW = 0.50
 DISK_TARGET_HIGH = 0.80
-# Per-node load target band. .63 raised to match .62's band on 2026-06-24 (was
-# 0.55/0.80) — the "latency cliff at 0.86-0.91" that justified the lower band was
-# re-tested and disproven (see _DISK_INFO comment above): sustained load_ratio~0.96
-# held peak throughput with no collapse. Empirical FETCH_WORKERS sweep peak was
-# ~55-60 (cores=96, so load1~85-95 at peak) — band below targets staying near that.
+# Per-node load target band. Both nodes use the same band (0.85/0.95): empirical
+# sweep on .63 showed sustained load_ratio~0.96 holds peak throughput without collapse,
+# and the empirical peak was ~55-60 workers (load1~85-95 on 96 cores).
 _LOAD_TARGETS = {
     "62": {"low": 0.85, "high": 0.95},
     "63": {"low": 0.85, "high": 0.95},
@@ -117,24 +107,15 @@ LOAD_CHANGE_COOLDOWN_SEC = 90  # don't act again until load has had time to refl
                                 # just oscillates on stale data.
 
 # Per-node bounds — wide enough that the AIMD loop above has real room to find the
-# sweet spot itself (raised back up from the 2026-06-23 emergency static caps now that
-# load1 is actually being watched).
+# sweet spot itself — wide enough that load1 feedback, not the bounds, is the
+# binding constraint under normal operation.
 _WORKER_BOUNDS = {
-    # .62's min was 10, but observed steady-state ratio at FETCH_WORKERS=10 stayed
-    # 0.82-1.05 — already above LOAD_TARGET_HIGH even at the floor (2026-06-23: each
-    # request is apparently expensive enough right now that 10 concurrent already
-    # saturates it). Lowered the floor so the AIMD loop has room to actually reach
-    # the target band instead of being stuck oscillating against an artificial wall.
+    # .62: floor kept low so AIMD has room to back off when old-block trace_block
+    # requests are expensive — at higher concurrency load_ratio can exceed 1.0 quickly.
     "62": {"min": 3, "max": 150, "probe": [5, 10, 20, 40]},
-    # min raised 15->30 and probe re-centered on the empirical peak (2026-06-24
-    # manual sweep: linear scaling to ~55-60, peak ~290-300 blk/s there, gentle
-    # decline by 160 — nothing like the old probe's untested 100/200 region implied).
-    # max raised 150->260 on 2026-06-25: AIMD pegged at the 150 ceiling for an extended
-    # period with NO backoff trigger (load_ratio 0.69-0.94, never hit LOAD_TARGET_HIGH=0.95)
-    # at sustained 330-390 blk/s — the cap itself was the binding constraint, not load.
-    # Conditions differ from the original 06-24 sweep (live-sync on .63's erigon is now
-    # frozen, freeing some resources), so this isn't necessarily a re-opening of the old
-    # 100-400 oscillation problem — AIMD's own load_ratio backoff still applies above this.
+    # .63: probe re-centered on empirical peak (~55-60 workers → ~290-300 blk/s);
+    # max raised to 260 because AIMD was pegged at 150 with load_ratio well below
+    # LOAD_TARGET_HIGH — the old cap was the binding constraint, not node load.
     "63": {"min": 30, "max": 260, "probe": [30, 45, 60, 80]},
 }
 _bounds = _WORKER_BOUNDS.get(NODE, {"min": 50, "max": 500, "probe": [100, 200, 300, 400]})
@@ -152,7 +133,7 @@ RESTART_BACKOFF_THRESHOLD = 3  # this many restarts within the window triggers a
 ACCUM_RE = re.compile(r"Accum (\d+)→(\d+): saved=(\d+) save=(\d+)ms")
 ALERT_RE = re.compile(r"\[ALERT\] (\d+) connection errors")
 # [watermark] N — the contiguous-saved-frontier resume point (see pipeline.zig
-# Watermark struct, added 2026-06-23). NOT the same as Accum's per-batch max: a
+# Watermark struct). NOT the same as Accum's per-batch max: a
 # batch can report Accum X->Y while a slower, still-in-flight worker on a block
 # < Y hasn't saved yet — resuming from Y would skip it forever on a crash/kill.
 # The watermark line only ever reports a value once everything below it is
@@ -232,11 +213,11 @@ def grafana_disk_busy():
 # log_tail_state()/last_watermark() are called ~10x per AIMD cycle (every probe
 # measurement and every steady-state check). Both used to re-scan the ENTIRE log
 # file from byte 0 on every single call — fine when the log was small, but after
-# days of continuous indexing it grows to tens of millions of lines (41M+ seen on
-# .63 2026-06-25), and re-reading+regexing the whole thing on every call became a
-# real, growing source of latency in the tuner's own decision loop (a single probe
-# measurement stalled for 90s+ past its nominal window). Same anti-pattern already
-# found and fixed once before in monitor_pol_v3.py — fixed here the same way: keep
+# days of continuous indexing it grows to tens of millions of lines, and re-reading
+# the whole thing on every call becomes a real, growing source of latency in the
+# tuner's own decision loop (a single probe measurement can stall past its nominal
+# window). Same anti-pattern already fixed in monitor_pol_v3.py — fixed here the
+# same way: keep
 # a persistent byte-offset cursor and only scan newly-appended bytes since the last
 # call, caching the last-seen block/errors/watermark across calls. Unlike
 # monitor_pol_v3.py (which deliberately seeds pos at EOF to skip old history), this
@@ -422,8 +403,8 @@ def main():
 
             # Heavy error rate OR load1 overloaded during probe — drop this candidate
             # and skip remaining higher ones. disk_busy deliberately excluded here
-            # (2026-06-24: proved to be a false-overload signal for .63's NVMe, see
-            # _DISK_INFO comment) — still measured/logged above for visibility only.
+            # (false-overload signal for high-IOPS NVMe, see _DISK_INFO comment) —
+            # still measured/logged above for visibility only.
             overloaded = (err_delta >= ERROR_DELTA_THRESHOLD
                           or (load_ratio is not None and load_ratio >= LOAD_TARGET_HIGH))
             if overloaded:
@@ -514,10 +495,9 @@ def main():
             # too many overloads the node": keep nudging toward the load band instead
             # of sitting at a fixed cap or a stale probe-round winner. disk_busy is
             # measured/logged for visibility only — NOT used to gate raise/backoff
-            # decisions (2026-06-24: proved to be a false-overload signal for .63's
-            # NVMe — busy% reads ~100% near-constantly regardless of actual headroom,
-            # see _DISK_INFO comment above for the measured FETCH_WORKERS sweep that
-            # found this). load_ratio alone now drives both raise and backoff.
+            # decisions (false-overload signal for high-IOPS NVMe; busy% reads ~100%
+            # near-constantly regardless of actual headroom, see _DISK_INFO comment).
+            # load_ratio alone drives both raise and backoff.
             load1, load_ratio = grafana_load1()
             disk_busy = grafana_disk_busy()
             now = time.time()
