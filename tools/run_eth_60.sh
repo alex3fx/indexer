@@ -4,7 +4,7 @@
 # Redis DB=2 (isolated from node-07 instance which uses DB=1)
 # Auto-restart loop; resumes from own log (NOT shared Redis cursor).
 
-set -euo pipefail
+set -uo pipefail
 
 BINARY="$HOME/raw_erc20_v7"
 LOG="$HOME/eth_index_60.log"
@@ -22,7 +22,10 @@ while true; do
     echo "$(date -u +%FT%TZ)  Starting node-60 instance: FROM=$FROM HEAD" | tee -a "$LOG"
 
     EVM_CHAIN_ID=1 \
-    MODE=development \
+    MODE=production \
+    LOGS_GRAYLOG_HOST=144.76.108.185 \
+    LOGS_GRAYLOG_PORT=12201 \
+    LOGS_GRAYLOG_APP=indexer-eth-60 \
     PRIMARY_RPC_HTTPS=http://100.64.0.60:8545 \
     PRIMARY_RPC_WSS=ws://100.64.0.60:8546 \
     BACKUP_RPC_HTTPS=http://100.64.0.7:8545 \
