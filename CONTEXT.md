@@ -84,48 +84,51 @@ ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
   "nohup /tmp/start_hist.sh > ~/erc20_hist_<FROM>_<TO>.log 2>&1 &"
 ```
 
-## Dual-node запуск (v7 binary)
+## Dual-node запуск через тюнер (v8 binary)
 
-Два экземпляра на `100.64.0.4`, каждый со своей ETH-нодой и диапазоном блоков.
+Два экземпляра на `100.64.0.4`, каждый со своей ETH-нодой и диапазоном блоков. Управляются
+`dynamic_tuner_eth.py` — он сам подбирает FETCH_WORKERS через AIMD, перезапускает при краше,
+резюмирует по последнему `[watermark]` в лог-файле.
 
-### Деплой бинаря v7
+### Деплой бинаря v8 (если нужен новый)
 
 ```bash
-# Локально
 cd /home/alex/lotos/task1/devindexer/indexer-erc20
 /home/alex/lotos/zig-x86_64-linux-0.17.0-dev.263+0add2dfc4/zig build \
   -p .zig/build --cache-dir .zig/.cache -Doptimize=ReleaseFast
 
-# Убедиться что v6 остановлен
-ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 "pkill -f raw_erc20_v6 || true; sleep 1"
+# Остановить работающие инстанции перед заменой бинаря
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
+  "tmux kill-session -t eth07; tmux kill-session -t eth60; pkill -f raw_erc20 || true; sleep 2"
 
-# Деплой
-scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_erc20_v7
+scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_erc20_v8
 ```
 
-### Запуск dual-node (каждый в своём tmux pane)
+### Запуск тюнера (обе ноды)
 
-**Шаг 1** — скопировать скрипты запуска на сервер:
 ```bash
+# Деплой скриптов (если обновлены локально)
 scp -i ~/.ssh/id_ed25519 \
-  tools/run_eth_07.sh tools/run_eth_60.sh \
+  tools/dynamic_tuner_eth.py tools/run_tuner_07.sh tools/run_tuner_60.sh \
   alexey_smolyakov@100.64.0.4:~/
-```
-
-**Шаг 2** — **отредактировать `YOUR_REDIS_PASSWORD`** в обоих скриптах на `ZCy8k4G6pcRYVFfm`.
-
-**Шаг 3** — запуск (два раздельных SSH, иначе второй может не стартовать):
-```bash
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
-  "nohup ~/run_eth_07.sh > ~/eth_07_wrap.log 2>&1 &"
+  "chmod +x ~/run_tuner_07.sh ~/run_tuner_60.sh"
+
+# Старт (два отдельных SSH)
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
+  "tmux new-session -d -s eth07 '~/run_tuner_07.sh >> ~/eth_tuner_07.log 2>&1'"
 
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
-  "nohup ~/run_eth_60.sh > ~/eth_60_wrap.log 2>&1 &"
+  "tmux new-session -d -s eth60 '~/run_tuner_60.sh >> ~/eth_tuner_60.log 2>&1'"
 ```
 
 ### Мониторинг прогресса
 
 ```bash
+# Статус тюнеров (blk/s, FETCH_WORKERS, load1)
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
+  "grep -E 'steady:|probe FETCH' ~/eth_tuner_07.log | tail -10"
+
 # Прогресс нода .7
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
   "grep -oP 'Accum \d+→\K\d+' ~/eth_index_07.log | tail -5"
@@ -134,8 +137,12 @@ ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
   "grep -oP 'Accum \d+→\K\d+' ~/eth_index_60.log | tail -5"
 
-# Живы ли процессы
-ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 "pgrep -a raw_erc20"
+# Живы ли процессы и tmux-сессии
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 "tmux ls && pgrep -a raw_erc20"
+
+# Остановить всё
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
+  "tmux kill-session -t eth07; tmux kill-session -t eth60"
 ```
 
 ### Фоллбек схема (три уровня)
@@ -164,6 +171,7 @@ primary (локальная нода) → backup1 (соседняя нода) �
 | PRIMARY_RPC_HTTPS/WSS env override | ✅ готово | (текущий) |
 | Три уровня RPC фоллбека (backup1/backup2) | ✅ готово | (текущий) |
 | Dual-node run scripts (07/60) | ✅ готово | (текущий) |
+| Dynamic tuner (AIMD FETCH_WORKERS) | ✅ запущено | (текущий) |
 
 ### Unprepared fix — детали
 
@@ -222,7 +230,7 @@ Scylla под нагрузкой вытесняет cached prepared statements. 
 - **Нода .7:** `100.64.0.7:8545` — RETH v2.3.0, архивная, `trace_block`, диапазон `[0, 12_700_000]`
 - **Нода .60:** `100.64.0.60:8545` — RETH v2.3.0, архивная, `trace_block`, диапазон `[12_700_001, HEAD]`
 - **Publicnode backup:** `https://ethereum-rpc.publicnode.com` — третий уровень фоллбека
-- **Worker count:** `8` в run-скриптах (тестовый дефолт; для sustained prod — `64` оптимум для .7)
+- **Worker count:** динамический (`dynamic_tuner_eth.py` AIMD); бенчмарк .7: оптимум W=64 (204.9 blk/s)
 - **SAVE_EVERY:** `100`, **SCYLLA_CHUNK_BUCKETS:** `64`
 - **Redis изоляция:** нода .7 → DB=1, нода .60 → DB=2 (разные курсоры, не конфликтуют)
 

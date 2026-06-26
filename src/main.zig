@@ -365,6 +365,14 @@ pub fn main(init: Init) !void {
     if (init.environ_map.get("PRIMARY_RPC_WSS")) |url| {
         if (url.len > 0) chain.rpcNodes.lotosArchiveNode.wss = url;
     }
+    if (init.environ_map.get("FETCH_WORKERS")) |v| {
+        if (std.fmt.parseInt(u32, v, 10)) |n| {
+            chain.indexingOptions.workerCount = n;
+            std.debug.print("Worker count override: {d}\n", .{n});
+        } else |_| {
+            std.debug.print("Invalid FETCH_WORKERS: {s}\n", .{v});
+        }
+    }
 
     const cli = try parseCli(init);
 

@@ -7,48 +7,55 @@ All scripts read credentials from the environment — `SCYLLA_DB_PASSWORD` is re
 hardcoded default anywhere in this directory); `GRAFANA_USER`/`GRAFANA_PASS` are optional
 (only needed for the tuner's load-aware signal).
 
-## `run_eth_07.sh` / `run_eth_60.sh` — dual-node ETH indexer launch scripts
+## `dynamic_tuner_eth.py` + `run_tuner_07.sh` / `run_tuner_60.sh` — ETH tuner (active)
 
-Two-instance setup: node `.7` covers `[0, 12_700_000]`, node `.60` covers `[12_700_001, HEAD]`.
-Each script runs an auto-restart loop and resumes from its own log file (not the shared Redis cursor).
-Three-tier RPC fallback: primary → neighbor → `ethereum-rpc.publicnode.com`.
+Bootstrap-probes FETCH_WORKERS (W=16/32/48/64 for node .07; W=32/48/64/96 for node .60), then
+runs a continuous AIMD control loop driven by the RPC node's `node_load1` from Grafana/Prometheus.
+Restarts the indexer on crash, resumes from `[watermark] N` in the log, sends alerts to GrayLog.
 
-Before first use:
-1. Replace `YOUR_REDIS_PASSWORD` with the actual Redis password.
-2. Set `SCYLLA_DB_PASSWORD`, keyspace/user/host for the target cluster.
-3. Deploy binary as `~/raw_erc20_v7` on `100.64.0.4` (see `CONTEXT.md` for deploy commands).
+`run_tuner_07.sh` / `run_tuner_60.sh` are credential wrappers — credentials live in the file, not
+on the command line (not visible in `ps aux`). Deployed to `~/` on `100.64.0.4`.
 
 ```bash
-# On 100.64.0.4, in separate tmux panes:
-nohup ./tools/run_eth_07.sh &
-nohup ./tools/run_eth_60.sh &
+# Start (tmux sessions eth07 / eth60 on 100.64.0.4)
+tmux new-session -d -s eth07 '~/run_tuner_07.sh >> ~/eth_tuner_07.log 2>&1'
+tmux new-session -d -s eth60 '~/run_tuner_60.sh >> ~/eth_tuner_60.log 2>&1'
+
+# Status
+tail -f ~/eth_tuner_07.log
+tail -f ~/eth_tuner_60.log
+grep 'steady:' ~/eth_tuner_07.log | tail -5   # blk/s and FETCH_WORKERS
+
+# Stop
+tmux kill-session -t eth07
+tmux kill-session -t eth60
 ```
 
-Env vars that matter:
-- `CM_CONNECTION_URL` — `redis://...@host:port/<DB>` — node-07 uses DB=1, node-60 uses DB=2
-- `PRIMARY_RPC_HTTPS` / `BACKUP_RPC_HTTPS` / `BACKUP_RPC_HTTPS_2` — override chain defaults
-
-**Status:** working (2026-06-26), requires binary v7+
+Hardware: node .07 = 48 cores (157.90.65.123), node .60 = 96 cores (100.64.0.60).
+Load target: 0.85–0.95 of core count. Cooldown between adjustments: 90s.
+**Status:** running (2026-06-26), requires binary v8+, supersedes `run_eth_07.sh`/`run_eth_60.sh`.
 
 ---
 
-## `dynamic_tuner.py` — launch + load-aware concurrency supervisor
+## `run_eth_07.sh` / `run_eth_60.sh` — static wrapper scripts (superseded)
 
-Bootstrap-probes a few `FETCH_WORKERS` values, then runs a continuous AIMD control loop driven
-by the RPC node's `node_load1` (Grafana/Prometheus) — raises concurrency when load is low, backs
-off when high. Restarts on crash with exponential backoff. Resumes from the log's last
-`[watermark] N` line automatically (the true contiguous-safe resume point — see
-`docs/HOWTOSTART.md` for why this differs from the `Accum X→Y` line).
+Simple auto-restart loops with fixed FETCH_WORKERS=64. Superseded by `dynamic_tuner_eth.py`
+which probes and adjusts FETCH_WORKERS automatically. Kept for reference / manual override.
+
+**Status:** superseded (2026-06-26), requires binary v8+
+
+---
+
+## `dynamic_tuner.py` — Polygon indexer tuner (not for ETH)
+
+Polygon-specific (chain_id=137, nodes .62/.63, keyspace=pol). See the Polygon indexer repo
+(`/home/alex/lotos/task1/devindexer/indexer`) for usage. Use `dynamic_tuner_eth.py` for ETH.
 
 ```bash
 export SCYLLA_DB_PASSWORD='...'
 export GRAFANA_USER='...' GRAFANA_PASS='...'   # optional
 python3 dynamic_tuner.py <node_id> <rpc_url> <from_block_if_no_log_yet> <to_block>
 ```
-
-Per-deployment topology (RPC URLs, Prometheus instance labels, worker bounds) is set near the
-top of the script — edit `_NEIGHBOR_DEFAULTS`/`_NODE_INFO`/`_WORKER_BOUNDS`, or override via env
-(`NEIGHBOR_RPC_URL`, `NODE_62_INSTANCE`, etc.) without touching the script.
 
 ## `monitor_pol_v3.py` — heartbeat/alert monitor
 

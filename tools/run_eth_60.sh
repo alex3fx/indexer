@@ -6,7 +6,7 @@
 
 set -uo pipefail
 
-BINARY="$HOME/raw_erc20_v7"
+BINARY="$HOME/raw_erc20_v8"
 LOG="$HOME/eth_index_60.log"
 REDIS_BASE="redis://:YOUR_REDIS_PASSWORD@100.64.0.4:6379"
 
@@ -36,7 +36,7 @@ while true; do
     SCYLLA_DB_KEYSPACE=eth \
     SCYLLA_DB_USERNAME=cassandra \
     SCYLLA_DB_PASSWORD=cassandra \
-    FETCH_WORKERS=8 \
+    FETCH_WORKERS=64 \
     SAVE_EVERY=100 \
     SCYLLA_CHUNK_BUCKETS=64 \
     "$BINARY" --from="$FROM" 2>&1 | tee -a "$LOG" || true
