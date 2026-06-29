@@ -1,6 +1,6 @@
 # Контекст проекта — ETH ERC-20 индексер
 
-_Последнее обновление: 2026-06-26 (v2 — dual-node setup)_
+_Последнее обновление: 2026-06-27 (v3 — v3 chunk scheme, TRUNCATE+RESTART)_
 
 ## Что это
 
@@ -84,13 +84,13 @@ ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
   "nohup /tmp/start_hist.sh > ~/erc20_hist_<FROM>_<TO>.log 2>&1 &"
 ```
 
-## Dual-node запуск через тюнер (v8 binary)
+## Dual-node запуск через тюнер (v9 binary, v3 chunk scheme)
 
 Два экземпляра на `100.64.0.4`, каждый со своей ETH-нодой и диапазоном блоков. Управляются
 `dynamic_tuner_eth.py` — он сам подбирает FETCH_WORKERS через AIMD, перезапускает при краше,
 резюмирует по последнему `[watermark]` в лог-файле.
 
-### Деплой бинаря v8 (если нужен новый)
+### Деплой бинаря v9 (если нужен новый)
 
 ```bash
 cd /home/alex/lotos/task1/devindexer/indexer-erc20
@@ -101,7 +101,7 @@ cd /home/alex/lotos/task1/devindexer/indexer-erc20
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
   "tmux kill-session -t eth07; tmux kill-session -t eth60; pkill -f raw_erc20 || true; sleep 2"
 
-scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_erc20_v8
+scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_erc20_v9
 ```
 
 ### Запуск тюнера (обе ноды)
@@ -156,7 +156,7 @@ primary (локальная нода) → backup1 (соседняя нода) �
 
 ---
 
-## Текущий статус (2026-06-26)
+## Текущий статус (2026-06-27)
 
 ### Что сделано и проверено
 
@@ -172,6 +172,7 @@ primary (локальная нода) → backup1 (соседняя нода) �
 | Три уровня RPC фоллбека (backup1/backup2) | ✅ готово | (текущий) |
 | Dual-node run scripts (07/60) | ✅ готово | (текущий) |
 | Dynamic tuner (AIMD FETCH_WORKERS) | ✅ запущено | (текущий) |
+| v3 chunk scheme (LANES=24, ERA=12000) | ✅ активно с 2026-06-27 | (текущий) |
 
 ### Unprepared fix — детали
 
@@ -203,27 +204,36 @@ Scylla под нагрузкой вытесняет cached prepared statements. 
 - Свободно ~20 TB, оценка на всю цепь ~13.5 TB (запас ~6.5 TB — не огромный, следить с первого дня)
 - Подробнее: `docs/FULLCHAIN_PREP.md` разделы 3 и 3.1
 
-### Что не запущено
+### Full-chain индексация — ЗАПУЩЕНА (2026-06-27)
 
-- **Полная историческая индексация** (genesis → head) — **НЕ ЗАПУЩЕНА**. Это следующий шаг.
-  Перед запуском — прочитать `docs/FULLCHAIN_PREP.md` полностью (особенно чеклист п.5).
+**TRUNCATE + RESTART выполнен 2026-06-27.** Причина: обнаружено смешение двух несовместимых схем
+чанков в БД (LANES=64 от основных прогонов + LANES=24 от ранних тестов → hot partition проблема).
+Решение: TRUNCATE 14 таблиц eth.*, flush Redis DB1+DB2, рестарт с v3-схемой.
+
+- **Нода .7** (eth07 tmux): `raw_erc20_v9`, блоки `0 → 12,700,000`, SCYLLA_CHUNK_BUCKETS=24, SCYLLA_CHUNK_ERA=12000
+- **Нода .60** (eth60 tmux): `raw_erc20_v9`, блоки `12,700,001 → HEAD`, те же параметры
+- Управляется `dynamic_tuner_eth.py` (AIMD, auto-restart)
+- Схема v3: `chunk = (block % 24) + 24 * (block // 12000)` — 500 блоков/партицию, 24 партиции/эпоха
+
+**Следить:** диск `/storage/scylla-eth` (свободно ~20 TB, нужно ~13.5 TB).
 
 ## Открытые задачи
 
-1. **Запуск full-chain индексации** — genesis → head на `/storage/scylla-eth`.
-   Ключевые риски: диск (~6.5 TB запаса), время (~6+ дней), нет мониторинга как у Polygon (нет аналога `dynamic_tuner.py`).
-   Предварительно: sustained-тест в зоне 25.3M (head) чтобы уточнить скорость там.
+1. **Мониторинг full-chain прогона** — проверять прогресс обеих нод, диск, скорость.
+   `grep -oP 'Accum \d+→\K\d+' ~/eth_index_07.log | tail -5` на сервере.
 
-2. **Портирование operational tooling из ветки `polygon`**:
-   - `tools/dynamic_tuner.py` — авто-тюнинг FETCH_WORKERS
+2. **Верификация данных** после завершения (или промежуточная) — `find_missing_blocks.py`-эквивалент
+   для ETH. Проверить отсутствие пропусков блоков.
+
+3. **Портирование operational tooling из ветки `polygon`**:
    - `tools/find_missing_blocks.py` — поиск пропусков
    - `tools/backfill_spans.sh` — backfill конкретных диапазонов
    - `tools/monitor_pol_v3.py` → нужна ETH-версия `monitor_eth.py`
 
-3. **Merge ветки `polygon`** — 30 operational коммитов с bug fixes (silent skip-record loss,
+4. **Merge ветки `polygon`** — 30 operational коммитов с bug fixes (silent skip-record loss,
    WSS reconnect giving up, task #4 HTTPS backup RPC, task #7 give-up cycle counter).
 
-4. **Верификация ERC-20 данных** — для первого 1-5M блоков после запуска, сверка с RPC ground truth.
+5. **Верификация ERC-20 данных** — для первого 1-5M блоков после запуска, сверка с RPC ground truth.
 
 ## Infra — ETH
 
@@ -231,7 +241,8 @@ Scylla под нагрузкой вытесняет cached prepared statements. 
 - **Нода .60:** `100.64.0.60:8545` — RETH v2.3.0, архивная, `trace_block`, диапазон `[12_700_001, HEAD]`
 - **Publicnode backup:** `https://ethereum-rpc.publicnode.com` — третий уровень фоллбека
 - **Worker count:** динамический (`dynamic_tuner_eth.py` AIMD); бенчмарк .7: оптимум W=64 (204.9 blk/s)
-- **SAVE_EVERY:** `100`, **SCYLLA_CHUNK_BUCKETS:** `64`
+- **SAVE_EVERY:** `100`, **SCYLLA_CHUNK_BUCKETS:** `24`, **SCYLLA_CHUNK_ERA:** `12000`
+- **Схема чанков (v3):** `chunk = (block % 24) + 24 * (block // 12000)` — 500 блоков/партицию max, 24 партиции/эпоха (spread по 24 Scylla шардам). Аналог Polygon v3.
 - **Redis изоляция:** нода .7 → DB=1, нода .60 → DB=2 (разные курсоры, не конфликтуют)
 
 ## Документация

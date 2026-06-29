@@ -10,7 +10,7 @@ export GRAFANA_USER=alexey.smolyakov@lotos.io
 export GRAFANA_PASS='OX8OYykA2!jtWv'
 export GRAFANA_URL=https://grafana.lotos-team.com
 export GRAFANA_PROM_UID=PBFA97CFB590B2093
-export INDEXER_BIN="$HOME/raw_erc20_v8"
+export INDEXER_BIN="$HOME/raw_erc20_v9"
 export TUNER_LOG="$HOME/eth_index_60.log"
 
 # TO_BLOCK=999000000 — never-reached sentinel; tuner runs indefinitely (follows HEAD)

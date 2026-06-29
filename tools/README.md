@@ -33,7 +33,10 @@ tmux kill-session -t eth60
 
 Hardware: node .07 = 48 cores (157.90.65.123), node .60 = 96 cores (100.64.0.60).
 Load target: 0.85–0.95 of core count. Cooldown between adjustments: 90s.
-**Status:** running (2026-06-26), requires binary v8+, supersedes `run_eth_07.sh`/`run_eth_60.sh`.
+**Status:** running (2026-06-27), requires binary v9+, supersedes `run_eth_07.sh`/`run_eth_60.sh`.
+**v3 chunk scheme active:** `SCYLLA_CHUNK_BUCKETS=24`, `SCYLLA_CHUNK_ERA=12000`
+(`chunk = (block % 24) + 24 * (block // 12000)` — 500 blk/partition, 24 partitions/era).
+Switched from LANES=64 flat (hot partition risk) via TRUNCATE+RESTART on 2026-06-27.
 
 ---
 
@@ -42,7 +45,7 @@ Load target: 0.85–0.95 of core count. Cooldown between adjustments: 90s.
 Simple auto-restart loops with fixed FETCH_WORKERS=64. Superseded by `dynamic_tuner_eth.py`
 which probes and adjusts FETCH_WORKERS automatically. Kept for reference / manual override.
 
-**Status:** superseded (2026-06-26), requires binary v8+
+**Status:** superseded (2026-06-26), requires binary v8+. Do NOT use — chunk scheme was LANES=64 flat (incompatible with current v3 scheme)
 
 ---
 
@@ -75,23 +78,53 @@ numbers (one per line) — an arithmetic-sequence check per lane, not `ALLOW FIL
 doesn't under-sample like naive chunk-number enumeration does.
 
 ```bash
-export SCYLLA_DB_PASSWORD='...'
-python3 find_missing_blocks.py FROM_BLOCK TO_BLOCK [LANES=64] [ERA=32000] [TABLE=blocks] [CONCURRENCY=64]
+export SCYLLA_DB_USERNAME=cassandra SCYLLA_DB_PASSWORD='...' SCYLLA_DB_KEYSPACE=eth
+python3.12 find_missing_blocks.py FROM_BLOCK TO_BLOCK [LANES=24] [ERA=12000] [TABLE=blocks] [CONCURRENCY=128]
 ```
 
 Run this after any historical sync range is claimed complete, and after any manual backfill,
-before trusting the data as gap-free.
+before trusting the data as gap-free. Output: one missing block number per line on stdout;
+summary ("Total missing: N") to stderr. Requires `python3.12` (cassandra-driver installed there).
 
-## `backfill_spans.sh` — targeted re-sync for known gaps
+**2026-06-29 run**: found 6,032 missing blocks across 235 regions in 0→25.4M.
+Results saved to `~/missing_blocks_eth.txt` on 100.64.0.4.
 
-Re-runs the indexer binary across each `FROM TO` span from a file (group `find_missing_blocks.py`
-output into contiguous ranges first). Idempotent — primary key is `chunk + block_number`, so it's
-safe to re-cover already-good blocks at span edges.
+## `make_spans_eth.py` — groups missing blocks into re-index spans
+
+Takes `find_missing_blocks.py` output (one block number per line) and groups consecutive missing
+blocks into contiguous `FROM TO` spans for backfill. Splits output at block 12,700,000 (the
+.07/.60 RPC split point) into two separate files.
+
+```bash
+python3 make_spans_eth.py <missing_blocks.txt> [gap_tolerance=500] [padding=10]
+# produces: missing_blocks_eth_spans_07.txt and missing_blocks_eth_spans_60.txt
+```
+
+**2026-06-29**: 6,032 missing blocks → 232 spans (134 for .07, 98 for .60).
+
+## `backfill_spans_eth.sh` — targeted re-sync for known gaps (ETH)
+
+Re-runs the ETH indexer binary across each `FROM TO` span from a file. Idempotent — primary key
+is `chunk + block_number`, so re-covering already-good blocks at span edges is safe.
+Uses `SCYLLA_CHUNK_BUCKETS=24 SCYLLA_CHUNK_ERA=12000 EVM_CHAIN_ID=1 SCYLLA_DB_KEYSPACE=eth`.
+
+```bash
+export SCYLLA_DB_USERNAME=cassandra SCYLLA_DB_PASSWORD='...' REDIS_PASSWORD='...'
+./backfill_spans_eth.sh <node: 07|60> <rpc_url> <spans_file> <log_file> [fetch_workers=10] [span_timeout=3600]
+```
+
+Deployed to `~/` on 100.64.0.4 along with `run_backfill_07.sh` / `run_backfill_60.sh` wrappers.
+Running in tmux sessions `backfill07` / `backfill60` as of 2026-06-29.
+
+**Status:** active (2026-06-29) — backfilling 6,032 missing blocks from overload period.
+Logs: `~/eth_backfill_07.log`, `~/eth_backfill_60.log`.
+
+## `backfill_spans.sh` — targeted re-sync for known gaps (Polygon)
+
+**Polygon-specific** (chain_id=137, BUCKETS=64, ERA=32000, keyspace=pol). For ETH use
+`backfill_spans_eth.sh` above.
 
 ```bash
 export SCYLLA_DB_PASSWORD='...'
 ./backfill_spans.sh <node_id> <rpc_url> <spans_file> <log_file> [fetch_workers=8] [span_timeout=3600]
 ```
-
-Don't run this concurrently with live indexing at high concurrency against the same RPC node —
-the two compete for the node's resources. Keep `fetch_workers` low (5-10) during backfill.

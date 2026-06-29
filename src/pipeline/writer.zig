@@ -56,6 +56,7 @@ pub fn processBlock(
     blockNum: u64,
     hPool: ?*http_pool.HttpPool,
     chunkBuckets: u64,
+    chunkEra: u64,
     backupNode: ?EvmRpcNodeConfig,
     backupNode2: ?EvmRpcNodeConfig,
     erc20Ctx: *erc20.Erc20Context,
@@ -69,7 +70,7 @@ pub fn processBlock(
 
     const t_recv_ms = realtimeMs();
 
-    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, hPool, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result);
+    const primaryStatus = pipeline.fetchParseTransform(gpa, io, rpcNode, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, hPool, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result);
 
     var fetched = primaryStatus == .ok;
 
@@ -80,13 +81,13 @@ pub fn processBlock(
 
     if (!fetched) if (backupNode) |bn| {
         pipeline.resetResult(&result);
-        fetched = pipeline.fetchParseTransform(gpa, io, bn, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
+        fetched = pipeline.fetchParseTransform(gpa, io, bn, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
         if (fetched) std.debug.print("[rt] block={d} recovered from backup1\n", .{blockNum});
     };
 
     if (!fetched) if (backupNode2) |bn2| {
         pipeline.resetResult(&result);
-        fetched = pipeline.fetchParseTransform(gpa, io, bn2, blockNum, chunkSize, chunkBuckets, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
+        fetched = pipeline.fetchParseTransform(gpa, io, bn2, blockNum, chunkSize, chunkBuckets, chunkEra, bClient, rClient, tClient, null, &erc20Ctx.bloom, &erc20Ctx.bytecodeBloom, &result) == .ok;
         if (fetched) std.debug.print("[rt] block={d} recovered from backup2\n", .{blockNum});
     };
 
