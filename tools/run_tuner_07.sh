@@ -12,7 +12,7 @@ export GRAFANA_USER=alexey.smolyakov@lotos.io
 export GRAFANA_PASS='OX8OYykA2!jtWv'
 export GRAFANA_URL=https://grafana.lotos-team.com
 export GRAFANA_PROM_UID=PBFA97CFB590B2093
-export INDEXER_BIN="$HOME/raw_erc20_v9"
+export INDEXER_BIN="$HOME/raw_erc20_v10"
 export TUNER_LOG="$HOME/eth_index_07.log"
 
 exec python3 "$HOME/dynamic_tuner_eth.py" 07 http://100.64.0.7:8545 25418655 999000000

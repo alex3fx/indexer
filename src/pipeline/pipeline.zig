@@ -592,7 +592,7 @@ const PrevSave = struct {
         return .{ .thread = thread, .accum = args.accum, .args = heapArgs };
     }
 
-    fn finish(self: *PrevSave, gpa: Allocator, blocksDone: *u64, t0: i64) !void {
+    fn finish(self: *PrevSave, gpa: Allocator, blocksDone: *u64, t0: i64, log: *Logger) !void {
         self.thread.join();
         gpa.destroy(self.args);
         defer {
@@ -602,10 +602,16 @@ const PrevSave = struct {
         if (self.accum.saveErr) |e| return e;
         blocksDone.* += self.accum.savedCount();
         const ms = @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
+        const blk_s = @as(f64, @floatFromInt(blocksDone.*)) / ms * 1000.0;
         std.debug.print(
             "\nAccum {d}→{d}: saved={d} save={d:.0}ms | {d:.1} blk/s avg\n\n",
-            .{ self.accum.blockStart, self.accum.blockEnd, self.accum.savedCount(), self.accum.saveMs, @as(f64, @floatFromInt(blocksDone.*)) / ms * 1000.0 },
+            .{ self.accum.blockStart, self.accum.blockEnd, self.accum.savedCount(), self.accum.saveMs, blk_s },
         );
+        const msg = std.fmt.allocPrint(gpa, "Accum {d}→{d}: saved={d} save={d:.0}ms | {d:.1} blk/s", .{
+            self.accum.blockStart, self.accum.blockEnd, self.accum.savedCount(), self.accum.saveMs, blk_s,
+        }) catch return;
+        defer gpa.free(msg);
+        log.info(msg);
     }
 };
 
@@ -833,7 +839,7 @@ pub fn runHistorical(
 
         if (accum.entPtrs.items.len >= saveEvery) {
             if (prevSave) |*ps| {
-                try ps.finish(gpa, &blocksDone, t0);
+                try ps.finish(gpa, &blocksDone, t0, log);
                 prevSave = null;
             }
             prevSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs, chain, erc20Ctx));
@@ -845,13 +851,13 @@ pub fn runHistorical(
     for (threads) |t| t.join();
 
     if (prevSave) |*ps| {
-        try ps.finish(gpa, &blocksDone, t0);
+        try ps.finish(gpa, &blocksDone, t0, log);
         prevSave = null;
     }
 
     if (accum.savedCount() > 0) {
         var finalSave = try PrevSave.start(gpa, conns.saveArgs(accum, &rdb, bs, chain, erc20Ctx));
-        try finalSave.finish(gpa, &blocksDone, t0);
+        try finalSave.finish(gpa, &blocksDone, t0, log);
     } else {
         accum.deinit();
         gpa.destroy(accum);
