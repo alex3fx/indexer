@@ -33,10 +33,12 @@ tmux kill-session -t eth60
 
 Hardware: node .07 = 48 cores (157.90.65.123), node .60 = 96 cores (100.64.0.60).
 Load target: 0.85–0.95 of core count. Cooldown between adjustments: 90s.
-**Status:** running (2026-06-27), requires binary v9+, supersedes `run_eth_07.sh`/`run_eth_60.sh`.
+**Status:** running (2026-06-27), requires binary v10+, supersedes `run_eth_07.sh`/`run_eth_60.sh`.
 **v3 chunk scheme active:** `SCYLLA_CHUNK_BUCKETS=24`, `SCYLLA_CHUNK_ERA=12000`
 (`chunk = (block % 24) + 24 * (block // 12000)` — 500 blk/partition, 24 partitions/era).
 Switched from LANES=64 flat (hot partition risk) via TRUNCATE+RESTART on 2026-06-27.
+**Realtime mode (2026-06-29):** `TO_BLOCK=0` in `run_tuner_60.sh` → binary launched without `--to`,
+catches up historically, enters WSS realtime loop. Per-block `log.info` → GrayLog every ~12s.
 
 ---
 
@@ -118,6 +120,23 @@ Running in tmux sessions `backfill07` / `backfill60` as of 2026-06-29.
 
 **Status:** active (2026-06-29) — backfilling 6,032 missing blocks from overload period.
 Logs: `~/eth_backfill_07.log`, `~/eth_backfill_60.log`.
+
+## `run_eth60_realtime.sh` — direct realtime launch (no tuner)
+
+Direct launch of eth60 without tuner — fixed `FETCH_WORKERS=64`, no AIMD, no probing.
+Binary started without `--to`: discovers HEAD from WSS, catches up historically, enters
+WSS realtime loop (`log.info` per block → GrayLog every ~12s).
+
+```bash
+# On 100.64.0.4, in tmux session eth60:
+tmux new-session -d -s eth60 '~/run_eth60_realtime.sh'
+# Resume: watermark auto-detected from eth_index_60.log
+```
+
+**Status:** deployed (2026-06-29) on 100.64.0.4. Launched when tuner is not needed.
+For AIMD-managed realtime, prefer `run_tuner_60.sh` with `TO_BLOCK=0`.
+
+---
 
 ## `backfill_spans.sh` — targeted re-sync for known gaps (Polygon)
 

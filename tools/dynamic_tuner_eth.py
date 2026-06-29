@@ -31,6 +31,10 @@ NODE = sys.argv[1]              # "07" or "60"
 RPC_URL = sys.argv[2]           # http://100.64.0.7:8545 or .60:8545
 FROM_DEFAULT = int(sys.argv[3])  # used only if log has no resume point yet
 TO_BLOCK = int(sys.argv[4])
+# TO_BLOCK=0 → realtime mode: binary launched without --to (discovers HEAD from WSS,
+# does historical catch-up, then enters WSS realtime loop). Tuner skips the
+# "reached target" stop condition and never terminates on its own.
+REALTIME = (TO_BLOCK == 0)
 
 BIN = os.environ.get("INDEXER_BIN", "/home/alexey_smolyakov/raw_erc20_v8")
 
@@ -221,10 +225,13 @@ def start_indexer(from_block, to_block, fetch_workers):
         "LOGS_GRAYLOG_PORT": str(GRAYLOG_PORT),
         "LOGS_GRAYLOG_APP": f"indexer-eth-{NODE}",
     })
+    # TO_BLOCK=0 is the realtime sentinel: omit --to so the binary queries
+    # current HEAD from WSS, catches up historically, then stays in WSS realtime.
+    realtime = (to_block == 0)
     logf = open(LOG, "a")
-    logf.write(f"\n[tuner] starting --from={from_block} --to={to_block} FETCH_WORKERS={fetch_workers}\n")
+    logf.write(f"\n[tuner] starting --from={from_block}{'' if realtime else f' --to={to_block}'} FETCH_WORKERS={fetch_workers}{'  [realtime]' if realtime else ''}\n")
     logf.flush()
-    cmd = [BIN, f"--from={from_block}", f"--to={to_block}"]
+    cmd = [BIN, f"--from={from_block}"] if realtime else [BIN, f"--from={from_block}", f"--to={to_block}"]
     proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
     logf.close()
     return proc
@@ -265,11 +272,12 @@ def measure_window(proc_holder, from_block, to_block, fetch_workers, duration_se
 def main():
     global current_proc
     gelf_send(f"[node-{NODE}] eth dynamic tuner starting", level=6)
-    print(f"[tuner-{NODE}] starting, log={LOG}, FROM_DEFAULT={FROM_DEFAULT}, TO={TO_BLOCK}", flush=True)
+    mode_str = "realtime (no --to)" if REALTIME else f"historical to={TO_BLOCK}"
+    print(f"[tuner-{NODE}] starting, log={LOG}, FROM_DEFAULT={FROM_DEFAULT}, mode={mode_str}", flush=True)
 
     fetch_workers = PROBE_VALUES_INIT[len(PROBE_VALUES_INIT) // 2]
     from_block = resume_from()
-    if from_block > TO_BLOCK:
+    if not REALTIME and from_block > TO_BLOCK:
         print(f"[tuner-{NODE}] already past target {TO_BLOCK}, nothing to do", flush=True)
         return
 
@@ -288,7 +296,7 @@ def main():
 
     while True:
         cur_from = resume_from()
-        if cur_from > TO_BLOCK:
+        if not REALTIME and cur_from > TO_BLOCK:
             print(f"[tuner-{NODE}] reached target {TO_BLOCK}, stopping", flush=True)
             gelf_send(f"[node-{NODE}] reached target block {TO_BLOCK}, tuner done", level=6)
             stop_indexer(proc_holder["proc"])
@@ -314,7 +322,7 @@ def main():
                       level=6, extra={"node": NODE, "fetch_workers": candidate, "blk_s": rate,
                                        "conn_errors_delta": err_delta, "load1": load1})
 
-            if exited and resume_from() > TO_BLOCK:
+            if not REALTIME and exited and resume_from() > TO_BLOCK:
                 continue
 
             overloaded = (err_delta >= ERROR_DELTA_THRESHOLD
@@ -350,7 +358,7 @@ def main():
             time.sleep(CHECK_INTERVAL_SEC)
             if proc_holder["proc"].poll() is not None:
                 cur = resume_from()
-                if cur > TO_BLOCK:
+                if not REALTIME and cur > TO_BLOCK:
                     continue
                 now = time.time()
                 recent_restarts[:] = [t for t in recent_restarts if now - t < RESTART_WINDOW_SEC]
