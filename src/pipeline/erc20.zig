@@ -90,6 +90,44 @@ pub const Erc20Context = struct {
         self.bytecodeBloom.deinit(self.gpa);
     }
 
+    // Scans all "erc20:*" keys from Redis and inserts each address into the
+    // bloom filter. Must be called before the indexing loop starts so that
+    // Transfer-event touches from previously discovered tokens are detected
+    // in realtime (or when starting mid-chain in historical mode).
+    // Soft-fails on any error — an empty bloom just means we miss touch-based
+    // supply/owner updates until the next binary run.
+    pub fn preloadBloomFromRedis(self: *Erc20Context, rdb: *cursor.Conn) void {
+        const KEY_PREFIX = "erc20:";
+        var total: usize = 0;
+        // cursorSlice starts pointing at the stack "0"; after first iteration
+        // it points into ownedCursor (heap-allocated copy of each Redis cursor).
+        var initBuf = [_]u8{'0'};
+        var cursorSlice: []const u8 = &initBuf;
+        var ownedCursor: ?[]u8 = null;
+        defer if (ownedCursor) |c| self.gpa.free(c);
+
+        while (true) {
+            var res = rdb.scan(cursorSlice, KEY_PREFIX ++ "*", 5000) catch |e| {
+                std.debug.print("[erc20] bloom preload scan error after {d}: {s}\n", .{ total, @errorName(e) });
+                return;
+            };
+            defer res.deinit(self.gpa);
+
+            for (res.keys) |key| {
+                if (key.len <= KEY_PREFIX.len) continue;
+                self.bloom.insert(key[KEY_PREFIX.len..]);
+                total += 1;
+            }
+
+            if (ownedCursor) |c| self.gpa.free(c);
+            ownedCursor = self.gpa.dupe(u8, res.cursor) catch break;
+            cursorSlice = ownedCursor.?;
+            if (std.mem.eql(u8, cursorSlice, "0")) break;
+        }
+
+        std.debug.print("[erc20] bloom preloaded {d} addresses from Redis\n", .{total});
+    }
+
     fn overrideFor(self: *const Erc20Context, mc: EvmContractConfig, blockNumber: u64) ?[]const u8 {
         if (blockNumber >= mc.deployedAtBlock) return null;
         return self.multicall3Bytecode;

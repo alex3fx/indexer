@@ -514,6 +514,10 @@ pub fn main(init: Init) !void {
         erc20.MULTICALL_CHUNK_SIZE_DEFAULT;
     var erc20Ctx = try erc20.Erc20Context.init(gpa, io, &chain, erc20ChunkSize);
     defer erc20Ctx.deinit();
+    // Pre-populate the bloom filter from Redis so that realtime (and mid-chain
+    // historical restarts) detect Transfer-event "touches" on already-known
+    // ERC-20 addresses, not just on tokens discovered during this run.
+    erc20Ctx.preloadBloomFromRedis(&rdb);
 
     // ── Historical sync ───────────────────────────────────────────────────────
     if (fromBlock <= toBlock) {

@@ -13,7 +13,7 @@ export SCYLLA_DB_USERNAME=cassandra
 export SCYLLA_DB_PASSWORD=cassandra
 export REDIS_PASSWORD=ZCy8k4G6pcRYVFfm
 
-BIN="$HOME/raw_erc20_v10"
+BIN="$HOME/raw_erc20_v11"
 LOG="$HOME/eth_index_60.log"
 REDIS_DB=2
 
