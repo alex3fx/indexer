@@ -1,21 +1,20 @@
-# Scylla — read-only доступ и схема базы (Polygon, keyspace `pol`)
+# Scylla — read-only доступ и схема базы (ETH, keyspace `eth`)
 
-_Создано: 2026-06-23._ Описывает БД индексера Polygon на проде (`100.64.0.64`) и read-only
-пользователя `reader`, заведённого для внешнего/аналитического чтения без риска повлиять на
-запись (PK=`reader`, права — только `SELECT` на keyspace `pol`, без `MODIFY`/DDL).
+_Создано: 2026-06-29._ Описывает БД ETH ERC-20 индексера на тест-сервере (`100.64.0.4`) и
+read-only пользователя `reader`, заведённого для внешнего/аналитического чтения без риска
+повлиять на запись (права — только `SELECT` на keyspace `eth`, без `MODIFY`/DDL).
 
 ## Доступ
 
-- Хост: `100.64.0.64`, порт `9042` (CQL native protocol)
-- Keyspace: `pol`
+- Хост: `100.64.0.4`, порт `9042` (CQL native protocol)
+- Keyspace: `eth`
 - Пользователь: `reader`
-- Пароль: **передаётся отдельно, не хранится в этом документе** (см. секретный канал/менеджер
-  паролей команды)
-- Права: `SELECT` на `KEYSPACE pol` (проверено: `INSERT`/`UPDATE`/`DELETE` отдаются `Unauthorized`)
+- Пароль: `LLCcvffYaEhS7pNMCfS1Dbar`
+- Права: `SELECT` на `KEYSPACE eth` (проверено: `INSERT`/`UPDATE`/`DELETE` отдаются `Unauthorized`)
 
-Строка подключения (cqlsh), `<PASSWORD>` — подставить реальный пароль:
+Строка подключения (cqlsh):
 ```bash
-cqlsh 100.64.0.64 9042 -u reader -p '<PASSWORD>' -k pol
+cqlsh 100.64.0.4 9042 -u reader -p 'LLCcvffYaEhS7pNMCfS1Dbar' -k eth
 ```
 
 Python (`cassandra-driver`):
@@ -23,18 +22,13 @@ Python (`cassandra-driver`):
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 
-auth = PlainTextAuthProvider(username="reader", password="<PASSWORD>")
-cluster = Cluster(["100.64.0.64"], port=9042, auth_provider=auth)
-session = cluster.connect("pol")
+auth = PlainTextAuthProvider(username="reader", password="LLCcvffYaEhS7pNMCfS1Dbar")
+cluster = Cluster(["100.64.0.4"], port=9042, auth_provider=auth)
+session = cluster.connect("eth")
 ```
 
-JDBC-подобная строка (для инструментов, которые её ожидают):
-```
-cassandra://reader:<PASSWORD>@100.64.0.64:9042/pol
-```
-
-**Важно про сеть**: `100.64.0.64` — приватный (CGNAT) адрес, доступен только из внутренней сети/VPN
-инфраструктуры lotos. Снаружи без доступа к этой сети не подключится.
+**Важно про сеть**: `100.64.0.4` — приватный (CGNAT) адрес, доступен только из внутренней
+сети/VPN инфраструктуры lotos. Снаружи без доступа к этой сети не подключится.
 
 ## Топология кластера
 
@@ -44,28 +38,30 @@ cassandra://reader:<PASSWORD>@100.64.0.64:9042/pol
 
 ## Схема партиционирования ("chunk")
 
-Все основные таблицы партиционированы по столбцу `chunk` (int), который вычисляется из номера
-блока по формуле **"lane + era"**:
+Основные таблицы (блоки/транзакции/логи/итд) партиционированы по столбцу `chunk` (int),
+который вычисляется из номера блока по формуле **v3 "lane + era"**:
 
 ```
-lane = block_number % 64
-era  = block_number / 32000        (целочисленное деление)
-chunk = lane + 64 * era
+lane  = block_number % 24
+era   = block_number // 12000      (целочисленное деление)
+chunk = lane + 24 * era
 ```
 
-То есть на каждые 32 000 последовательных блоков приходится 64 партиции (`chunk`-а) — внутри одной
-партиции номера блоков идут с шагом 64 (один и тот же `lane`). Это ограничивает размер партиции
-~500 блоков на партицию при равномерной плотности.
+На каждые 12 000 последовательных блоков приходится 24 партиции — внутри одной партиции
+блоки идут с шагом 24 (один и тот же `lane`), что ограничивает размер ~500 блоков/партицию.
 
-Внутри партиции данные отсортированы по `block_number` (и далее по `transaction_index`/`log_index`/
-`trace_index`, где применимо) — `CLUSTERING ORDER BY (block_number ASC, ...)`.
+Внутри партиции данные отсортированы по `block_number` (и далее по `transaction_index`/
+`log_index`/`trace_index`, где применимо).
 
-Пример: блок `31267567` → `lane = 31267567 % 64 = 47`, `era = 31267567 // 32000 = 977`,
-`chunk = 47 + 64*977 = 62575`.
+Пример: блок `25_422_600` → `lane = 25422600 % 24 = 0`, `era = 25422600 // 12000 = 2118`,
+`chunk = 0 + 24*2118 = 50832`.
+
+ERC-20 таблицы (`erc20_tokens`, `erc20_owners`, `erc20_total_supplies`, `erc20_self_destructed`)
+партиционированы по `address` (text) — без `chunk`, напрямую по адресу контракта.
 
 ## Таблицы
 
-Все таблицы партиционированы по `chunk` (кроме `contracts_by_addresses`, см. ниже).
+### Основные (партиционированы по `chunk`)
 
 | Таблица | PRIMARY KEY | Назначение |
 |---|---|---|
@@ -74,67 +70,96 @@ chunk = lane + 64 * era
 | `logs` | `(chunk, block_number, transaction_index, log_index)` | Event-логи: `address`, `data`, `topic_zeroth..third`, `rest_topics` (list), `removed` |
 | `internal_transactions` | `(chunk, block_number, transaction_index, trace_index)` | Внутренние вызовы/переводы (из trace): `from_address`, `to_address`, `value` |
 | `contracts` | `(chunk, block_number, transaction_index, trace_index)` | Деплои контрактов: `address`, `creator_address`, `creation_bytecode`, `deployed_bytecode`, `contract_factory` |
-| `contracts_by_addresses` | `(address)` | Те же деплои, но партиционированы по адресу контракта — для быстрого поиска "когда/кем задеплоен адрес X" (НЕ по `chunk`, нет привязки к диапазону блоков для full-scan) |
-| `block_completions` | `(chunk, block_number)` | Служебная: счётчики `tx_count`/`log_count`/`itx_count`/`contract_count` на блок — используется для верификации полноты записи блока |
+| `block_completions` | `(chunk, block_number)` | Служебная: счётчики `tx_count`/`log_count`/`itx_count`/`contract_count` на блок |
 
-### Колонки по таблицам
+### Поиск контрактов по адресу / bytecode
+
+| Таблица | PRIMARY KEY | Назначение |
+|---|---|---|
+| `contracts_by_addresses` | `(address)` | Деплои по адресу контракта: `creator`, `tx_hash`, `block_number`, `timestamp`, `creation_bytecode`, `deployed_bytecode`, `contract_factory` |
+| `contracts_by_bytecode_hash` | `(bytecode_hash, address)` | Индекс контрактов по хэшу деплоед-байткода: `creation_block` |
+| `bytecode_store` | `(bytecode_hash)` | Дедуплицированный байткод: `bytecode`, `size`, `first_seen_block`, `has_collision` |
+| `bytecode_collision_registry` | `(bytecode_hash, address, bytecode)` | Коллизии хэшей (разный байткод, одинаковый хэш): `creation_block` |
+
+### ERC-20 (партиционированы по `address`)
+
+| Таблица | PRIMARY KEY | Назначение |
+|---|---|---|
+| `erc20_tokens` | `(address)` | Детекция ERC-20: флаги `has_transfer/approve/allowance/balance_of`, `name`, `symbol`, `decimals`, `is_*_following_standard` |
+| `erc20_owners` | `(address)` | Владелец контракта: `initial_owner`, `latest_owner`, `is_ownership_renounced`, `updated_at_block` |
+| `erc20_total_supplies` | `(address)` | Total supply: `initial_total_supply`, `latest_total_supply`, `updated_at_block` |
+| `erc20_self_destructed` | `(address)` | Самоуничтоженные контракты: `at_block`, `at_timestamp` |
+
+### Полные схемы колонок
 
 **`blocks`**: `chunk int, number bigint, miner text, timestamp_s bigint, timestamp_ms bigint`
 
-**`transactions`**: `chunk int, block_number bigint, transaction_index int, hash text, from_address text,
-to_address text, value varint, gas_limit bigint, gas_price bigint, gas_used bigint,
-max_priority_fee_per_gas bigint, max_fee_per_gas bigint, cumulative_gas_used bigint,
-effective_gas_price bigint, contract_address text, status tinyint, type tinyint, method_id text,
-input text, block_timestamp_s bigint, block_timestamp_ms bigint`
+**`transactions`**: `chunk int, block_number bigint, transaction_index int, hash text,
+from_address text, to_address text, value varint, gas_limit bigint, gas_price bigint,
+gas_used bigint, max_priority_fee_per_gas bigint, max_fee_per_gas bigint,
+cumulative_gas_used bigint, effective_gas_price bigint, contract_address text,
+status tinyint, type tinyint, method_id text, input text,
+block_timestamp_s bigint, block_timestamp_ms bigint`
 
-**`logs`**: `chunk int, block_number bigint, transaction_index int, log_index int, address text,
-data text, topic_zeroth text, topic_first text, topic_second text, topic_third text,
-rest_topics list<text>, transaction_hash text, removed boolean, block_timestamp_s bigint,
-block_timestamp_ms bigint`
+**`logs`**: `chunk int, block_number bigint, transaction_index int, log_index int,
+address text, data text, topic_zeroth text, topic_first text, topic_second text,
+topic_third text, rest_topics list<text>, transaction_hash text, removed boolean,
+block_timestamp_s bigint, block_timestamp_ms bigint`
 
-**`internal_transactions`**: `chunk int, block_number bigint, transaction_index int, trace_index int,
-from_address text, to_address text, value varint, transaction_hash text, block_timestamp_s bigint,
-block_timestamp_ms bigint`
+**`internal_transactions`**: `chunk int, block_number bigint, transaction_index int,
+trace_index int, from_address text, to_address text, value varint,
+transaction_hash text, block_timestamp_s bigint, block_timestamp_ms bigint`
 
-**`contracts`**: `chunk int, block_number bigint, transaction_index int, trace_index int, address text,
-creation_method tinyint, creator_address text, contract_factory text, creation_bytecode text,
-deployed_bytecode text, transaction_hash text, block_timestamp_s bigint, block_timestamp_ms bigint`
+**`contracts`**: `chunk int, block_number bigint, transaction_index int, trace_index int,
+address text, creation_method tinyint, creator_address text, contract_factory text,
+creation_bytecode text, deployed_bytecode text, transaction_hash text,
+block_timestamp_s bigint, block_timestamp_ms bigint`
 
-**`contracts_by_addresses`**: `address text, creator text, tx_hash text, block_number bigint,
-timestamp bigint, contract_factory text, creation_bytecode text, deployed_bytecode text`
+**`contracts_by_addresses`**: `address text, creator text, tx_hash text,
+block_number bigint, timestamp bigint, contract_factory text,
+creation_bytecode text, deployed_bytecode text`
 
-**`block_completions`**: `chunk int, block_number bigint, tx_count int, log_count int, itx_count int,
-contract_count int`
+**`erc20_tokens`**: `address text, chain_id int, decimals smallint, detection_version int,
+has_allowance boolean, has_approve boolean, has_balance_of boolean, has_transfer boolean,
+has_transfer_from boolean, is_fully_following_standard boolean,
+is_minimally_following_standard boolean, is_not_following_standard boolean,
+is_partially_following_standard boolean, is_standard_decimals boolean,
+name text, symbol text`
 
-## Обход всей таблицы через token range (без `chunk`-перечисления)
+**`erc20_owners`**: `address text, chain_id int, initial_owner text, latest_owner text,
+is_ownership_renounced boolean, updated_at_block bigint, updated_at_timestamp bigint`
 
-Перебирать `chunk` явным образом (`WHERE chunk = N`) для full-table scan — **неэффективно и
-небезопасно для полноты**: значение `chunk` хэшируется в случайный токен (murmur3 от значения
-партиционного ключа не связан с арифметикой lane/era), поэтому явный перебор по известным `chunk`
-попадает в случайные шарды и из-за birthday paradox не гарантирует покрытие всех физических
-диапазонов хранения при небольшом количестве samples.
+**`erc20_total_supplies`**: `address text, chain_id int, initial_total_supply text,
+latest_total_supply text, updated_at_block bigint, updated_at_timestamp bigint`
 
-**Правильный паттерн** — резать кольцо токенов (`-2^63 … 2^63-1`) на N равных диапазонов и читать
-параллельно через `token(chunk)`:
+**`erc20_self_destructed`**: `address text, chain_id int, at_block bigint, at_timestamp bigint`
+
+**`block_completions`**: `chunk int, block_number bigint, tx_count int, log_count int,
+itx_count int, contract_count int`
+
+## Обход таблиц через token range (без `chunk`-перечисления)
+
+Для `chunk`-based таблиц перебирать `chunk` явно — **неэффективно**: murmur3 хэш от `chunk`
+не связан с арифметикой lane/era. Правильный паттерн — резать кольцо токенов на N диапазонов:
 
 ```sql
 SELECT * FROM transactions WHERE token(chunk) > ? AND token(chunk) <= ?;
 ```
 
-Пример на Python (`cassandra-driver`), параллельное чтение в N диапазонов:
+Пример на Python (параллельный token-range scan):
 
 ```python
 import threading
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 
-auth = PlainTextAuthProvider(username="reader", password="<PASSWORD>")
-cluster = Cluster(["100.64.0.64"], port=9042, auth_provider=auth)
-session = cluster.connect("pol")
+auth = PlainTextAuthProvider(username="reader", password="LLCcvffYaEhS7pNMCfS1Dbar")
+cluster = Cluster(["100.64.0.4"], port=9042, auth_provider=auth)
+session = cluster.connect("eth")
 
 MIN_TOKEN = -(2**63)
 MAX_TOKEN = 2**63 - 1
-RANGES = 256          # больше диапазонов = более мелкие, параллелизуемые чтения
+RANGES = 256
 TABLE = "transactions"
 
 def scan_range(lo, hi, results):
@@ -142,39 +167,27 @@ def scan_range(lo, hi, results):
         f"SELECT * FROM {TABLE} WHERE token(chunk) > %s AND token(chunk) <= %s",
         (lo, hi)
     )
-    count = 0
-    for row in rows:
-        count += 1
-        # обработать row...
+    count = sum(1 for _ in rows)
     results.append(count)
 
 step = (MAX_TOKEN - MIN_TOKEN) // RANGES
 boundaries = [MIN_TOKEN + i * step for i in range(RANGES + 1)]
-boundaries[-1] = MAX_TOKEN  # подровнять край
+boundaries[-1] = MAX_TOKEN
 
 results = []
-threads = []
-for i in range(RANGES):
-    t = threading.Thread(target=scan_range, args=(boundaries[i], boundaries[i+1], results))
-    threads.append(t)
-    t.start()
-for t in threads:
-    t.join()
+threads = [threading.Thread(target=scan_range, args=(boundaries[i], boundaries[i+1], results))
+           for i in range(RANGES)]
+for t in threads: t.start()
+for t in threads: t.join()
 
 print("total rows:", sum(results))
 cluster.shutdown()
 ```
 
+Для `address`-based таблиц (ERC-20) — аналогично `WHERE token(address) > ? AND token(address) <= ?`.
+
 Замечания:
-- `RANGES` подбирается под желаемую конкурентность (256 — разумный дефолт; не делать слишком
-  крупными — единичные огромные партиции/диапазоны таймаутят на больших таблицах типа `logs`/
-  `internal_transactions`).
-- Если нужен скан только за конкретный диапазон **блоков** (а не вся таблица), это **отдельная
-  задача** — `chunk` не отображается на диапазон блоков напрямую (один `chunk` = блоки одного `lane`
-  в пределах одной `era`, разбросанные по случайным физическим токенам). Для диапазона блоков
-  эффективнее точечно вычислить набор нужных `(chunk, block_number)` пар по формуле выше и делать
-  point/range-запросы `WHERE chunk = ? AND block_number >= ? AND block_number < ?` для каждого
-  затронутого `chunk`, а не token-range scan всей таблицы.
-- Ретраи с backoff на таймаутах обязательны при больших token-range сканах — это штатная ситуация
-  на таблицах такого объёма, не признак сбоя (см. `tools/find_missing_blocks.py` и
-  `tools/localize_gap2.py` в репозитории — готовые примеры с retry+backoff на этом же паттерне).
+- `RANGES=256` — разумный дефолт; крупные диапазоны таймаутят на `logs`/`internal_transactions`
+- Для скана по диапазону **блоков** эффективнее вычислить нужные `chunk` по формуле выше
+  и делать `WHERE chunk = ? AND block_number >= ? AND block_number < ?` на каждый chunk
+- Ретраи с backoff на таймаутах обязательны — штатная ситуация на таких объёмах
