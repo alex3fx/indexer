@@ -138,6 +138,58 @@ For AIMD-managed realtime, prefer `run_tuner_60.sh` with `TO_BLOCK=0`.
 
 ---
 
+## `bytecode_api/` — HTTP service: bytecode lookup and clone-search (active)
+
+Go HTTP service that answers two questions given a contract address or deployed bytecode hex:
+
+1. **Get bytecode** for a contract address → `/bytecode?address=0x...`
+2. **Find all contracts with identical bytecode** → `/same?address=0x...` or `/same?bytecode=0x...`
+
+Reads from Scylla `eth` keyspace (read-only account) via `contracts_by_addresses` and
+`contracts_by_bytecode_hash`. Authentication via `--pass` flag (not visible in `ps aux`).
+
+**Endpoints:**
+
+```
+GET  /health                            → "ok"
+GET  /bytecode?address=0x{addr}         → {"address":"0x...", "bytecode":"0x60806..."}
+GET  /same?address=0x{addr}             → {"bytecode_hash":"0x...", "count":N, "addresses":[...]}
+GET  /same?bytecode=0x{hex}             → same (short bytecodes; prefer POST for large)
+POST /same  {"address":"0x..."}         → same as GET /same?address=
+POST /same  {"bytecode":"0x..."}        → same as GET /same?bytecode= (no URL size limit)
+POST /bytecode  {"address":"0x..."}     → same as GET /bytecode?address=
+```
+
+**Source:** `tools/bytecode_api/main.go` + `go.mod`/`go.sum`
+
+**Build** (requires Go on the target server — local Go is currently broken):
+
+```bash
+# On 100.64.0.4:
+export PATH=$HOME/go/bin:$PATH
+cd ~/bytecode_api_src
+go build -o ~/bytecode_api_v1 .
+```
+
+**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v1`, run script `~/run_bytecode_api.sh`
+
+```bash
+# Start (tmux session bytecode_api on 100.64.0.4):
+tmux new-session -d -s bytecode_api '~/run_bytecode_api.sh'
+
+# Test:
+curl http://100.64.0.4:8080/health
+curl "http://100.64.0.4:8080/same?address=0x219e497a09202a3534f653e63faaeab6689c1d22"
+
+# Stop:
+tmux kill-session -t bytecode_api
+```
+
+**Status:** running (2026-06-29). Port 8080 bound to `0.0.0.0`.
+Scylla auth: user `reader` (read-only), password in `run_bytecode_api.sh`.
+
+---
+
 ## `backfill_spans.sh` — targeted re-sync for known gaps (Polygon)
 
 **Polygon-specific** (chain_id=137, BUCKETS=64, ERA=32000, keyspace=pol). For ETH use
