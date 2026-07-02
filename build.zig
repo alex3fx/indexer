@@ -73,6 +73,8 @@ pub fn build(b: *Build) void {
         }),
     });
     tests.root_module.addImport("indexer/core", core_mod);
+    tests.root_module.addImport("indexer/db", db_mod);
+    tests.root_module.link_libc = true;
 
     const test_step = b.step("test", "Run logger tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);

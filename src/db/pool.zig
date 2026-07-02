@@ -105,10 +105,170 @@ const OPCODE_AUTH_OK: u8 = 0x10;
 const OPCODE_SUPPORTED: u8 = 0x06;
 const OPCODE_RESULT: u8 = 0x08;
 const OPCODE_ERROR: u8 = 0x00;
+const OPCODE_EXECUTE: u8 = 0x0A;
 const CONSISTENCY_ONE: u16 = 0x0001;
+const CONSISTENCY_LOCAL_SERIAL: u16 = 0x0009;
 
 // Temporary allocator for CQL frame buffers. Lifetime: within each function call.
 pub const tempAllocator = std.heap.page_allocator;
+
+// ─── SELECT result ────────────────────────────────────────────────────────────
+
+// Rows from a CQL SELECT. Each row is a slice of nullable byte columns.
+// All memory lives in an internal arena; call deinit() when done.
+pub const SelectResult = struct {
+    rows: []const []const ?[]const u8,
+    _arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *SelectResult) void {
+        self._arena.deinit();
+    }
+};
+
+// Skip a CQL [short string]: [u16 len] + len bytes.
+fn skipShortStr(body: []const u8, pos: usize) usize {
+    if (pos + 2 > body.len) return body.len;
+    const len = std.mem.readInt(u16, body[pos..][0..2], .big);
+    return pos + 2 + len;
+}
+
+// Skip a CQL [option]: [u16 type_code] + optional extra bytes.
+fn skipCqlOption(body: []const u8, pos: usize) usize {
+    if (pos + 2 > body.len) return body.len;
+    const code = std.mem.readInt(u16, body[pos..][0..2], .big);
+    var p = pos + 2;
+    switch (code) {
+        0x0000 => p = skipShortStr(body, p), // CUSTOM: class name
+        0x0020, 0x0022 => p = skipCqlOption(body, p), // LIST, SET: element type
+        0x0021 => { // MAP: key type + value type
+            p = skipCqlOption(body, p);
+            p = skipCqlOption(body, p);
+        },
+        0x0030 => { // UDT
+            p = skipShortStr(body, p); // keyspace
+            p = skipShortStr(body, p); // type name
+            if (p + 2 > body.len) return body.len;
+            const n = std.mem.readInt(u16, body[p..][0..2], .big);
+            p += 2;
+            for (0..n) |_| {
+                p = skipShortStr(body, p);
+                p = skipCqlOption(body, p);
+            }
+        },
+        0x0031 => { // TUPLE
+            if (p + 2 > body.len) return body.len;
+            const n = std.mem.readInt(u16, body[p..][0..2], .big);
+            p += 2;
+            for (0..n) |_| p = skipCqlOption(body, p);
+        },
+        else => {}, // all simple types: no extra bytes
+    }
+    return p;
+}
+
+fn parseRowsResult(body: []const u8, gpa: std.mem.Allocator) !SelectResult {
+    if (body.len < 12) return error.CqlMalformedResult;
+    const kind = std.mem.readInt(i32, body[0..4], .big);
+    if (kind != 2) return error.CqlNotRows;
+    const flags = std.mem.readInt(i32, body[4..8], .big);
+    const columns_count: usize = @intCast(std.mem.readInt(i32, body[8..12], .big));
+    var pos: usize = 12;
+
+    // Skip paging state
+    if (flags & 0x02 != 0) {
+        if (pos + 4 > body.len) return error.CqlMalformedResult;
+        const ps_len = std.mem.readInt(i32, body[pos..][0..4], .big);
+        pos += 4;
+        if (ps_len > 0) pos += @intCast(ps_len);
+    }
+
+    // Skip column metadata
+    if (flags & 0x04 == 0) { // has metadata
+        if (flags & 0x01 != 0) { // global table spec
+            pos = skipShortStr(body, pos);
+            pos = skipShortStr(body, pos);
+        }
+        for (0..columns_count) |_| {
+            if (flags & 0x01 == 0) {
+                pos = skipShortStr(body, pos);
+                pos = skipShortStr(body, pos);
+            }
+            pos = skipShortStr(body, pos); // column name
+            pos = skipCqlOption(body, pos); // column type
+        }
+    }
+
+    if (pos + 4 > body.len) return error.CqlMalformedResult;
+    const rows_count: usize = @intCast(std.mem.readInt(i32, body[pos..][0..4], .big));
+    pos += 4;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    const rows = try aa.alloc([]const ?[]const u8, rows_count);
+    for (0..rows_count) |i| {
+        const cols = try aa.alloc(?[]const u8, columns_count);
+        for (0..columns_count) |j| {
+            if (pos + 4 > body.len) return error.CqlMalformedResult;
+            const vlen = std.mem.readInt(i32, body[pos..][0..4], .big);
+            pos += 4;
+            if (vlen < 0) {
+                cols[j] = null;
+            } else {
+                const ulen: usize = @intCast(vlen);
+                if (pos + ulen > body.len) return error.CqlMalformedResult;
+                cols[j] = try aa.dupe(u8, body[pos..][0..ulen]);
+                pos += ulen;
+            }
+        }
+        rows[i] = cols;
+    }
+    return .{ .rows = rows, ._arena = arena };
+}
+
+// Parse [applied] boolean from an LWT INSERT IF NOT EXISTS result.
+// First column of first row is the boolean.
+fn parseLWTResult(body: []const u8) !bool {
+    if (body.len < 12) return error.CqlMalformedResult;
+    const kind = std.mem.readInt(i32, body[0..4], .big);
+    if (kind != 2) return error.CqlNotRows;
+    const flags = std.mem.readInt(i32, body[4..8], .big);
+    const columns_count: usize = @intCast(std.mem.readInt(i32, body[8..12], .big));
+    var pos: usize = 12;
+
+    if (flags & 0x02 != 0) {
+        if (pos + 4 > body.len) return error.CqlMalformedResult;
+        const ps_len = std.mem.readInt(i32, body[pos..][0..4], .big);
+        pos += 4;
+        if (ps_len > 0) pos += @intCast(ps_len);
+    }
+    if (flags & 0x04 == 0) {
+        if (flags & 0x01 != 0) {
+            pos = skipShortStr(body, pos);
+            pos = skipShortStr(body, pos);
+        }
+        for (0..columns_count) |_| {
+            if (flags & 0x01 == 0) {
+                pos = skipShortStr(body, pos);
+                pos = skipShortStr(body, pos);
+            }
+            pos = skipShortStr(body, pos);
+            pos = skipCqlOption(body, pos);
+        }
+    }
+    if (pos + 4 > body.len) return error.CqlMalformedResult;
+    const rows_count = std.mem.readInt(i32, body[pos..][0..4], .big);
+    pos += 4;
+    if (rows_count == 0) return false;
+    // First row, first column = [applied] boolean
+    if (pos + 4 > body.len) return error.CqlMalformedResult;
+    const vlen = std.mem.readInt(i32, body[pos..][0..4], .big);
+    pos += 4;
+    if (vlen < 1) return false;
+    if (pos >= body.len) return error.CqlMalformedResult;
+    return body[pos] != 0;
+}
 
 // ─── CQL value encoding ───────────────────────────────────────────────────────
 
@@ -524,6 +684,85 @@ pub const CqlConn = struct {
             self.gpa.free(prep.id);
             prep.id = newId;
             try self.sendBatchOnce(prep.id, nVals, rowBufs);
+        };
+    }
+
+    pub fn allocator(self: *CqlConn) std.mem.Allocator {
+        return self.gpa;
+    }
+
+    // Build and send a CQL EXECUTE frame.
+    // params: pre-encoded values (concatenated valBlob/valInt32/etc. output).
+    // serialConsistency: non-null enables the WITH_SERIAL_CONSISTENCY flag (for LWT).
+    fn sendExecuteFrame(self: *CqlConn, prepId: []const u8, consistency: u16, nParams: u16, params: []const u8, serialConsistency: ?u16) !void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(tempAllocator);
+
+        // [short bytes] id
+        try appendShort(&body, @intCast(prepId.len));
+        try body.appendSlice(tempAllocator, prepId);
+        // [short] consistency
+        try appendShort(&body, consistency);
+        // [byte] flags: 0x01=VALUES, 0x10=WITH_SERIAL_CONSISTENCY
+        const flags: u8 = if (serialConsistency != null) 0x11 else 0x01;
+        try body.append(tempAllocator, flags);
+        // [short] n_values + values
+        try appendShort(&body, nParams);
+        try body.appendSlice(tempAllocator, params);
+        // [short] serial_consistency (if LWT)
+        if (serialConsistency) |sc| try appendShort(&body, sc);
+
+        try self.sendFrame(OPCODE_EXECUTE, body.items);
+    }
+
+    fn executeSelectOnce(self: *CqlConn, prepId: []const u8, nParams: u16, params: []const u8, gpa: std.mem.Allocator) !SelectResult {
+        try self.sendExecuteFrame(prepId, CONSISTENCY_ONE, nParams, params, null);
+        const resp = try self.recvFrame();
+        defer self.gpa.free(resp.body);
+        if (resp.opcode == OPCODE_ERROR) {
+            if (resp.body.len >= 4 and std.mem.readInt(i32, resp.body[0..4], .big) == 0x2500)
+                return error.CqlUnprepared;
+            return error.CqlError;
+        }
+        if (resp.opcode != OPCODE_RESULT) return error.CqlUnexpectedOpcode;
+        return parseRowsResult(resp.body, gpa);
+    }
+
+    /// Execute a SELECT prepared statement and return all rows.
+    /// On UNPREPARED (cache eviction): re-PREPAREs and retries once.
+    /// Caller owns the returned SelectResult; call result.deinit() when done.
+    pub fn executeSelect(self: *CqlConn, prep: *Prepared, nParams: u16, params: []const u8, gpa: std.mem.Allocator) !SelectResult {
+        return self.executeSelectOnce(prep.id, nParams, params, gpa) catch |err| {
+            if (err != error.CqlUnprepared) return err;
+            const newId = try self.prepare(prep.query);
+            self.gpa.free(prep.id);
+            prep.id = newId;
+            return self.executeSelectOnce(prep.id, nParams, params, gpa);
+        };
+    }
+
+    fn executeLWTOnce(self: *CqlConn, prepId: []const u8, nParams: u16, params: []const u8) !bool {
+        try self.sendExecuteFrame(prepId, CONSISTENCY_ONE, nParams, params, CONSISTENCY_LOCAL_SERIAL);
+        const resp = try self.recvFrame();
+        defer self.gpa.free(resp.body);
+        if (resp.opcode == OPCODE_ERROR) {
+            if (resp.body.len >= 4 and std.mem.readInt(i32, resp.body[0..4], .big) == 0x2500)
+                return error.CqlUnprepared;
+            return error.CqlError;
+        }
+        if (resp.opcode != OPCODE_RESULT) return error.CqlUnexpectedOpcode;
+        return parseLWTResult(resp.body);
+    }
+
+    /// Execute a prepared INSERT IF NOT EXISTS. Returns true if applied.
+    /// On UNPREPARED: re-PREPAREs and retries once.
+    pub fn executeLWT(self: *CqlConn, prep: *Prepared, nParams: u16, params: []const u8) !bool {
+        return self.executeLWTOnce(prep.id, nParams, params) catch |err| {
+            if (err != error.CqlUnprepared) return err;
+            const newId = try self.prepare(prep.query);
+            self.gpa.free(prep.id);
+            prep.id = newId;
+            return self.executeLWTOnce(prep.id, nParams, params);
         };
     }
 
