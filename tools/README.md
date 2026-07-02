@@ -138,40 +138,43 @@ For AIMD-managed realtime, prefer `run_tuner_60.sh` with `TO_BLOCK=0`.
 
 ---
 
-## `bytecode_api/` — HTTP service: bytecode lookup and clone-search (active)
+## `bytecode_api/` — HTTP service: bytecode lookup, clone-search, verification (active, v2)
 
-Go HTTP service that answers two questions given a contract address or deployed bytecode hex:
-
-1. **Get bytecode** for a contract address → `/bytecode?address=0x...`
-2. **Find all contracts with identical bytecode** → `/same?address=0x...` or `/same?bytecode=0x...`
-
-Reads from Scylla `eth` keyspace (read-only account) via `contracts_by_addresses` and
-`contracts_by_bytecode_hash`. Authentication via `--pass` flag (not visible in `ps aux`).
+Go HTTP service для интеграции с watcher. Читает из v2-таблиц (`contracts_by_address_v2`,
+`addresses_by_bytecode` — 256 бакетов параллельно), пишет при верификации.
+Фильтрует CREATE2-редеплои: `/same` spot-проверяет текущий байткод каждого адреса.
 
 **Endpoints:**
 
 ```
 GET  /health                            → "ok"
-GET  /bytecode?address=0x{addr}         → {"address":"0x...", "bytecode":"0x60806..."}
-GET  /same?address=0x{addr}             → {"bytecode_hash":"0x...", "count":N, "addresses":[...]}
-GET  /same?bytecode=0x{hex}             → same (short bytecodes; prefer POST for large)
-POST /same  {"address":"0x..."}         → same as GET /same?address=
-POST /same  {"bytecode":"0x..."}        → same as GET /same?bytecode= (no URL size limit)
-POST /bytecode  {"address":"0x..."}     → same as GET /bytecode?address=
+GET  /bytecode?address=0x{addr}         → {"address","bytecode"} (legacy, старая таблица)
+GET  /contract?address=0x{addr}         → {"address","block_number","tx_hash","deployer",
+                                           "bytecode_hash","bytecode_seq","size","kind",
+                                           "verified","verified_at","abi","source_ref"}
+GET  /same?address=0x{addr}             → {"bytecode_hash","bytecode_seq","count","addresses":[...]}
+GET  /same?bytecode=0x{hex}             → то же, по raw bytecode
+POST /same  {"address":"0x..."}         → то же
+POST /verify {"address","abi","source"} → {"status":"verified|already_verified|pending",
+                                           "bytecode_hash","bytecode_seq","address_count","addresses"}
 ```
+
+`/verify`: `abi` — JSON-строка, `source` — hex-encoded байты архива (опционально).
+Сохраняет ABI (zlib-сжатый) в `bytecode_store_v2`, source — в `source_store` чанками 512KB.
+Если адрес не найден в индексере — пишет в `pending_verifications`, возвращает `status:pending`.
 
 **Source:** `tools/bytecode_api/main.go` + `go.mod`/`go.sum`
 
-**Build** (requires Go on the target server — local Go is currently broken):
+**Build** (локально через Go 1.26.4):
 
 ```bash
-# On 100.64.0.4:
-export PATH=$HOME/go/bin:$PATH
-cd ~/bytecode_api_src
-go build -o ~/bytecode_api_v1 .
+cd tools/bytecode_api
+/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o bytecode_api_v2 .
+scp bytecode_api_v2 alexey_smolyakov@100.64.0.4:~/bytecode_api_v2
 ```
 
-**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v1`, run script `~/run_bytecode_api.sh`
+**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v2`, run script `~/run_bytecode_api.sh`
+(user: cassandra — нужен для записи при `/verify`)
 
 ```bash
 # Start (tmux session bytecode_api on 100.64.0.4):
