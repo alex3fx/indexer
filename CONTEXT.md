@@ -1,6 +1,6 @@
 # Контекст проекта — ETH ERC-20 индексер
 
-_Последнее обновление: 2026-06-27 (v3 — v3 chunk scheme, TRUNCATE+RESTART)_
+_Последнее обновление: 2026-07-02 (bytecode store v2 + backfill 0→25.4M завершён)_
 
 ## Что это
 
@@ -156,7 +156,7 @@ primary (локальная нода) → backup1 (соседняя нода) �
 
 ---
 
-## Текущий статус (2026-06-27)
+## Текущий статус (2026-07-02)
 
 ### Что сделано и проверено
 
@@ -168,11 +168,28 @@ primary (локальная нода) → backup1 (соседняя нода) �
 | Sanitize non-UTF8 в name/symbol | ✅ готово | eb0fa4b |
 | CQL Unprepared retry fix | ✅ проверено 3 дня | 0f31aa3 |
 | Bytecode dedup (bloom + 3 таблицы) | ✅ готово, верифицировано | ae06c1c |
-| PRIMARY_RPC_HTTPS/WSS env override | ✅ готово | (текущий) |
-| Три уровня RPC фоллбека (backup1/backup2) | ✅ готово | (текущий) |
-| Dual-node run scripts (07/60) | ✅ готово | (текущий) |
-| Dynamic tuner (AIMD FETCH_WORKERS) | ✅ запущено | (текущий) |
-| v3 chunk scheme (LANES=24, ERA=12000) | ✅ активно с 2026-06-27 | (текущий) |
+| PRIMARY_RPC_HTTPS/WSS env override | ✅ готово | bd7da48 |
+| Три уровня RPC фоллбека (backup1/backup2) | ✅ готово | bd7da48 |
+| Dual-node run scripts (07/60) | ✅ готово | bd7da48 |
+| Dynamic tuner (AIMD FETCH_WORKERS) | ✅ запущено | bd7da48 |
+| v3 chunk scheme (LANES=24, ERA=12000) | ✅ активно с 2026-06-27 | bd7da48 |
+| **Bytecode store v2 pipeline integration** | ✅ завершено (binary v12) | 743102f |
+| **bytecode_api v2** (`/contract`,`/same`,`/verify`) | ✅ задеплоен на :8080 | 743102f |
+| **Historical backfill v2 таблиц 0→25422776** | ✅ завершён 2026-07-02 | 743102f |
+
+### v2 таблицы — состояние данных (2026-07-02)
+
+| Таблица | Строки | Описание |
+|---------|--------|----------|
+| `bytecode_store_v2` | 117,558 | Уникальных bytecode-сигнатур |
+| `contracts_by_address_v2` | 2,300,982 | Событий деплоя (address × block_number) |
+| `addresses_by_bytecode` | 2,268,670 | Уникальных пар (bytecode, address) — для /same |
+| `collision_registry_v2` | 0 | SHA256-коллизий нет |
+| `pending_verifications` | 1 | Из тестирования |
+| `source_store` | 0 | Верифицированных источников нет |
+
+Разница 32,312 между `contracts_by_address_v2` и `addresses_by_bytecode` — структурная (не баг):
+один адрес, задеплоенный N раз с одним bytecode → N строк в первой таблице, 1 строка во второй.
 
 ### Unprepared fix — детали
 
@@ -234,6 +251,23 @@ Scylla под нагрузкой вытесняет cached prepared statements. 
    WSS reconnect giving up, task #4 HTTPS backup RPC, task #7 give-up cycle counter).
 
 5. **Верификация ERC-20 данных** — для первого 1-5M блоков после запуска, сверка с RPC ground truth.
+
+6. **pending_verifications wiring** (VERIFICATION_TASK шаг 7) — Zig pipeline: при деплое нового
+   контракта проверять `pending_verifications` по адресу и тригерить автоверификацию.
+   Не реализовано в `processOneContract` (`bytecode_store.zig`).
+
+7. **bytecode_api v2 — repair backfill v2 таблиц** — если понадобится дозалить пропущенные
+   контракты в `addresses_by_bytecode` (их нет, пока не нужно).
+
+### bytecode_api v2 — endpoints (100.64.0.4:8080)
+
+```
+GET  /contract?address=0x{addr}   → деплой-инфо + bytecode_id + verified статус
+GET  /same?address=0x{addr}       → все адреса с тем же deployed bytecode (256-бакетный скан)
+POST /verify {"address","abi","source"} → верифицирует bytecode, сохраняет ABI+source
+```
+
+Запущен в tmux-сессии `bytecode_api` на 100.64.0.4. Исходник: `tools/bytecode_api/main.go`.
 
 ## Infra — ETH
 

@@ -9,7 +9,8 @@
 инфраструктура, открытые задачи.
 
 Признаки правильного репозитория: `src/pipeline/erc20.zig`, `src/pipeline/bloom.zig`,
-`src/rpc/multicall.zig`; env `EVM_CHAIN_ID=1`; 4 ERC-20 таблицы в `scripts/db/models/lookups/`.
+`src/rpc/multicall.zig`; env `EVM_CHAIN_ID=1`; 4 ERC-20 таблицы в `scripts/db/models/lookups/`;
+`src/pipeline/bytecode_store.zig` — deduplicated bytecode storage, 4 v2-таблицы в `scripts/db/models/lookups/`.
 
 ## Целостность данных — приоритет №1
 
@@ -31,10 +32,12 @@ retry+backoff, а не молча пропускать. Пропуск без re
 ## Деплой на тест-сервер
 
 - **Сервер:** `100.64.0.4` (ssh `alexey_smolyakov@100.64.0.4` через `~/.ssh/id_ed25519`)
-- **Бинарь деплоится как** `~/raw_erc20_vN` (инкрементируй N)
+- **Текущий бинарь:** `~/raw_erc20_v12` (деплоить следующий как v13, v14 и т.д.)
 - **Перед `scp` нового бинаря** — убедись что предыдущий процесс остановлен (`Text file busy`)
 - **ssh-баг:** два `nohup cmd &` в одной ssh-команде — второй иногда не стартует. Запускать
   раздельными ssh-вызовами.
+- **bytecode_api v2:** `~/bytecode_api_v2` на :8080, tmux-сессия `bytecode_api`, исходник `tools/bytecode_api/main.go`
+- **Go build:** использовать `/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go` (не `/usr/local/go`, он сломан)
 - Подробные команды запуска — в `CONTEXT.md`
 
 ## Хранение вспомогательных инструментов
@@ -59,6 +62,12 @@ Burst-тесты (< 1 мин, 100-2000 блоков) дают 40-983 blk/s — *
 ### Scylla на /storage
 Данные пишутся на `/storage/scylla-eth` — выделенный LVM 20.96 TiB (не `/var/lib/docker/...`).
 Свободно ~20 TB. Оценка на всю цепь: ~13.5 TB. Следить за диском с первого дня.
+
+### contracts_by_address_v2 vs addresses_by_bytecode — ожидаемое расхождение
+PK `contracts_by_address_v2` = `(address, block_number)` — один адрес, задеплоенный N раз, даёт
+N строк. PK `addresses_by_bytecode` = `(hash, seq, bucket, address)` — одна строка на уникальную
+(bytecode, address) пару независимо от числа деплоев. Разница ~32k — это CREATE2+selfdestruct
+редеплои с тем же bytecode. Это не баг, а структурное свойство схемы.
 
 ## MCP-серверы
 
