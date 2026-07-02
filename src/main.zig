@@ -18,6 +18,7 @@ const Logger = core.logger.Logger;
 const pipeline = @import("pipeline/pipeline.zig");
 const writer = @import("pipeline/writer.zig");
 const erc20 = @import("pipeline/erc20.zig");
+const bytecode_store = @import("pipeline/bytecode_store.zig");
 const erc20_rescan = @import("pipeline/erc20_rescan.zig");
 const ws = @import("indexer/rpc").ws;
 const cursor = @import("indexer/db").cursor;
@@ -90,6 +91,7 @@ const RealtimeContext = struct {
     chunkEra: u64,
     backupNode: ?EvmRpcNodeConfig,
     backupNode2: ?EvmRpcNodeConfig,
+    bcStore: bytecode_store.BytecodeStore,
 
     fn init(
         gpa: std.mem.Allocator,
@@ -119,6 +121,9 @@ const RealtimeContext = struct {
             itxsLanes,
         );
         errdefer rtConns.deinit();
+
+        var bcStore = try bytecode_store.BytecodeStore.init(&rtConns.bytecode, bytecode_store.DEFAULT_CACHE_CAP);
+        errdefer bcStore.deinit();
 
         std.debug.print("Starting HTTP thread pool (3 persistent threads)...\n", .{});
         // startThreads() is deliberately NOT called here: the threads it spawns
@@ -161,10 +166,12 @@ const RealtimeContext = struct {
             .chunkEra = chunkEra,
             .backupNode = backupNode,
             .backupNode2 = backupNode2,
+            .bcStore = bcStore,
         };
     }
 
     fn deinit(self: *RealtimeContext) void {
+        self.bcStore.deinit();
         self.rtConns.deinit();
         self.hPool.deinit();
         self.redis.deinit();
@@ -288,7 +295,7 @@ fn runRealtimeLoop(
             // processBlock tries primary, then backup on any failure.
             // Only returns .retry_later when both are unavailable.
             while (true) {
-                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.chunkEra, ctx.backupNode, ctx.backupNode2, erc20Ctx)) {
+                switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.chunkEra, ctx.backupNode, ctx.backupNode2, erc20Ctx, &ctx.bcStore)) {
                     .saved => |m| {
                         const kb = @as(f64, @floatFromInt(m.kb_total));
                         const fetch_us_kb = if (kb > 0) m.fetch_ms * 1000.0 / kb else 0;

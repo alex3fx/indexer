@@ -36,7 +36,7 @@ inline fn hexNibble(c: u8) u8 {
 
 // Decode a hex bytecode string ("0x..." or raw hex) into raw bytes using arena.
 // Odd-length or invalid nibbles: best-effort (treat as 0).
-fn decodeHexBytecode(arena: std.mem.Allocator, hex: []const u8) ![]u8 {
+pub fn decodeHexBytecode(arena: std.mem.Allocator, hex: []const u8) ![]u8 {
     var h = hex;
     if (h.len >= 2 and h[0] == '0' and (h[1] == 'x' or h[1] == 'X')) h = h[2..];
     const byteLen = h.len / 2;

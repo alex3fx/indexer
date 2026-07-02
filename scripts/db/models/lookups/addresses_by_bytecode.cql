@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS addresses_by_bytecode (
     hash         blob,
     seq          tinyint,
     bucket       smallint,
-    address      blob,
+    address      text,
     block_number bigint,
     PRIMARY KEY ((hash, seq, bucket), address)
 );

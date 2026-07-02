@@ -18,6 +18,7 @@ const transformer = @import("transformer.zig");
 const Bloom = @import("bloom.zig").Bloom;
 const BytecodeBloom = @import("bytecode_bloom.zig").BytecodeBloom;
 const erc20 = @import("erc20.zig");
+const bytecode_store = @import("bytecode_store.zig");
 const pool = @import("indexer/db").pool;
 const http_pool = @import("indexer/rpc").pool;
 const batch = @import("indexer/db").batch;
@@ -391,6 +392,7 @@ const HistoricalConns = struct {
     comp: pool.CqlConn,
     erc20: pool.CqlConn,
     bytecode: pool.CqlConn,
+    bcStore: bytecode_store.BytecodeStore,
 
     fn open(
         gpa: Allocator,
@@ -416,6 +418,8 @@ const HistoricalConns = struct {
         errdefer self.erc20.deinit();
         self.bytecode = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.bytecode.deinit();
+        self.bcStore = try bytecode_store.BytecodeStore.init(&self.bytecode, bytecode_store.DEFAULT_CACHE_CAP);
+        errdefer self.bcStore.deinit();
 
         self.txs = try gpa.alloc(pool.CqlConn, txsN);
         var txsOpened: usize = 0;
@@ -458,6 +462,7 @@ const HistoricalConns = struct {
         self.contracts.deinit();
         self.comp.deinit();
         self.erc20.deinit();
+        self.bcStore.deinit();
         self.bytecode.deinit();
         for (self.txs) |*c| c.deinit();
         self.gpa.free(self.txs);
@@ -485,6 +490,7 @@ const HistoricalConns = struct {
             .cComp = &self.comp,
             .cErc20 = &self.erc20,
             .cBytecode = &self.bytecode,
+            .bcStore = &self.bcStore,
             .rdb = rdb,
             .bs = bs,
             .chain = chain,
@@ -505,6 +511,7 @@ const SaveArgs = struct {
     cComp: *pool.CqlConn,
     cErc20: *pool.CqlConn,
     cBytecode: *pool.CqlConn,
+    bcStore: *bytecode_store.BytecodeStore,
     rdb: *cursor.Conn,
     bs: pool.BatchSizes,
     chain: *const EvmChainConfig,
@@ -544,6 +551,12 @@ fn saveAccumFn(args: *SaveArgs) void {
             pinTimestampS,
             &carrier.?.ent,
         );
+    }
+
+    // Write v2 bytecode tables (bytecode_store_v2, contracts_by_address_v2,
+    // addresses_by_bytecode) for every contract deploy in this window.
+    for (windowEnts.items) |ent| {
+        args.bcStore.processContracts(args.cBytecode, ent.contractsByAddr.items);
     }
 
     const t0 = nowNs();

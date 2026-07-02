@@ -14,6 +14,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const pool = @import("indexer/db").pool;
+const transformer = @import("transformer.zig");
 const Allocator = std.mem.Allocator;
 
 fn nowMs() i64 {
@@ -42,6 +43,10 @@ pub const QUERY_INSERT =
     "INSERT INTO bytecode_store_v2 (hash,seq,bytecode,check_hash,size,kind,verified) VALUES (?,?,?,?,?,?,false) IF NOT EXISTS";
 pub const QUERY_COLLISION =
     "INSERT INTO collision_registry_v2 (hash,detected_at,seq_count,note) VALUES (?,?,?,?)";
+pub const QUERY_INSERT_CONTRACT_V2 =
+    "INSERT INTO contracts_by_address_v2 (address,block_number,bytecode_hash,bytecode_seq,creation_hash,creation_seq,tx_hash,deployer) VALUES (?,?,?,?,?,?,?,?)";
+pub const QUERY_INSERT_ADDR_BY_BC =
+    "INSERT INTO addresses_by_bytecode (hash,seq,bucket,address,block_number) VALUES (?,?,?,?,?)";
 
 // ─── FIFO-eviction cache ──────────────────────────────────────────────────────
 
@@ -117,6 +122,8 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
         selPrep: pool.Prepared,
         insPrep: pool.Prepared,
         colPrep: pool.Prepared,
+        insContractPrep: pool.Prepared,
+        insAddrPrep: pool.Prepared,
         cache: LruCache,
         gpa: Allocator,
 
@@ -128,11 +135,17 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             errdefer gpa.free(insId);
             const colId = try db.prepare(QUERY_COLLISION);
             errdefer gpa.free(colId);
+            const insContractId = try db.prepare(QUERY_INSERT_CONTRACT_V2);
+            errdefer gpa.free(insContractId);
+            const insAddrId = try db.prepare(QUERY_INSERT_ADDR_BY_BC);
+            errdefer gpa.free(insAddrId);
             const cache = try LruCache.init(gpa, cap);
             return .{
                 .selPrep = .{ .id = selId, .query = QUERY_SELECT },
                 .insPrep = .{ .id = insId, .query = QUERY_INSERT },
                 .colPrep = .{ .id = colId, .query = QUERY_COLLISION },
+                .insContractPrep = .{ .id = insContractId, .query = QUERY_INSERT_CONTRACT_V2 },
+                .insAddrPrep = .{ .id = insAddrId, .query = QUERY_INSERT_ADDR_BY_BC },
                 .cache = cache,
                 .gpa = gpa,
             };
@@ -142,6 +155,8 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             self.gpa.free(self.selPrep.id);
             self.gpa.free(self.insPrep.id);
             self.gpa.free(self.colPrep.id);
+            self.gpa.free(self.insContractPrep.id);
+            self.gpa.free(self.insAddrPrep.id);
             self.cache.deinit();
         }
 
@@ -256,7 +271,79 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             const rows = [1][]const u8{p.items};
             try db.batchSendRows(&self.colPrep, 4, &rows);
         }
+
+        // Process all contract deploys in a window, writing v2 rows.
+        //
+        // For each ContractByAddrRow:
+        //  1. Decode hex bytecodes → resolveOrInsert (bytecode_store_v2)
+        //  2. INSERT contracts_by_address_v2
+        //  3. INSERT addresses_by_bytecode (deployed bytecode id, bucket=addr[0])
+        //
+        // Errors on a single contract are logged and skipped — we must not abort
+        // the whole save batch due to one bad row (e.g. empty bytecode on a precompile).
+        pub fn processContracts(
+            self: *Self,
+            db: *Db,
+            contracts: []const @import("indexer/db").schema.ContractByAddrRow,
+        ) void {
+            for (contracts) |*c| {
+                self.processOneContract(db, c) catch |e| {
+                    std.debug.print("[bytecode_store] processContract error addr={s}: {s}\n", .{ c.address, @errorName(e) });
+                };
+            }
+        }
+
+        fn processOneContract(
+            self: *Self,
+            db: *Db,
+            c: *const @import("indexer/db").schema.ContractByAddrRow,
+        ) !void {
+            const deployed_raw = transformer.decodeHexBytecode(pool.tempAllocator, c.deployedBytecode) catch &.{};
+            defer if (deployed_raw.len > 0) pool.tempAllocator.free(deployed_raw);
+            const creation_raw = transformer.decodeHexBytecode(pool.tempAllocator, c.creationBytecode) catch &.{};
+            defer if (creation_raw.len > 0) pool.tempAllocator.free(creation_raw);
+
+            const deployed_id = try self.resolveOrInsert(db, deployed_raw, .deployed, pool.tempAllocator);
+            const creation_id = try self.resolveOrInsert(db, creation_raw, .creation, pool.tempAllocator);
+
+            // INSERT contracts_by_address_v2
+            var p: std.ArrayList(u8) = .empty;
+            defer p.deinit(pool.tempAllocator);
+            try pool.valTextRequired(&p, c.address);
+            try pool.valBigint(&p, c.blockNumber);
+            try pool.valBlob(&p, &deployed_id.hash);
+            try pool.valTinyint(&p, deployed_id.seq);
+            try pool.valBlob(&p, &creation_id.hash);
+            try pool.valTinyint(&p, creation_id.seq);
+            try pool.valText(&p, c.txHash);
+            try pool.valText(&p, c.creator);
+            const row1 = [1][]const u8{p.items};
+            try db.batchSendRows(&self.insContractPrep, 8, &row1);
+
+            // INSERT addresses_by_bytecode (for deployed bytecode; creation bytecode is
+            // one-off and rarely queried by hash, so we skip it here).
+            p.items.len = 0;
+            const bucket = addrFirstByte(c.address);
+            try pool.valBlob(&p, &deployed_id.hash);
+            try pool.valTinyint(&p, deployed_id.seq);
+            try pool.valSmallint(&p, bucket);
+            try pool.valTextRequired(&p, c.address);
+            try pool.valBigint(&p, c.blockNumber);
+            const row2 = [1][]const u8{p.items};
+            try db.batchSendRows(&self.insAddrPrep, 5, &row2);
+        }
     };
+}
+
+// Return the first decoded byte of a hex-encoded address as a smallint bucket.
+// Address format: "0x1234..." or "1234...". Returns 0 on malformed input.
+fn addrFirstByte(hexAddr: []const u8) i16 {
+    var h = hexAddr;
+    if (h.len >= 2 and h[0] == '0' and (h[1] == 'x' or h[1] == 'X')) h = h[2..];
+    if (h.len < 2) return 0;
+    const hi = std.fmt.charToDigit(h[0], 16) catch return 0;
+    const lo = std.fmt.charToDigit(h[1], 16) catch return 0;
+    return @intCast((hi << 4) | lo);
 }
 
 pub const BytecodeStore = BytecodeStoreT(pool.CqlConn, std.crypto.hash.sha2.Sha256);

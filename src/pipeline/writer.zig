@@ -7,6 +7,7 @@ const core = @import("indexer/core");
 
 const pipeline = @import("pipeline.zig");
 const erc20 = @import("erc20.zig");
+const bytecode_store = @import("bytecode_store.zig");
 const pool = @import("indexer/db").pool;
 const http_pool = @import("indexer/rpc").pool;
 const batch = @import("indexer/db").batch;
@@ -60,6 +61,7 @@ pub fn processBlock(
     backupNode: ?EvmRpcNodeConfig,
     backupNode2: ?EvmRpcNodeConfig,
     erc20Ctx: *erc20.Erc20Context,
+    bcStore: *bytecode_store.BytecodeStore,
 ) ProcessBlockStatus {
     const rpcNode = chain.rpcNodes.lotosArchiveNode;
     const chunkSize = @as(u64, @intCast(chain.indexingOptions.minifiedChunkSize));
@@ -100,6 +102,8 @@ pub fn processBlock(
     const pinTimestampS: i64 = if (result.ent.blocks.items.len > 0) result.ent.blocks.items[0].timestampS else 0;
     var windowEnts = [1]*batch.Entities{&result.ent};
     erc20.resolveAndEnrichWindow(erc20Ctx, chain, rdb, result.arena.allocator(), windowEnts[0..], blockNum, pinTimestampS, &result.ent);
+
+    bcStore.processContracts(&rtConns.bytecode, result.ent.contractsByAddr.items);
 
     const t_save = nowNs();
     batch.saveBlockRt(rtConns, &result.ent, bs) catch |e| return .{ .fatal = e };
