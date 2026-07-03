@@ -198,10 +198,41 @@ curl "http://100.64.0.4:8080/same?address=0x219e497a09202a3534f653e63faaeab6689c
 tmux kill-session -t bytecode_api
 ```
 
-**Status:** running (2026-07-02), binary `bytecode_api_v3`. Port 8080 bound to `0.0.0.0`.
+**Status:** running (2026-07-03), binary `bytecode_api_v4`. Port 8080 bound to `0.0.0.0`.
 Scylla auth: user `cassandra` (read+write для `/verify`), password in `run_bytecode_api.sh`.
 Auto-restart: run script содержит `while true` loop — при падении рестартует через 5с.
 `chain_id` query param: если не `1` → HTTP 501 "Not implemented yet".
+**v4 (2026-07-03):** удалён `/bytecode` endpoint (читал старую таблицу `contracts_by_addresses`).
+Использовать `/contract` вместо `/bytecode`.
+
+---
+
+## `merge_old_to_v2/` — одноразовый backfill старых таблиц в v2 (2026-07-03)
+
+Заполняет новые поля в v2-таблицах из старых таблиц:
+- **Stream A:** `contracts` → `contracts_by_address_v2` (поля: `contract_factory`, `block_timestamp_s`, `block_timestamp_ms`, `creation_method`, `transaction_index`, `trace_index`; только блоки < 25422404)
+- **Stream B:** `bytecode_store` → `bytecode_store_v2` (поле: `first_seen_block`; seq=0)
+
+Причина: v16 индексер заполняет эти поля для новых блоков, но блоки 0→25422404 проиндексированы v13-v15 без этих полей.
+
+```bash
+# На сервере (127.0.0.1):
+./merge_old_to_v2 --host 127.0.0.1 --user cassandra --pass cassandra --stream both
+# Или отдельно:
+./merge_old_to_v2 --host 127.0.0.1 --user cassandra --pass cassandra --stream a
+./merge_old_to_v2 --host 127.0.0.1 --user cassandra --pass cassandra --stream b
+```
+
+**Build:**
+```bash
+cd tools/merge_old_to_v2
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o merge_old_to_v2_linux .
+scp merge_old_to_v2_linux alexey_smolyakov@100.64.0.4:~/merge_old_to_v2
+```
+
+**Status:** запущен 2026-07-03 на 100.64.0.4, tmux-сессия `backfill`.
+~50M строк (Stream A) + ~2.5M строк (Stream B), 32 воркера, 8 retry с backoff.
+Результат: 0 ошибок (Stream A), Stream B в ожидании после A.
 
 ---
 

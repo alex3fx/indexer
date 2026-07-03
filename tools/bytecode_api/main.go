@@ -54,7 +54,6 @@ func main() {
 	defer session.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/bytecode", handleBytecode)
 	mux.HandleFunc("/same", handleSame)
 	mux.HandleFunc("/contract", handleContract)
 	mux.HandleFunc("/verify", handleVerify)
@@ -62,7 +61,7 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	log.Printf("bytecode-api v2 listening on %s", *listen)
+	log.Printf("bytecode-api v4 listening on %s", *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
@@ -78,40 +77,6 @@ func checkChainID(w http.ResponseWriter, r *http.Request) bool {
 	}
 	jsonError(w, fmt.Sprintf("chain_id=%s is not implemented yet", v), http.StatusNotImplemented)
 	return false
-}
-
-// ─── /bytecode ───────────────────────────────────────────────────────────────
-
-// GET /bytecode?address=0x...  → deployed bytecode hex (legacy compat, old table)
-func handleBytecode(w http.ResponseWriter, r *http.Request) {
-	if !checkChainID(w, r) {
-		return
-	}
-	addr, err := parseAddressParam(r)
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var deployedBytecode string
-	err = session.Query(
-		`SELECT deployed_bytecode FROM contracts_by_addresses WHERE address = ?`,
-		addr,
-	).Scan(&deployedBytecode)
-
-	if err == gocql.ErrNotFound {
-		jsonError(w, "contract not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		jsonError(w, fmt.Sprintf("query error: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	jsonResponse(w, map[string]string{
-		"address":  addr,
-		"bytecode": deployedBytecode,
-	})
 }
 
 // ─── /contract ───────────────────────────────────────────────────────────────

@@ -194,8 +194,6 @@ pub fn saveBlock(conn: *CqlConn, ent: *const Entities, bs: BatchSizes) !void {
     try saveTxs(conn, ent.txs.items, bs.txs);
     try saveLogs(conn, ent.logs.items, bs.logs);
     try saveInternalTxs(conn, ent.internalTxs.items, bs.itxs);
-    try saveContracts(conn, ent.contracts.items, bs.contracts);
-    try saveContractsByAddr(conn, ent.contractsByAddr.items, bs.contracts);
     try saveErc20Tokens(conn, ent.erc20Tokens.items, bs.contracts);
     try saveErc20Supplies(conn, ent.erc20Supplies.items, bs.contracts);
     try saveErc20Owners(conn, ent.erc20Owners.items, bs.contracts);
@@ -222,16 +220,7 @@ pub fn saveBlockRowsForEntities(g: *TableSave) void {
 }
 
 pub fn saveContractRowsForEntities(g: *TableSave) void {
-    for (g.ents) |ent| {
-        saveContracts(g.conn, ent.contracts.items, g.bs.contracts) catch |e| {
-            g.err = e;
-            return;
-        };
-        saveContractsByAddr(g.conn, ent.contractsByAddr.items, g.bs.contracts) catch |e| {
-            g.err = e;
-            return;
-        };
-    }
+    _ = g;
 }
 
 pub fn saveErc20RowsForEntities(g: *TableSave) void {
@@ -256,16 +245,7 @@ pub fn saveErc20RowsForEntities(g: *TableSave) void {
 }
 
 pub fn saveBytecodeRowsForEntities(g: *TableSave) void {
-    for (g.ents) |ent| {
-        saveBytecodeStore(g.conn, ent.bytecodeStore.items, g.bs.contracts) catch |e| {
-            g.err = e;
-            return;
-        };
-        saveContractsByHash(g.conn, ent.contractsByHash.items, g.bs.contracts) catch |e| {
-            g.err = e;
-            return;
-        };
-    }
+    _ = g;
 }
 
 pub const TableLaneSave = struct {
@@ -462,8 +442,6 @@ const BLOCK_COLS: u16 = 5;
 const TX_COLS: u16 = 21;
 const LOG_COLS: u16 = 15;
 const ITX_COLS: u16 = 10;
-const CONTRACT_COLS: u16 = 13;
-const CONTRACT_CBA_COLS: u16 = 8;
 const COMPLETION_COLS: u16 = 6;
 const ERC20_TOKEN_COLS: u16 = 16;
 const ERC20_SUPPLY_INSERT_COLS: u16 = 6;
@@ -471,8 +449,6 @@ const ERC20_SUPPLY_UPDATE_COLS: u16 = 4;
 const ERC20_OWNER_INSERT_COLS: u16 = 7;
 const ERC20_OWNER_UPDATE_COLS: u16 = 5;
 const ERC20_SELFDESTRUCT_COLS: u16 = 4;
-const BYTECODE_STORE_COLS: u16 = 5;
-const CONTRACTS_BY_HASH_COLS: u16 = 3;
 
 fn saveBlocks(conn: *CqlConn, rows: []const BlockRow, bs: usize) !void {
     if (rows.len == 0) return;
@@ -633,83 +609,6 @@ fn saveInternalTxs(conn: *CqlConn, rows: []const InternalTxRow, bs: usize) !void
         starts[enc] = bd.items.len;
         for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
         try conn.batchSendRows(&conn.prepIds.internalTxs, ITX_COLS, ptrs[0..enc]);
-        i = end;
-    }
-}
-
-fn saveContracts(conn: *CqlConn, rows: []const ContractRow, bs: usize) !void {
-    if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
-    var v = preallocBuf(1024);
-    defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% @as(usize, 1024));
-    defer bd.deinit(tempAllocator);
-    var starts: [MAX_BS + 1]usize = undefined;
-    var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valInt32(&v, r.chunk);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valInt32(&v, r.transactionIndex);
-            try pool.valTextRequired(&v, r.transactionHash);
-            try pool.valInt32(&v, r.traceIndex);
-            try pool.valBigint(&v, r.blockTimestampS);
-            try pool.valBigint(&v, r.blockTimestampMs);
-            try pool.valTextRequired(&v, r.address);
-            try pool.valTinyint(&v, r.creationMethod);
-            try pool.valTextRequired(&v, r.creatorAddress);
-            try pool.valText(&v, r.contractFactory);
-            try pool.valTextRequired(&v, r.creationBytecode);
-            try pool.valTextRequired(&v, r.deployedBytecode);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
-        starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(&conn.prepIds.contracts, CONTRACT_COLS, ptrs[0..enc]);
-        i = end;
-    }
-}
-
-fn saveContractsByAddr(conn: *CqlConn, rows: []const ContractByAddrRow, bs: usize) !void {
-    if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
-    var v = preallocBuf(512);
-    defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 512);
-    defer bd.deinit(tempAllocator);
-    var starts: [MAX_BS + 1]usize = undefined;
-    var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = rows[j];
-            try pool.valTextRequired(&v, r.address);
-            try pool.valTextRequired(&v, r.creator);
-            try pool.valTextRequired(&v, r.txHash);
-            try pool.valBigint(&v, r.blockNumber);
-            try pool.valBigint(&v, r.timestamp);
-            try pool.valText(&v, r.contractFactory);
-            try pool.valTextRequired(&v, r.creationBytecode);
-            try pool.valTextRequired(&v, r.deployedBytecode);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
-        starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(&conn.prepIds.contractsByAddr, CONTRACT_CBA_COLS, ptrs[0..enc]);
         i = end;
     }
 }
@@ -964,66 +863,3 @@ fn saveBlockCompletions(conn: *CqlConn, ent: *const Entities) !void {
     }
 }
 
-fn saveBytecodeStore(conn: *CqlConn, rows: []const BytecodeStoreRow, bs: usize) !void {
-    if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
-    var v = preallocBuf(256);
-    defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 256);
-    defer bd.deinit(tempAllocator);
-    var starts: [MAX_BS + 1]usize = undefined;
-    var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = &rows[j];
-            try pool.valBlob(&v, r.bytecodeHash[0..]);
-            try pool.valBlob(&v, r.bytecode);
-            try pool.valInt32(&v, r.size);
-            try pool.valBigint(&v, r.firstSeenBlock);
-            try pool.valBool(&v, false); // has_collision: always false at write time
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
-        starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(&conn.prepIds.bytecodeStore, BYTECODE_STORE_COLS, ptrs[0..enc]);
-        i = end;
-    }
-}
-
-fn saveContractsByHash(conn: *CqlConn, rows: []const ContractsByHashRow, bs: usize) !void {
-    if (rows.len == 0) return;
-    const chunk = @min(bs, MAX_BS);
-    var v = preallocBuf(128);
-    defer v.deinit(tempAllocator);
-    var bd = preallocBuf(chunk *% 128);
-    defer bd.deinit(tempAllocator);
-    var starts: [MAX_BS + 1]usize = undefined;
-    var ptrs: [MAX_BS][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < rows.len) {
-        const end = @min(i + chunk, rows.len);
-        bd.items.len = 0;
-        var enc: usize = 0;
-        for (i..end) |j| {
-            v.items.len = 0;
-            starts[enc] = bd.items.len;
-            const r = &rows[j];
-            try pool.valBlob(&v, r.bytecodeHash[0..]);
-            try pool.valTextRequired(&v, r.address);
-            try pool.valBigint(&v, r.creationBlock);
-            try bd.appendSlice(tempAllocator, v.items);
-            enc += 1;
-        }
-        starts[enc] = bd.items.len;
-        for (0..enc) |k| ptrs[k] = bd.items[starts[k]..starts[k + 1]];
-        try conn.batchSendRows(&conn.prepIds.contractsByHash, CONTRACTS_BY_HASH_COLS, ptrs[0..enc]);
-        i = end;
-    }
-}

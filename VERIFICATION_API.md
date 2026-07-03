@@ -246,4 +246,4 @@ curl "$BASE/contract?address=0x219e497a09202a3534f653e63faaeab6689c1d22&chain_id
 - **`/same` без фильтрации может вернуть тысячи адресов** для популярного bytecode (ERC-20 factory и т.п.) — учитывайте при пагинации на стороне watcher.
 - **ABI хранится zlib-сжатым** в Scylla; API возвращает уже распакованный JSON.
 - **Source** передаётся как hex от произвольных байт (zip, tar.gz и т.п.) — API не валидирует формат.
-- **`/bytecode`** — legacy endpoint, читает из старой таблицы `contracts_by_addresses`. Использовать только для обратной совместимости; предпочитайте `/contract`.
+- **`/bytecode`** — endpoint удалён в v4. Использовать `/contract`.
