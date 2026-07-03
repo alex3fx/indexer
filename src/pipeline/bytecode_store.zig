@@ -40,11 +40,11 @@ pub const DEFAULT_CACHE_CAP: usize = 100_000;
 pub const QUERY_SELECT =
     "SELECT seq, size, check_hash, bytecode FROM bytecode_store_v2 WHERE hash = ?";
 pub const QUERY_INSERT =
-    "INSERT INTO bytecode_store_v2 (hash,seq,bytecode,check_hash,size,kind,verified) VALUES (?,?,?,?,?,?,false) IF NOT EXISTS";
+    "INSERT INTO bytecode_store_v2 (hash,seq,bytecode,check_hash,size,kind,first_seen_block,verified) VALUES (?,?,?,?,?,?,?,false) IF NOT EXISTS";
 pub const QUERY_COLLISION =
     "INSERT INTO collision_registry_v2 (hash,detected_at,seq_count,note) VALUES (?,?,?,?)";
 pub const QUERY_INSERT_CONTRACT_V2 =
-    "INSERT INTO contracts_by_address_v2 (address,block_number,bytecode_hash,bytecode_seq,creation_hash,creation_seq,tx_hash,deployer) VALUES (?,?,?,?,?,?,?,?)";
+    "INSERT INTO contracts_by_address_v2 (address,block_number,bytecode_hash,bytecode_seq,creation_hash,creation_seq,tx_hash,deployer,contract_factory,block_timestamp_s,block_timestamp_ms,creation_method,transaction_index,trace_index) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 pub const QUERY_INSERT_ADDR_BY_BC =
     "INSERT INTO addresses_by_bytecode (hash,seq,bucket,address,block_number) VALUES (?,?,?,?,?)";
 pub const QUERY_SELECT_PENDING =
@@ -201,7 +201,7 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
         //  6. LWT not applied (concurrent insert) → re-read from step 2.
         //
         // gpa is used for temporary SelectResult allocation (freed before return).
-        pub fn resolveOrInsert(self: *Self, db: *Db, bytecode: []const u8, kind: Kind, gpa: Allocator) !BytecodeId {
+        pub fn resolveOrInsert(self: *Self, db: *Db, bytecode: []const u8, kind: Kind, gpa: Allocator, first_seen_block: i64) !BytecodeId {
             var sha: [32]u8 = undefined;
             Hasher.hash(bytecode, &sha, .{});
 
@@ -269,8 +269,9 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
                 try pool.valBlob(&iparams, &our_keccak.?);                    // check_hash
                 try pool.valInt32(&iparams, @intCast(bytecode.len));           // size
                 try pool.valTinyint(&iparams, @bitCast(@as(u8, @intFromEnum(kind)))); // kind
+                try pool.valBigint(&iparams, first_seen_block);                // first_seen_block
 
-                const applied = try db.executeLWT(&self.insPrep, 6, iparams.items);
+                const applied = try db.executeLWT(&self.insPrep, 7, iparams.items);
                 if (!applied) {
                     // Concurrent insert beat us — re-read to find it.
                     continue;
@@ -331,8 +332,8 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             const creation_raw = transformer.decodeHexBytecode(pool.tempAllocator, c.creationBytecode) catch &.{};
             defer if (creation_raw.len > 0) pool.tempAllocator.free(creation_raw);
 
-            const deployed_id = try self.resolveOrInsert(db, deployed_raw, .deployed, pool.tempAllocator);
-            const creation_id = try self.resolveOrInsert(db, creation_raw, .creation, pool.tempAllocator);
+            const deployed_id = try self.resolveOrInsert(db, deployed_raw, .deployed, pool.tempAllocator, c.blockNumber);
+            const creation_id = try self.resolveOrInsert(db, creation_raw, .creation, pool.tempAllocator, c.blockNumber);
 
             // INSERT contracts_by_address_v2
             var p: std.ArrayList(u8) = .empty;
@@ -345,8 +346,14 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             try pool.valTinyint(&p, creation_id.seq);
             try pool.valText(&p, c.txHash);
             try pool.valText(&p, c.creator);
+            try pool.valText(&p, c.contractFactory);
+            try pool.valBigint(&p, c.timestamp);
+            try pool.valBigint(&p, c.blockTimestampMs);
+            try pool.valTinyint(&p, c.creationMethod);
+            try pool.valInt32(&p, c.transactionIndex);
+            try pool.valInt32(&p, c.traceIndex);
             const row1 = [1][]const u8{p.items};
-            try db.batchSendRows(&self.insContractPrep, 8, &row1);
+            try db.batchSendRows(&self.insContractPrep, 14, &row1);
 
             // INSERT addresses_by_bytecode (for deployed bytecode; creation bytecode is
             // one-off and rarely queried by hash, so we skip it here).
@@ -580,7 +587,7 @@ test "empty partition: first deploy inserts with seq=0" {
     var store = try TestStore.init(&mock, 16);
     defer store.deinit();
 
-    const id = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator);
+    const id = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator, 0);
 
     try testing.expectEqual(@as(i8, 0), id.seq);
     try testing.expectEqual(@as(usize, 1), mock.lwtIdx); // one LWT insert
@@ -598,8 +605,8 @@ test "dedup hit via cache: second call returns without CQL" {
     var store = try TestStore.init(&mock, 16);
     defer store.deinit();
 
-    const id1 = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator);
-    const id2 = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator);
+    const id1 = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator, 0);
+    const id2 = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator, 0);
 
     // Both should return the same BytecodeId.
     try testing.expectEqual(id1.seq, id2.seq);
@@ -648,7 +655,7 @@ test "sha256 collision: bytecode whose hash partition already holds a different 
     var store = try CollisionStore.init(&mock, 16);
     defer store.deinit();
 
-    const id2 = try store.resolveOrInsert(&mock, b2, .deployed, testing.allocator);
+    const id2 = try store.resolveOrInsert(&mock, b2, .deployed, testing.allocator, 0);
     try testing.expectEqual(@as(i8, 1), id2.seq); // collision → seq=1
     try testing.expectEqual(@as(usize, 1), mock.batchCalls); // collision_registry written
 }
@@ -685,7 +692,7 @@ test "concurrent LWT retry: LWT fails once then succeeds on re-read" {
     var store = try TestStore.init(&mock, 16);
     defer store.deinit();
 
-    const id = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator);
+    const id = try store.resolveOrInsert(&mock, bytecode, .deployed, testing.allocator, 0);
     try testing.expectEqual(@as(i8, 0), id.seq);
     try testing.expectEqual(@as(usize, 2), mock.selIdx); // two SELECTs
     try testing.expectEqual(@as(usize, 1), mock.lwtIdx); // one failed LWT
