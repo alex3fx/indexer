@@ -99,7 +99,13 @@ GET /contract?address=0x219e497a09202a3534f653e63faaeab6689c1d22&chain_id=1
 
 Фильтрует CREATE2+selfdestruct редеплои: возвращает только адреса, у которых **текущий** байткод совпадает.
 
-**POST-тело** (альтернатива GET-параметрам):
+> **Для watcher: всегда используйте `POST /same` при поиске по bytecode.**
+> `GET ?bytecode=` ограничен длиной URL (~1 MB в Go net/http, но nginx и браузеры урежут до 8 KB).
+> Deployed bytecode до EIP-170 лимита (24 576 байт = 49 154 hex-символов) через GET проходит,
+> но creation bytecode (initcode) лимита не имеет и через GET надёжно не передать.
+> POST принимает тело до 4 MB — достаточно для любого реального контракта.
+
+**POST-тело** (рекомендуемый вариант для watcher):
 
 ```json
 {"address": "0x219e497a09202a3534f653e63faaeab6689c1d22"}
