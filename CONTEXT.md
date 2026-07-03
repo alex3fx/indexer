@@ -1,6 +1,6 @@
 # Контекст проекта — ETH ERC-20 индексер
 
-_Последнее обновление: 2026-07-02 (bytecode store v2 + backfill 0→25.4M завершён)_
+_Последнее обновление: 2026-07-03 (step 7 + chain_id guard + auto-restart API — готово к интеграции с watcher)_
 
 ## Что это
 
@@ -44,7 +44,16 @@ scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_er
 
 Имя `raw_erc20_vN` — инкрементировать N при каждом деплое.
 
-### Запуск (через скрипт)
+### Запуск realtime (через готовый скрипт на сервере)
+```bash
+# Realtime — запустить через run_eth60_realtime.sh (уже содержит все env-переменные)
+ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
+  "tmux new-session -d -s eth60 '~/run_eth60_realtime.sh >> ~/eth_index_60.log 2>&1'"
+# Текущий бинарь: ~/raw_erc20_v15
+# Следующий деплой: ~/raw_erc20_v16, v17, ...
+```
+
+### Запуск (через временный скрипт)
 ```bash
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 "cat > /tmp/start_erc20.sh << 'SCRIPT'
 #!/bin/bash
@@ -56,7 +65,7 @@ export SCYLLA_DB_PORT=9042
 export SCYLLA_DB_KEYSPACE=eth
 export SCYLLA_DB_USERNAME=cassandra
 export SCYLLA_DB_PASSWORD=cassandra
-exec /home/alexey_smolyakov/raw_erc20_vN
+exec /home/alexey_smolyakov/raw_erc20_v15
 SCRIPT
 chmod +x /tmp/start_erc20.sh"
 
@@ -156,7 +165,7 @@ primary (локальная нода) → backup1 (соседняя нода) �
 
 ---
 
-## Текущий статус (2026-07-02)
+## Текущий статус (2026-07-03)
 
 ### Что сделано и проверено
 
@@ -173,19 +182,22 @@ primary (локальная нода) → backup1 (соседняя нода) �
 | Dual-node run scripts (07/60) | ✅ готово | bd7da48 |
 | Dynamic tuner (AIMD FETCH_WORKERS) | ✅ запущено | bd7da48 |
 | v3 chunk scheme (LANES=24, ERA=12000) | ✅ активно с 2026-06-27 | bd7da48 |
-| **Bytecode store v2 pipeline integration** | ✅ завершено (binary v12) | 743102f |
-| **bytecode_api v2** (`/contract`,`/same`,`/verify`) | ✅ задеплоен на :8080 | 743102f |
+| **Bytecode store v2 pipeline integration** | ✅ завершено (binary v15) | 743102f |
+| **bytecode_api v3** (`/contract`,`/same`,`/verify`, chain_id guard) | ✅ задеплоен на :8080 | fd31abf |
 | **Historical backfill v2 таблиц 0→25422776** | ✅ завершён 2026-07-02 | 743102f |
+| **Step 7: pending_verifications auto-trigger** | ✅ реализовано + integration tested | fd31abf |
+| **bytecode_api: auto-restart + chain_id guard** | ✅ готово | fd31abf |
+| **VERIFICATION_API.md** (watcher integration docs) | ✅ создан | 15d25b3 |
 
-### v2 таблицы — состояние данных (2026-07-02)
+### v2 таблицы — состояние данных (2026-07-03, realtime ~25.45M)
 
 | Таблица | Строки | Описание |
 |---------|--------|----------|
-| `bytecode_store_v2` | 117,558 | Уникальных bytecode-сигнатур |
-| `contracts_by_address_v2` | 2,300,982 | Событий деплоя (address × block_number) |
-| `addresses_by_bytecode` | 2,268,670 | Уникальных пар (bytecode, address) — для /same |
+| `bytecode_store_v2` | 117,558+ | Уникальных bytecode-сигнатур |
+| `contracts_by_address_v2` | 2,300,982+ | Событий деплоя (address × block_number) |
+| `addresses_by_bytecode` | 2,268,670+ | Уникальных пар (bytecode, address) — для /same |
 | `collision_registry_v2` | 0 | SHA256-коллизий нет |
-| `pending_verifications` | 1 | Из тестирования |
+| `pending_verifications` | 0 | Чистое состояние (тестовая запись удалена при auto-trigger) |
 | `source_store` | 0 | Верифицированных источников нет |
 
 Разница 32,312 между `contracts_by_address_v2` и `addresses_by_bytecode` — структурная (не баг):
@@ -239,35 +251,43 @@ Scylla под нагрузкой вытесняет cached prepared statements. 
 1. **Мониторинг full-chain прогона** — проверять прогресс обеих нод, диск, скорость.
    `grep -oP 'Accum \d+→\K\d+' ~/eth_index_07.log | tail -5` на сервере.
 
-2. **Верификация данных** после завершения (или промежуточная) — `find_missing_blocks.py`-эквивалент
-   для ETH. Проверить отсутствие пропусков блоков.
+2. **Верификация данных** — `find_missing_blocks.py` уже прогонялся (2026-06-29: найдено 6,032,
+   backfill завершён). Повторить после завершения полного прогона, особенно для нодa .07 (0→12.7M).
 
 3. **Портирование operational tooling из ветки `polygon`**:
-   - `tools/find_missing_blocks.py` — поиск пропусков
-   - `tools/backfill_spans.sh` — backfill конкретных диапазонов
    - `tools/monitor_pol_v3.py` → нужна ETH-версия `monitor_eth.py`
+   - Merge bug fixes: silent skip-record loss, WSS reconnect giving up, give-up cycle counter
 
 4. **Merge ветки `polygon`** — 30 operational коммитов с bug fixes (silent skip-record loss,
    WSS reconnect giving up, task #4 HTTPS backup RPC, task #7 give-up cycle counter).
 
-5. **Верификация ERC-20 данных** — для первого 1-5M блоков после запуска, сверка с RPC ground truth.
+5. **Верификация ERC-20 данных** — для первого 1-5M блоков, сверка с RPC ground truth.
 
-6. **pending_verifications wiring** (VERIFICATION_TASK шаг 7) — Zig pipeline: при деплое нового
-   контракта проверять `pending_verifications` по адресу и тригерить автоверификацию.
-   Не реализовано в `processOneContract` (`bytecode_store.zig`).
+6. ~~**pending_verifications wiring**~~ — **ГОТОВО** (binary v15, fd31abf).
 
-7. **bytecode_api v2 — repair backfill v2 таблиц** — если понадобится дозалить пропущенные
-   контракты в `addresses_by_bytecode` (их нет, пока не нужно).
+7. **bytecode_api — repair backfill v2 таблиц** — если понадобится дозалить пропущенные
+   контракты в `addresses_by_bytecode` (пока не нужно).
 
-### bytecode_api v2 — endpoints (100.64.0.4:8080)
+### bytecode_api v3 — endpoints (100.64.0.4:8080)
+
+Параметр `?chain_id=` обязателен (или отсутствует — тогда предполагается `1`).
+Если `chain_id != "1"` → HTTP 501. Подробная документация: `VERIFICATION_API.md`.
 
 ```
-GET  /contract?address=0x{addr}   → деплой-инфо + bytecode_id + verified статус
-GET  /same?address=0x{addr}       → все адреса с тем же deployed bytecode (256-бакетный скан)
-POST /verify {"address","abi","source"} → верифицирует bytecode, сохраняет ABI+source
+GET  /health                            → "ok"
+GET  /contract?address=0x{addr}&chain_id=1  → деплой-инфо + bytecode_id + verified статус + ABI
+GET  /same?address=0x{addr}&chain_id=1      → все адреса с тем же deployed bytecode
+POST /same?chain_id=1  {"address"/"bytecode": "0x..."}  → то же (рекомендуется для watcher)
+POST /verify?chain_id=1 {"address","abi","source"} → верифицирует; status: verified|already_verified|pending
 ```
 
-Запущен в tmux-сессии `bytecode_api` на 100.64.0.4. Исходник: `tools/bytecode_api/main.go`.
+**Pending-trigger:** если `/verify` вызван до индексации — пишет в `pending_verifications`.
+Zig-индексер (`processOneContract` → `applyPendingVerification`) при деплое контракта
+автоматически применяет pending-верификацию и удаляет запись.
+
+**Auto-restart:** `~/run_bytecode_api.sh` содержит `while true` loop — при падении рестартует через 5с.
+Запущен в tmux-сессии `bytecode_api` на 100.64.0.4. Binary: `~/bytecode_api_v3`.
+Исходник: `tools/bytecode_api/main.go`.
 
 ## Infra — ETH
 
@@ -283,6 +303,7 @@ POST /verify {"address","abi","source"} → верифицирует bytecode, �
 
 | Файл | Содержание |
 |------|-----------|
+| `VERIFICATION_API.md` | Watcher integration: все endpoints, chain_id, pending-flow, curl-примеры |
 | `docs/FULLCHAIN_PREP.md` | Воркер-каунт, оценки времени, диск, чеклист, валидация |
 | `docs/ERC20_BENCHMARK.md` | Детальные бенчмарки ERC-20 (burst/sustained, по зонам цепи) |
 | `docs/SCYLLA_STORAGE_MIGRATION.md` | Как и зачем переехали на /storage, детали LVM |
