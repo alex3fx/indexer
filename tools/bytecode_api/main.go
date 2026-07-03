@@ -66,10 +66,27 @@ func main() {
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
+// ─── chain_id guard ──────────────────────────────────────────────────────────
+
+// checkChainID enforces ?chain_id=1 (or absent, defaulting to ETH mainnet).
+// Any other value returns HTTP 501. Works for both GET (query param) and
+// POST (query param takes precedence; body is not consumed here).
+func checkChainID(w http.ResponseWriter, r *http.Request) bool {
+	v := r.URL.Query().Get("chain_id")
+	if v == "" || v == "1" {
+		return true
+	}
+	jsonError(w, fmt.Sprintf("chain_id=%s is not implemented yet", v), http.StatusNotImplemented)
+	return false
+}
+
 // ─── /bytecode ───────────────────────────────────────────────────────────────
 
 // GET /bytecode?address=0x...  → deployed bytecode hex (legacy compat, old table)
 func handleBytecode(w http.ResponseWriter, r *http.Request) {
+	if !checkChainID(w, r) {
+		return
+	}
 	addr, err := parseAddressParam(r)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
@@ -102,6 +119,9 @@ func handleBytecode(w http.ResponseWriter, r *http.Request) {
 // GET /contract?address=0x...
 // Returns full contract info from v2 tables: bytecode identity, size, verified status, ABI.
 func handleContract(w http.ResponseWriter, r *http.Request) {
+	if !checkChainID(w, r) {
+		return
+	}
 	addr, err := parseAddressParam(r)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
@@ -179,6 +199,9 @@ func handleContract(w http.ResponseWriter, r *http.Request) {
 // Uses v2 tables: contracts_by_address_v2 + addresses_by_bytecode (256 buckets, parallel).
 // Filters out CREATE2-redeployed addresses whose current bytecode differs.
 func handleSame(w http.ResponseWriter, r *http.Request) {
+	if !checkChainID(w, r) {
+		return
+	}
 	addr, bytecodeParam, err := parseSameParams(r)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
@@ -311,6 +334,9 @@ func filterCurrentBytecode(addrs []string, want bytecodeID) []string {
 func handleVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !checkChainID(w, r) {
 		return
 	}
 

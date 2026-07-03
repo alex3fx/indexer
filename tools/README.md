@@ -133,8 +133,18 @@ tmux new-session -d -s eth60 '~/run_eth60_realtime.sh'
 # Resume: watermark auto-detected from eth_index_60.log
 ```
 
-**Status:** deployed (2026-06-29) on 100.64.0.4. Launched when tuner is not needed.
+**Status:** active (2026-07-02), binary v15 on 100.64.0.4. Launched when tuner is not needed.
 For AIMD-managed realtime, prefer `run_tuner_60.sh` with `TO_BLOCK=0`.
+
+---
+
+## `run_test_single_block.sh` — one-shot integration test for pending_verifications trigger
+
+Runs binary v15 on block 12622799 (node .07), Redis DB=9 (isolated cursor). Used 2026-07-02 to
+verify step 7 (pending_verifications auto-trigger): confirmed `applied pending verification` fires,
+`bytecode_store_v2.verified` set to true, pending row deleted.
+
+**Status:** test-only (2026-07-02), do not use in production.
 
 ---
 
@@ -188,8 +198,10 @@ curl "http://100.64.0.4:8080/same?address=0x219e497a09202a3534f653e63faaeab6689c
 tmux kill-session -t bytecode_api
 ```
 
-**Status:** running (2026-06-29). Port 8080 bound to `0.0.0.0`.
-Scylla auth: user `reader` (read-only), password in `run_bytecode_api.sh`.
+**Status:** running (2026-07-02), binary `bytecode_api_v3`. Port 8080 bound to `0.0.0.0`.
+Scylla auth: user `cassandra` (read+write для `/verify`), password in `run_bytecode_api.sh`.
+Auto-restart: run script содержит `while true` loop — при падении рестартует через 5с.
+`chain_id` query param: если не `1` → HTTP 501 "Not implemented yet".
 
 ---
 

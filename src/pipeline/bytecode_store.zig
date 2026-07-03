@@ -47,6 +47,14 @@ pub const QUERY_INSERT_CONTRACT_V2 =
     "INSERT INTO contracts_by_address_v2 (address,block_number,bytecode_hash,bytecode_seq,creation_hash,creation_seq,tx_hash,deployer) VALUES (?,?,?,?,?,?,?,?)";
 pub const QUERY_INSERT_ADDR_BY_BC =
     "INSERT INTO addresses_by_bytecode (hash,seq,bucket,address,block_number) VALUES (?,?,?,?,?)";
+pub const QUERY_SELECT_PENDING =
+    "SELECT abi, source FROM pending_verifications WHERE address = ?";
+pub const QUERY_UPDATE_VERIFIED =
+    "UPDATE bytecode_store_v2 SET verified = true, verified_at = ?, verified_via_address = ?, abi = ?, source_ref = ? WHERE hash = ? AND seq = ?";
+pub const QUERY_DELETE_PENDING =
+    "DELETE FROM pending_verifications WHERE address = ?";
+pub const QUERY_INSERT_SOURCE_CHUNK =
+    "INSERT INTO source_store (hash, seq, chunk, data) VALUES (?, ?, ?, ?)";
 
 // ─── FIFO-eviction cache ──────────────────────────────────────────────────────
 
@@ -124,6 +132,10 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
         colPrep: pool.Prepared,
         insContractPrep: pool.Prepared,
         insAddrPrep: pool.Prepared,
+        selPendingPrep: pool.Prepared,
+        updVerifiedPrep: pool.Prepared,
+        delPendingPrep: pool.Prepared,
+        insSourcePrep: pool.Prepared,
         cache: LruCache,
         gpa: Allocator,
 
@@ -139,6 +151,14 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             errdefer gpa.free(insContractId);
             const insAddrId = try db.prepare(QUERY_INSERT_ADDR_BY_BC);
             errdefer gpa.free(insAddrId);
+            const selPendingId = try db.prepare(QUERY_SELECT_PENDING);
+            errdefer gpa.free(selPendingId);
+            const updVerifiedId = try db.prepare(QUERY_UPDATE_VERIFIED);
+            errdefer gpa.free(updVerifiedId);
+            const delPendingId = try db.prepare(QUERY_DELETE_PENDING);
+            errdefer gpa.free(delPendingId);
+            const insSourceId = try db.prepare(QUERY_INSERT_SOURCE_CHUNK);
+            errdefer gpa.free(insSourceId);
             const cache = try LruCache.init(gpa, cap);
             return .{
                 .selPrep = .{ .id = selId, .query = QUERY_SELECT },
@@ -146,6 +166,10 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
                 .colPrep = .{ .id = colId, .query = QUERY_COLLISION },
                 .insContractPrep = .{ .id = insContractId, .query = QUERY_INSERT_CONTRACT_V2 },
                 .insAddrPrep = .{ .id = insAddrId, .query = QUERY_INSERT_ADDR_BY_BC },
+                .selPendingPrep = .{ .id = selPendingId, .query = QUERY_SELECT_PENDING },
+                .updVerifiedPrep = .{ .id = updVerifiedId, .query = QUERY_UPDATE_VERIFIED },
+                .delPendingPrep = .{ .id = delPendingId, .query = QUERY_DELETE_PENDING },
+                .insSourcePrep = .{ .id = insSourceId, .query = QUERY_INSERT_SOURCE_CHUNK },
                 .cache = cache,
                 .gpa = gpa,
             };
@@ -157,6 +181,10 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             self.gpa.free(self.colPrep.id);
             self.gpa.free(self.insContractPrep.id);
             self.gpa.free(self.insAddrPrep.id);
+            self.gpa.free(self.selPendingPrep.id);
+            self.gpa.free(self.updVerifiedPrep.id);
+            self.gpa.free(self.delPendingPrep.id);
+            self.gpa.free(self.insSourcePrep.id);
             self.cache.deinit();
         }
 
@@ -331,8 +359,101 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             try pool.valBigint(&p, c.blockNumber);
             const row2 = [1][]const u8{p.items};
             try db.batchSendRows(&self.insAddrPrep, 5, &row2);
+
+            // Apply any pending verification submitted before this contract was indexed.
+            self.applyPendingVerification(db, c.address, deployed_id) catch |e|
+                std.debug.print("[bytecode_store] applyPending addr={s}: {s}\n", .{ c.address, @errorName(e) });
+        }
+
+        fn applyPendingVerification(
+            self: *Self,
+            db: *Db,
+            address: []const u8,
+            deployed_id: BytecodeId,
+        ) !void {
+            // Go API stores address as lowercase hex text (normalizeAddr = strings.ToLower).
+            const addr_lower = try pool.tempAllocator.dupe(u8, address);
+            defer pool.tempAllocator.free(addr_lower);
+            for (addr_lower) |*b| b.* = std.ascii.toLower(b.*);
+
+            var sp: std.ArrayList(u8) = .empty;
+            defer sp.deinit(pool.tempAllocator);
+            try pool.valTextRequired(&sp, addr_lower);
+
+            var result = try db.executeSelect(&self.selPendingPrep, 1, sp.items, pool.tempAllocator);
+            defer result.deinit();
+
+            if (result.rows.len == 0) return;
+
+            const row = result.rows[0];
+            if (row.len < 2) return;
+
+            const abi_raw = row[0] orelse return;
+            if (abi_raw.len == 0) return;
+
+            const abi_compressed = try zlibCompress(abi_raw);
+            defer pool.tempAllocator.free(abi_compressed);
+
+            const source_raw = row[1];
+            var source_ref: []const u8 = "";
+            if (source_raw) |src| {
+                if (src.len > 0) {
+                    try self.storeSourceChunks(db, deployed_id, src);
+                    source_ref = "source_store";
+                }
+            }
+
+            const now_ms = nowMs();
+            var up: std.ArrayList(u8) = .empty;
+            defer up.deinit(pool.tempAllocator);
+            try pool.valBigint(&up, now_ms);           // verified_at
+            try pool.valBlob(&up, addr_lower);         // verified_via_address (blob, hex string bytes)
+            try pool.valBlob(&up, abi_compressed);     // abi
+            try pool.valText(&up, source_ref);         // source_ref
+            try pool.valBlob(&up, &deployed_id.hash);  // hash
+            try pool.valTinyint(&up, deployed_id.seq); // seq
+            const row_up = [1][]const u8{up.items};
+            try db.batchSendRows(&self.updVerifiedPrep, 6, &row_up);
+
+            var dp: std.ArrayList(u8) = .empty;
+            defer dp.deinit(pool.tempAllocator);
+            try pool.valTextRequired(&dp, addr_lower);
+            const row_del = [1][]const u8{dp.items};
+            try db.batchSendRows(&self.delPendingPrep, 1, &row_del);
+
+            std.debug.print("[bytecode_store] applied pending verification addr={s}\n", .{address});
+        }
+
+        fn storeSourceChunks(self: *Self, db: *Db, id: BytecodeId, source: []const u8) !void {
+            const chunk_size: usize = 512 * 1024;
+            var chunk: i32 = 0;
+            var offset: usize = 0;
+            while (offset < source.len) {
+                const end = @min(offset + chunk_size, source.len);
+                var p: std.ArrayList(u8) = .empty;
+                defer p.deinit(pool.tempAllocator);
+                try pool.valBlob(&p, &id.hash);
+                try pool.valTinyint(&p, id.seq);
+                try pool.valInt32(&p, chunk);
+                try pool.valBlob(&p, source[offset..end]);
+                const row = [1][]const u8{p.items};
+                try db.batchSendRows(&self.insSourcePrep, 4, &row);
+                offset = end;
+                chunk += 1;
+            }
         }
     };
+}
+
+fn zlibCompress(input: []const u8) ![]u8 {
+    var aw = try std.Io.Writer.Allocating.initCapacity(pool.tempAllocator, 4096);
+    errdefer aw.deinit();
+    const window_buf = try pool.tempAllocator.alloc(u8, std.compress.flate.max_window_len);
+    defer pool.tempAllocator.free(window_buf);
+    var comp = try std.compress.flate.Compress.init(&aw.writer, window_buf, .zlib, .default);
+    try std.Io.Writer.writeAll(&comp.writer, input);
+    try comp.finish();
+    return aw.toOwnedSlice();
 }
 
 // Return the first decoded byte of a hex-encoded address as a smallint bucket.
