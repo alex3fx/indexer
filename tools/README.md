@@ -148,30 +148,34 @@ verify step 7 (pending_verifications auto-trigger): confirmed `applied pending v
 
 ---
 
-## `bytecode_api/` — HTTP service: bytecode lookup, clone-search, verification (active, v2)
+## `bytecode_api/` — HTTP service: bytecode lookup, clone-search, verification (active, v5)
 
 Go HTTP service для интеграции с watcher. Читает из v2-таблиц (`contracts_by_address_v2`,
 `addresses_by_bytecode` — 256 бакетов параллельно), пишет при верификации.
 Фильтрует CREATE2-редеплои: `/same` spot-проверяет текущий байткод каждого адреса.
 
+**Auth:** все endpoints (кроме `/health`) требуют header `Api-Access-Key: <key>`. Без ключа — 401.
+
 **Endpoints:**
 
 ```
-GET  /health                            → "ok"
-GET  /bytecode?address=0x{addr}         → {"address","bytecode"} (legacy, старая таблица)
-GET  /contract?address=0x{addr}         → {"address","block_number","tx_hash","deployer",
-                                           "bytecode_hash","bytecode_seq","size","kind",
-                                           "verified","verified_at","abi","source_ref"}
-GET  /same?address=0x{addr}             → {"bytecode_hash","bytecode_seq","count","addresses":[...]}
-GET  /same?bytecode=0x{hex}             → то же, по raw bytecode
-POST /same  {"address":"0x..."}         → то же
-POST /verify {"address","abi","source"} → {"status":"verified|already_verified|pending",
-                                           "bytecode_hash","bytecode_seq","address_count","addresses"}
+GET  /health                                      → "ok" (без авторизации)
+GET  /contract?address=0x{addr}                   → {address, block_number, tx_hash, deployer,
+                                                     deployed_bytecode_hash, deployed_bytecode_seq,
+                                                     creation_bytecode_hash, creation_bytecode_seq,
+                                                     size, verified, verified_at?, abi?, source_ref?}
+GET  /same?address=0x{addr}                       → {deployed_bytecode_hash, deployed_bytecode_seq,
+GET  /same?deployed_bytecode=0x{hex}                count, addresses:[...]}
+GET  /same?creation_bytecode=0x{hex}              → 501 (нет обратного индекса)
+POST /same  {"address"|"deployed_bytecode"|"creation_bytecode": "..."}
+POST /verify {"address","abi","source"}           → {status:"verified|already_verified|pending", ...}
 ```
 
-`/verify`: `abi` — JSON-строка, `source` — hex-encoded байты архива (опционально).
-Сохраняет ABI (zlib-сжатый) в `bytecode_store_v2`, source — в `source_store` чанками 512KB.
-Если адрес не найден в индексере — пишет в `pending_verifications`, возвращает `status:pending`.
+`/verify`: `abi` и `source` **обязательны вместе** (одно без другого → 400).
+ABI — JSON-строка, source — hex-encoded байты архива (zip/tar.gz).
+Если адрес не найден — пишет в `pending_verifications`, возвращает `status:pending`.
+
+Полная документация: **`VERIFICATION_API.md`** в корне репо.
 
 **Source:** `tools/bytecode_api/main.go` + `go.mod`/`go.sum`
 
@@ -179,30 +183,34 @@ POST /verify {"address","abi","source"} → {"status":"verified|already_verified
 
 ```bash
 cd tools/bytecode_api
-/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o bytecode_api_v2 .
-scp bytecode_api_v2 alexey_smolyakov@100.64.0.4:~/bytecode_api_v2
+GOOS=linux GOARCH=amd64 /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o bytecode_api_v5 .
+scp bytecode_api_v5 alexey_smolyakov@100.64.0.4:~/bytecode_api_v5
 ```
 
-**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v2`, run script `~/run_bytecode_api.sh`
+**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v5`, run script `~/run_bytecode_api.sh`
 (user: cassandra — нужен для записи при `/verify`)
 
 ```bash
-# Start (tmux session bytecode_api on 100.64.0.4):
-tmux new-session -d -s bytecode_api '~/run_bytecode_api.sh'
+# Start (tmux session bytecode_api на 100.64.0.4):
+tmux new-session -d -s bytecode_api '~/run_bytecode_api.sh >> ~/bytecode_api.log 2>&1'
 
 # Test:
+KEY="Api-Access-Key: 354bf5a9-a29a-4879-9f3d-d3c09c6a610a"
 curl http://100.64.0.4:8080/health
-curl "http://100.64.0.4:8080/same?address=0x219e497a09202a3534f653e63faaeab6689c1d22"
+curl -H "$KEY" "http://100.64.0.4:8080/same?address=0x219e497a09202a3534f653e63faaeab6689c1d22"
 
 # Stop:
 tmux kill-session -t bytecode_api
 ```
 
-**Status:** running (2026-07-03), binary `bytecode_api_v4`. Port 8080 bound to `0.0.0.0`.
+**Status:** running (2026-07-04), binary `bytecode_api_v5`. Port 8080 bound to `0.0.0.0`.
 Scylla auth: user `cassandra` (read+write для `/verify`), password in `run_bytecode_api.sh`.
 Auto-restart: run script содержит `while true` loop — при падении рестартует через 5с.
-`chain_id` query param: если не `1` → HTTP 501 "Not implemented yet".
-**v4 (2026-07-03):** удалён `/bytecode` endpoint (читал старую таблицу `contracts_by_addresses`).
+
+**Changelog:**
+- **v5 (2026-07-04):** авторизация `Api-Access-Key`, `/verify` требует abi+source вместе, `bytecode` → `deployed_bytecode` в `/same`, `creation_bytecode` возвращает 501, `/contract` возвращает оба bytecode hash.
+- **v4 (2026-07-03):** удалён `/bytecode` endpoint (читал старую таблицу `contracts_by_addresses`).
+- **v3 (2026-07-02):** pending_verifications, source_store chunked, chain_id guard.
 Использовать `/contract` вместо `/bytecode`.
 
 ---
