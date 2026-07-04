@@ -1,6 +1,6 @@
 # Контекст проекта — ETH ERC-20 индексер
 
-_Последнее обновление: 2026-07-03 (step 7 + chain_id guard + auto-restart API — готово к интеграции с watcher)_
+_Последнее обновление: 2026-07-04 (creation bytecode обратный индекс, bytecode_api v5, auto-restart indexer)_
 
 ## Что это
 
@@ -48,9 +48,11 @@ scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_er
 ```bash
 # Realtime — запустить через run_eth60_realtime.sh (уже содержит все env-переменные)
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
-  "tmux new-session -d -s eth60 '~/run_eth60_realtime.sh >> ~/eth_index_60.log 2>&1'"
-# Текущий бинарь: ~/raw_erc20_v15
-# Следующий деплой: ~/raw_erc20_v16, v17, ...
+  "tmux new-session -d -s eth60 '~/run_eth60_realtime.sh'"
+# Текущий бинарь: ~/raw_erc20_v18
+# Следующий деплой: ~/raw_erc20_v19, v20, ...
+# Скрипт содержит while-loop auto-restart (добавлено 2026-07-04)
+# Лог: ~/eth_index_60.log
 ```
 
 ### Запуск (через временный скрипт)
@@ -165,7 +167,7 @@ primary (локальная нода) → backup1 (соседняя нода) �
 
 ---
 
-## Текущий статус (2026-07-03)
+## Текущий статус (2026-07-04)
 
 ### Что сделано и проверено
 
@@ -186,22 +188,27 @@ primary (локальная нода) → backup1 (соседняя нода) �
 | **bytecode_api v3** (`/contract`,`/same`,`/verify`, chain_id guard) | ✅ задеплоен на :8080 | fd31abf |
 | **Historical backfill v2 таблиц 0→25422776** | ✅ завершён 2026-07-02 | 743102f |
 | **Step 7: pending_verifications auto-trigger** | ✅ реализовано + integration tested | fd31abf |
-| **bytecode_api: auto-restart + chain_id guard** | ✅ готово | fd31abf |
-| **VERIFICATION_API.md** (watcher integration docs) | ✅ создан | 15d25b3 |
+| **bytecode_api v5** (auth header, abi+source pairing, deployed/creation split) | ✅ задеплоен | 6198f98 |
+| **VERIFICATION_API.md** (watcher integration docs) | ✅ обновлён | 6198f98 |
+| **addresses_by_creation_bytecode** (creation bytecode обратный индекс) | ✅ таблица + indexer (v18) + backfill | e1a40ec |
+| **Auto-restart indexer** (while-loop в run_eth60_realtime.sh) | ✅ задеплоен | e1a40ec |
 
-### v2 таблицы — состояние данных (2026-07-03, realtime ~25.45M)
+### v2 таблицы — состояние данных (2026-07-04, realtime ~25.46M+)
 
 | Таблица | Строки | Описание |
 |---------|--------|----------|
 | `bytecode_store_v2` | 117,558+ | Уникальных bytecode-сигнатур |
-| `contracts_by_address_v2` | 2,300,982+ | Событий деплоя (address × block_number) |
+| `contracts_by_address_v2` | ~57M+ | Событий деплоя (address × block_number) — включая re-deploys |
 | `addresses_by_bytecode` | 2,268,670+ | Уникальных пар (bytecode, address) — для /same |
+| `addresses_by_creation_bytecode` | ~1.5M+ | Обратный индекс creation bytecode (добавлено 2026-07-04) |
 | `collision_registry_v2` | 0 | SHA256-коллизий нет |
-| `pending_verifications` | 0 | Чистое состояние (тестовая запись удалена при auto-trigger) |
+| `pending_verifications` | 0 | Чистое состояние |
 | `source_store` | 0 | Верифицированных источников нет |
 
-Разница 32,312 между `contracts_by_address_v2` и `addresses_by_bytecode` — структурная (не баг):
-один адрес, задеплоенный N раз с одним bytecode → N строк в первой таблице, 1 строка во второй.
+Примечание: `contracts_by_address_v2` гораздо больше (~57M строк), чем уникальных контрактов,
+из-за CREATE2 re-deploys. `addresses_by_creation_bytecode` покрывает только контракты с v18+
+(после 2026-07-04) плюс backfill для всех исторических контрактов у которых был ненулевой
+creation_hash (записанных v18+ индексером для новых и backfill-инструментом для старых).
 
 ### Unprepared fix — детали
 
