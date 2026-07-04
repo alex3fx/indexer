@@ -11,6 +11,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -64,7 +66,7 @@ func main() {
 	mux.HandleFunc("/contract", auth(handleContract))
 	mux.HandleFunc("/verify",   auth(handleVerify))
 
-	log.Printf("bytecode-api v5 listening on %s", *listen)
+	log.Printf("bytecode-api v6 listening on %s", *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
@@ -94,7 +96,7 @@ func checkChainID(w http.ResponseWriter, r *http.Request) bool {
 // ─── /contract ───────────────────────────────────────────────────────────────
 
 // GET /contract?address=0x...
-// Returns full contract info from v2 tables: bytecode identity, size, verified status, ABI.
+// Returns full ETHSCAN-compatible contract info.
 func handleContract(w http.ResponseWriter, r *http.Request) {
 	if !checkChainID(w, r) {
 		return
@@ -105,7 +107,7 @@ func handleContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deployed, creation, blockNum, txHash, deployer, err := resolveAddressV2(addr)
+	deployed, creation, blockNum, blockTimestampMs, txHash, creator, contractFactory, err := resolveAddressV2(addr)
 	if err == gocql.ErrNotFound {
 		jsonError(w, "contract not found", http.StatusNotFound)
 		return
@@ -115,49 +117,89 @@ func handleContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch deployed bytecode metadata + raw bytes.
 	var size int
 	var kind int8
 	var verified bool
 	var verifiedAt time.Time
 	var abiBlob []byte
 	var sourceRef string
+	var programmingLanguage string
+	var deployedBytecodeBlob []byte
 	err = session.Query(
-		`SELECT size, kind, verified, verified_at, abi, source_ref FROM bytecode_store_v2 WHERE hash = ? AND seq = ?`,
+		`SELECT size, kind, verified, verified_at, abi, source_ref, programming_language, bytecode
+		   FROM bytecode_store_v2 WHERE hash = ? AND seq = ?`,
 		deployed.hash[:], deployed.seq,
-	).Scan(&size, &kind, &verified, &verifiedAt, &abiBlob, &sourceRef)
+	).Scan(&size, &kind, &verified, &verifiedAt, &abiBlob, &sourceRef, &programmingLanguage, &deployedBytecodeBlob)
 	if err != nil && err != gocql.ErrNotFound {
 		jsonError(w, fmt.Sprintf("bytecode lookup error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	var abiJSON string
+	// Fetch creation bytecode bytes (only if creation hash is non-zero).
+	var creationBytecodeBlob []byte
+	if !isZeroHash(creation.hash[:]) {
+		_ = session.Query(
+			`SELECT bytecode FROM bytecode_store_v2 WHERE hash = ? AND seq = ?`,
+			creation.hash[:], creation.seq,
+		).Scan(&creationBytecodeBlob)
+	}
+
+	// Decode ABI (zlib-compressed JSON).
+	var abiJSON json.RawMessage
 	if len(abiBlob) > 0 {
-		dec, e := zlibDecompress(abiBlob)
-		if e == nil {
-			abiJSON = string(dec)
+		if dec, e := zlibDecompress(abiBlob); e == nil {
+			abiJSON = json.RawMessage(dec)
+		}
+	}
+
+	// Load source text from source_store.
+	var sourceText string
+	if sourceRef != "" {
+		if s, e := loadSource(deployed); e == nil {
+			sourceText = s
 		}
 	}
 
 	resp := map[string]interface{}{
-		"address":                addr,
-		"block_number":           blockNum,
-		"tx_hash":                txHash,
-		"deployer":               deployer,
-		"deployed_bytecode_hash": "0x" + hex.EncodeToString(deployed.hash[:]),
-		"deployed_bytecode_seq":  deployed.seq,
-		"creation_bytecode_hash": "0x" + hex.EncodeToString(creation.hash[:]),
-		"creation_bytecode_seq":  creation.seq,
-		"size":                   size,
-		"verified":               verified,
+		"address":           addr,
+		"block_number":      blockNum,
+		"block_timestamp":   blockTimestampMs,
+		"tx_hash":           txHash,
+		"contract_creator":  creator,
+		"verified":          verified,
 	}
-	if verified {
-		resp["verified_at"] = verifiedAt.Format(time.RFC3339)
+
+	// contract_factory: only include when non-empty (CREATE2/factory deploys).
+	if contractFactory != "" {
+		resp["contract_factory"] = contractFactory
+	} else {
+		resp["contract_factory"] = nil
 	}
-	if abiJSON != "" {
-		resp["abi"] = json.RawMessage(abiJSON)
+
+	// verified_at as ms timestamp.
+	if verified && !verifiedAt.IsZero() {
+		resp["verified_at"] = verifiedAt.UnixMilli()
 	}
-	if sourceRef != "" {
-		resp["source_ref"] = sourceRef
+
+	if programmingLanguage != "" {
+		resp["programming_language"] = programmingLanguage
+	}
+
+	if abiJSON != nil {
+		resp["abi"] = abiJSON
+	}
+
+	if len(deployedBytecodeBlob) > 0 {
+		resp["deployed_bytecode"] = "0x" + hex.EncodeToString(deployedBytecodeBlob)
+	}
+
+	if len(creationBytecodeBlob) > 0 {
+		resp["creation_bytecode"] = "0x" + hex.EncodeToString(creationBytecodeBlob)
+	}
+
+	if sourceText != "" {
+		resp["source"] = sourceText
 	}
 
 	jsonResponse(w, resp)
@@ -165,39 +207,57 @@ func handleContract(w http.ResponseWriter, r *http.Request) {
 
 // ─── /same ───────────────────────────────────────────────────────────────────
 
-// GET  /same?address=0x...                  → all contracts with same deployed bytecode
-// GET  /same?deployed_bytecode=0x...        → same, provide raw deployed (runtime) bytecode hex
-// GET  /same?creation_bytecode=0x...        → not yet implemented (no reverse index)
-// POST /same  body: {"address":"0x..."} or {"deployed_bytecode":"0x..."} or {"creation_bytecode":"0x..."}
+// GET  /same?address=0x...&limit=N&offset=N       → all contracts with same deployed bytecode
+// GET  /same?deployed_bytecode=0x...&limit=N      → same, provide raw deployed (runtime) bytecode hex
+// GET  /same?creation_bytecode=0x...&limit=N      → contracts with same creation bytecode
+// POST /same  body: {"address":"0x..."} or {"deployed_bytecode":"..."} or {"creation_bytecode":"..."}
 //
-// Deployed bytecode (runtime code) is what eth_getCode returns and what actually executes.
-// Creation bytecode (init code) is the data field of the deploy tx; it includes the constructor.
-// Only deployed bytecode has a reverse index (addresses_by_bytecode).
+// Pagination: limit=0 means no limit (return all). Addresses sorted for stable pagination.
 func handleSame(w http.ResponseWriter, r *http.Request) {
 	if !checkChainID(w, r) {
 		return
 	}
-	addr, deployedHex, creationHex, err := parseSameParams(r)
+	addr, deployedHex, creationHex, limit, offset, err := parseSameParams(r)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// creation_bytecode search: no reverse index exists yet.
 	if creationHex != "" {
-		jsonError(w,
-			"creation_bytecode search is not yet implemented: there is no reverse index for creation bytecode. "+
-				"Use deployed_bytecode= to search by runtime code (what eth_getCode returns), "+
-				"or address= to look up a specific contract.",
-			http.StatusNotImplemented,
-		)
+		// Search by creation bytecode via addresses_by_creation_bytecode reverse index.
+		raw, e := decodeHex(creationHex)
+		if e != nil {
+			jsonError(w, fmt.Sprintf("invalid creation_bytecode: %v", e), http.StatusBadRequest)
+			return
+		}
+		h := sha256.Sum256(raw)
+		id := bytecodeID{hash: h, seq: 0}
+
+		addresses, e := fetchAllCreationAddresses(id)
+		if e != nil {
+			jsonError(w, fmt.Sprintf("query error: %v", e), http.StatusInternalServerError)
+			return
+		}
+		sort.Strings(addresses)
+		total := len(addresses)
+		addresses = paginate(addresses, offset, limit)
+
+		jsonResponse(w, map[string]interface{}{
+			"creation_bytecode_hash": "0x" + hex.EncodeToString(id.hash[:]),
+			"creation_bytecode_seq":  id.seq,
+			"total":     total,
+			"count":     len(addresses),
+			"offset":    offset,
+			"limit":     limit,
+			"addresses": addresses,
+		})
 		return
 	}
 
 	var id bytecodeID
 
 	if addr != "" {
-		deployed, _, _, _, _, err := resolveAddressV2(addr)
+		deployed, _, _, _, _, _, _, err := resolveAddressV2(addr)
 		if err == gocql.ErrNotFound {
 			jsonError(w, "contract not found", http.StatusNotFound)
 			return
@@ -224,17 +284,43 @@ func handleSame(w http.ResponseWriter, r *http.Request) {
 	}
 
 	addresses = filterCurrentBytecode(addresses, id)
+	sort.Strings(addresses)
+	total := len(addresses)
+	addresses = paginate(addresses, offset, limit)
 
 	jsonResponse(w, map[string]interface{}{
 		"deployed_bytecode_hash": "0x" + hex.EncodeToString(id.hash[:]),
 		"deployed_bytecode_seq":  id.seq,
-		"count":                  len(addresses),
-		"addresses":              addresses,
+		"total":     total,
+		"count":     len(addresses),
+		"offset":    offset,
+		"limit":     limit,
+		"addresses": addresses,
 	})
+}
+
+func paginate(s []string, offset, limit int) []string {
+	if offset >= len(s) {
+		return []string{}
+	}
+	s = s[offset:]
+	if limit > 0 && len(s) > limit {
+		s = s[:limit]
+	}
+	return s
 }
 
 // fetchAllAddresses scans all 256 buckets of addresses_by_bytecode in parallel.
 func fetchAllAddresses(id bytecodeID) ([]string, error) {
+	return scanBuckets(id, "SELECT address FROM addresses_by_bytecode WHERE hash = ? AND seq = ? AND bucket = ?")
+}
+
+// fetchAllCreationAddresses scans all 256 buckets of addresses_by_creation_bytecode in parallel.
+func fetchAllCreationAddresses(id bytecodeID) ([]string, error) {
+	return scanBuckets(id, "SELECT address FROM addresses_by_creation_bytecode WHERE hash = ? AND seq = ? AND bucket = ?")
+}
+
+func scanBuckets(id bytecodeID, query string) ([]string, error) {
 	type result struct {
 		addrs []string
 		err   error
@@ -246,10 +332,7 @@ func fetchAllAddresses(id bytecodeID) ([]string, error) {
 		b := b
 		go func() {
 			defer wg.Done()
-			iter := session.Query(
-				`SELECT address FROM addresses_by_bytecode WHERE hash = ? AND seq = ? AND bucket = ?`,
-				id.hash[:], id.seq, int16(b),
-			).Iter()
+			iter := session.Query(query, id.hash[:], id.seq, int16(b)).Iter()
 			var a string
 			var addrs []string
 			for iter.Scan(&a) {
@@ -290,7 +373,7 @@ func filterCurrentBytecode(addrs []string, want bytecodeID) []string {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			cur, _, _, _, _, err := resolveAddressV2(a)
+			cur, _, _, _, _, _, _, err := resolveAddressV2(a)
 			if err != nil {
 				out[i] = check{addr: a, keep: true}
 				return
@@ -312,10 +395,9 @@ func filterCurrentBytecode(addrs []string, want bytecodeID) []string {
 // ─── /verify ─────────────────────────────────────────────────────────────────
 
 // POST /verify
-// Body: {"address":"0x...", "abi":"[...]", "source":"<hex of source archive>"}
-// ABI and source must be provided together — one without the other is rejected.
-// Marks the bytecode as verified in bytecode_store_v2, stores ABI + source,
-// returns the list of all clone addresses sharing that bytecode.
+// Body: {"address":"0x...", "abi":"[...]", "source":"<solidity source text>", "programming_language":"solidity"}
+// ABI and source must be provided together.
+// Marks the bytecode as verified, stores ABI + source, returns clone addresses.
 func handleVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "POST required", http.StatusMethodNotAllowed)
@@ -326,9 +408,10 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Address string `json:"address"`
-		ABI     string `json:"abi"`    // JSON array/string
-		Source  string `json:"source"` // hex-encoded source archive bytes
+		Address             string `json:"address"`
+		ABI                 string `json:"abi"`
+		Source              string `json:"source"` // plain text source code
+		ProgrammingLanguage string `json:"programming_language"`
 	}
 	if err := decodeJSONBody(r, &body); err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
@@ -343,7 +426,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 
 	// ABI and source must always come together.
 	if body.ABI != "" && body.Source == "" {
-		jsonError(w, "source is required when abi is provided: ABI alone without source code is not accepted", http.StatusBadRequest)
+		jsonError(w, "source is required when abi is provided", http.StatusBadRequest)
 		return
 	}
 	if body.Source != "" && body.ABI == "" {
@@ -351,15 +434,15 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve address → BytecodeId.
-	deployed, _, _, _, _, err := resolveAddressV2(addr)
+	// Resolve address → bytecode identity.
+	deployed, _, _, _, _, _, _, err := resolveAddressV2(addr)
 	if err == gocql.ErrNotFound {
 		// Contract not indexed yet — store in pending_verifications.
 		abiBlob := []byte(body.ABI)
-		srcBlob, _ := decodeHex(body.Source)
+		srcBlob := []byte(body.Source)
 		_ = session.Query(
-			`INSERT INTO pending_verifications (address, source, abi, received_at) VALUES (?, ?, ?, ?)`,
-			addr, srcBlob, abiBlob, time.Now(),
+			`INSERT INTO pending_verifications (address, source, abi, received_at, programming_language) VALUES (?, ?, ?, ?, ?)`,
+			addr, srcBlob, abiBlob, time.Now(), body.ProgrammingLanguage,
 		).Exec()
 		jsonResponse(w, map[string]string{"status": "pending", "address": addr})
 		return
@@ -379,6 +462,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 	if alreadyVerified {
 		addresses, _ := fetchAllAddresses(deployed)
 		addresses = filterCurrentBytecode(addresses, deployed)
+		sort.Strings(addresses)
 		jsonResponse(w, map[string]interface{}{
 			"status":                 "already_verified",
 			"deployed_bytecode_hash": "0x" + hex.EncodeToString(deployed.hash[:]),
@@ -399,32 +483,27 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Store source in source_store (chunked at 512KB).
+	// Store source text in source_store (chunked at 512KB).
 	sourceRef := ""
 	if body.Source != "" {
-		srcBytes, e := decodeHex(body.Source)
-		if e != nil {
-			srcBytes = []byte(body.Source)
-		}
-		if err := storeSource(deployed, srcBytes); err != nil {
+		if err := storeSource(deployed, []byte(body.Source)); err != nil {
 			log.Printf("[verify] source store error addr=%s: %v", addr, err)
 		} else {
 			sourceRef = "source_store"
 		}
 	}
 
-	// Mark bytecode as verified.
 	now := time.Now()
 	err = session.Query(
-		`UPDATE bytecode_store_v2 SET verified = true, verified_at = ?, verified_via_address = ?, abi = ?, source_ref = ? WHERE hash = ? AND seq = ?`,
-		now, addr, abiBlob, sourceRef, deployed.hash[:], deployed.seq,
+		`UPDATE bytecode_store_v2 SET verified = true, verified_at = ?, verified_via_address = ?, abi = ?, source_ref = ?, programming_language = ? WHERE hash = ? AND seq = ?`,
+		now, addr, abiBlob, sourceRef, body.ProgrammingLanguage, deployed.hash[:], deployed.seq,
 	).Exec()
 	if err != nil {
 		jsonError(w, fmt.Sprintf("update error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[verify] verified bytecode hash=%x seq=%d via addr=%s", deployed.hash, deployed.seq, addr)
+	log.Printf("[verify] verified bytecode hash=%x seq=%d via addr=%s lang=%s", deployed.hash, deployed.seq, addr, body.ProgrammingLanguage)
 
 	addresses, err := fetchAllAddresses(deployed)
 	if err != nil {
@@ -432,12 +511,13 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		addresses = []string{addr}
 	}
 	addresses = filterCurrentBytecode(addresses, deployed)
+	sort.Strings(addresses)
 
 	jsonResponse(w, map[string]interface{}{
 		"status":                 "verified",
 		"deployed_bytecode_hash": "0x" + hex.EncodeToString(deployed.hash[:]),
 		"deployed_bytecode_seq":  deployed.seq,
-		"verified_at":            now.Format(time.RFC3339),
+		"verified_at":            now.UnixMilli(),
 		"address_count":          len(addresses),
 		"addresses":              addresses,
 	})
@@ -464,6 +544,23 @@ func storeSource(id bytecodeID, srcBytes []byte) error {
 	return nil
 }
 
+// loadSource reassembles source text from source_store chunks.
+func loadSource(id bytecodeID) (string, error) {
+	iter := session.Query(
+		`SELECT data FROM source_store WHERE hash = ? AND seq = ? ORDER BY chunk ASC`,
+		id.hash[:], id.seq,
+	).Iter()
+	var chunk []byte
+	var all []byte
+	for iter.Scan(&chunk) {
+		all = append(all, chunk...)
+	}
+	if err := iter.Close(); err != nil {
+		return "", err
+	}
+	return string(all), nil
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 type bytecodeID struct {
@@ -471,16 +568,15 @@ type bytecodeID struct {
 	seq  int8
 }
 
-// resolveAddressV2 returns the deployed and creation BytecodeIds for an address.
-// Uses LIMIT 1 to get the latest deployment (highest block_number by Scylla clustering).
-func resolveAddressV2(addr string) (deployed, creation bytecodeID, blockNum int64, txHash, deployer string, err error) {
+// resolveAddressV2 returns full contract identity for the latest deployment of an address.
+func resolveAddressV2(addr string) (deployed, creation bytecodeID, blockNum, blockTimestampMs int64, txHash, creator, contractFactory string, err error) {
 	var deployedHash, creationHash []byte
 	var deployedSeq, creationSeq int8
 	err = session.Query(
-		`SELECT bytecode_hash, bytecode_seq, creation_hash, creation_seq, block_number, tx_hash, deployer
+		`SELECT bytecode_hash, bytecode_seq, creation_hash, creation_seq, block_number, tx_hash, deployer, block_timestamp_ms, contract_factory
 		   FROM contracts_by_address_v2 WHERE address = ? LIMIT 1`,
 		addr,
-	).Scan(&deployedHash, &deployedSeq, &creationHash, &creationSeq, &blockNum, &txHash, &deployer)
+	).Scan(&deployedHash, &deployedSeq, &creationHash, &creationSeq, &blockNum, &txHash, &creator, &blockTimestampMs, &contractFactory)
 	if err != nil {
 		return
 	}
@@ -489,6 +585,15 @@ func resolveAddressV2(addr string) (deployed, creation bytecodeID, blockNum int6
 	copy(creation.hash[:], creationHash)
 	creation.seq = creationSeq
 	return
+}
+
+func isZeroHash(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func zlibCompress(data []byte) ([]byte, error) {
@@ -546,16 +651,28 @@ func parseAddressParam(r *http.Request) (string, error) {
 	return addr, nil
 }
 
-func parseSameParams(r *http.Request) (addr, deployedHex, creationHex string, err error) {
+func parseSameParams(r *http.Request) (addr, deployedHex, creationHex string, limit, offset int, err error) {
 	if r.Method == http.MethodGet {
 		addr = normalizeAddr(r.URL.Query().Get("address"))
 		deployedHex = r.URL.Query().Get("deployed_bytecode")
 		creationHex = r.URL.Query().Get("creation_bytecode")
+		if s := r.URL.Query().Get("limit"); s != "" {
+			if n, e := strconv.Atoi(s); e == nil && n >= 0 {
+				limit = n
+			}
+		}
+		if s := r.URL.Query().Get("offset"); s != "" {
+			if n, e := strconv.Atoi(s); e == nil && n >= 0 {
+				offset = n
+			}
+		}
 	} else {
 		var body struct {
-			Address         string `json:"address"`
+			Address          string `json:"address"`
 			DeployedBytecode string `json:"deployed_bytecode"`
 			CreationBytecode string `json:"creation_bytecode"`
+			Limit            int    `json:"limit"`
+			Offset           int    `json:"offset"`
 		}
 		if err = decodeJSONBody(r, &body); err != nil {
 			return
@@ -563,6 +680,8 @@ func parseSameParams(r *http.Request) (addr, deployedHex, creationHex string, er
 		addr = normalizeAddr(body.Address)
 		deployedHex = body.DeployedBytecode
 		creationHex = body.CreationBytecode
+		limit = body.Limit
+		offset = body.Offset
 	}
 
 	set := 0

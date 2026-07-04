@@ -50,9 +50,9 @@ pub const QUERY_INSERT_ADDR_BY_BC =
 pub const QUERY_INSERT_ADDR_BY_CREATION_BC =
     "INSERT INTO addresses_by_creation_bytecode (hash,seq,bucket,address,block_number) VALUES (?,?,?,?,?)";
 pub const QUERY_SELECT_PENDING =
-    "SELECT abi, source FROM pending_verifications WHERE address = ?";
+    "SELECT abi, source, programming_language FROM pending_verifications WHERE address = ?";
 pub const QUERY_UPDATE_VERIFIED =
-    "UPDATE bytecode_store_v2 SET verified = true, verified_at = ?, verified_via_address = ?, abi = ?, source_ref = ? WHERE hash = ? AND seq = ?";
+    "UPDATE bytecode_store_v2 SET verified = true, verified_at = ?, verified_via_address = ?, abi = ?, source_ref = ?, programming_language = ? WHERE hash = ? AND seq = ?";
 pub const QUERY_DELETE_PENDING =
     "DELETE FROM pending_verifications WHERE address = ?";
 pub const QUERY_INSERT_SOURCE_CHUNK =
@@ -412,7 +412,7 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             if (result.rows.len == 0) return;
 
             const row = result.rows[0];
-            if (row.len < 2) return;
+            if (row.len < 3) return;
 
             const abi_raw = row[0] orelse return;
             if (abi_raw.len == 0) return;
@@ -429,6 +429,9 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
                 }
             }
 
+            const prog_lang_raw = row[2];
+            const prog_lang: []const u8 = if (prog_lang_raw) |pl| pl else "";
+
             const now_ms = nowMs();
             var up: std.ArrayList(u8) = .empty;
             defer up.deinit(pool.tempAllocator);
@@ -436,10 +439,11 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             try pool.valBlob(&up, addr_lower);         // verified_via_address (blob, hex string bytes)
             try pool.valBlob(&up, abi_compressed);     // abi
             try pool.valText(&up, source_ref);         // source_ref
+            try pool.valText(&up, prog_lang);          // programming_language
             try pool.valBlob(&up, &deployed_id.hash);  // hash
             try pool.valTinyint(&up, deployed_id.seq); // seq
             const row_up = [1][]const u8{up.items};
-            try db.batchSendRows(&self.updVerifiedPrep, 6, &row_up);
+            try db.batchSendRows(&self.updVerifiedPrep, 7, &row_up);
 
             var dp: std.ArrayList(u8) = .empty;
             defer dp.deinit(pool.tempAllocator);
