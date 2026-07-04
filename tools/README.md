@@ -133,7 +133,8 @@ tmux new-session -d -s eth60 '~/run_eth60_realtime.sh'
 # Resume: watermark auto-detected from eth_index_60.log
 ```
 
-**Status:** active (2026-07-02), binary v15 on 100.64.0.4. Launched when tuner is not needed.
+**Status:** active (2026-07-04), binary v18 on 100.64.0.4. Auto-restart loop added 2026-07-04
+(process had no restart on CqlError crash). Launched when tuner is not needed.
 For AIMD-managed realtime, prefer `run_tuner_60.sh` with `TO_BLOCK=0`.
 
 ---
@@ -212,6 +213,31 @@ Auto-restart: run script содержит `while true` loop — при паде�
 - **v4 (2026-07-03):** удалён `/bytecode` endpoint (читал старую таблицу `contracts_by_addresses`).
 - **v3 (2026-07-02):** pending_verifications, source_store chunked, chain_id guard.
 Использовать `/contract` вместо `/bytecode`.
+
+---
+
+## `backfill_creation_bc/` — заполнение `addresses_by_creation_bytecode` (2026-07-04)
+
+Единоразовый backfill нового обратного индекса creation bytecode для всех уже
+проиндексированных контрактов. Читает `contracts_by_address_v2` (full token-range scan),
+пишет в `addresses_by_creation_bytecode`. Строки с нулевым хешем (до v18 / precompiles) — пропускаются.
+Идемпотентен: INSERT по PK = upsert.
+
+```bash
+~/backfill_creation_bc_v2 --host=127.0.0.1 --pass=cassandra --workers=128 --log-every=50000
+```
+
+**Build:**
+```bash
+cd tools/backfill_creation_bc
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o backfill_creation_bc_v2 .
+scp backfill_creation_bc_v2 alexey_smolyakov@100.64.0.4:~/backfill_creation_bc_v2
+```
+
+**Status:** выполнен 2026-07-04. v1 завис на drain loop (баг: `scanned` включает скипнутые строки).
+Исправлено в v2 — sync.WaitGroup вместо счётчика. Данные записаны полностью (v1 успел дозаписать
+через воркеры). ~430k строк записано из ~25M строк contracts_by_address_v2 (~2.3% имели
+creation_hash).
 
 ---
 

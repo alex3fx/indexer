@@ -47,6 +47,8 @@ pub const QUERY_INSERT_CONTRACT_V2 =
     "INSERT INTO contracts_by_address_v2 (address,block_number,bytecode_hash,bytecode_seq,creation_hash,creation_seq,tx_hash,deployer,contract_factory,block_timestamp_s,block_timestamp_ms,creation_method,transaction_index,trace_index) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 pub const QUERY_INSERT_ADDR_BY_BC =
     "INSERT INTO addresses_by_bytecode (hash,seq,bucket,address,block_number) VALUES (?,?,?,?,?)";
+pub const QUERY_INSERT_ADDR_BY_CREATION_BC =
+    "INSERT INTO addresses_by_creation_bytecode (hash,seq,bucket,address,block_number) VALUES (?,?,?,?,?)";
 pub const QUERY_SELECT_PENDING =
     "SELECT abi, source FROM pending_verifications WHERE address = ?";
 pub const QUERY_UPDATE_VERIFIED =
@@ -132,6 +134,7 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
         colPrep: pool.Prepared,
         insContractPrep: pool.Prepared,
         insAddrPrep: pool.Prepared,
+        insCreationAddrPrep: pool.Prepared,
         selPendingPrep: pool.Prepared,
         updVerifiedPrep: pool.Prepared,
         delPendingPrep: pool.Prepared,
@@ -151,6 +154,8 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             errdefer gpa.free(insContractId);
             const insAddrId = try db.prepare(QUERY_INSERT_ADDR_BY_BC);
             errdefer gpa.free(insAddrId);
+            const insCreationAddrId = try db.prepare(QUERY_INSERT_ADDR_BY_CREATION_BC);
+            errdefer gpa.free(insCreationAddrId);
             const selPendingId = try db.prepare(QUERY_SELECT_PENDING);
             errdefer gpa.free(selPendingId);
             const updVerifiedId = try db.prepare(QUERY_UPDATE_VERIFIED);
@@ -166,6 +171,7 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
                 .colPrep = .{ .id = colId, .query = QUERY_COLLISION },
                 .insContractPrep = .{ .id = insContractId, .query = QUERY_INSERT_CONTRACT_V2 },
                 .insAddrPrep = .{ .id = insAddrId, .query = QUERY_INSERT_ADDR_BY_BC },
+                .insCreationAddrPrep = .{ .id = insCreationAddrId, .query = QUERY_INSERT_ADDR_BY_CREATION_BC },
                 .selPendingPrep = .{ .id = selPendingId, .query = QUERY_SELECT_PENDING },
                 .updVerifiedPrep = .{ .id = updVerifiedId, .query = QUERY_UPDATE_VERIFIED },
                 .delPendingPrep = .{ .id = delPendingId, .query = QUERY_DELETE_PENDING },
@@ -181,6 +187,7 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             self.gpa.free(self.colPrep.id);
             self.gpa.free(self.insContractPrep.id);
             self.gpa.free(self.insAddrPrep.id);
+            self.gpa.free(self.insCreationAddrPrep.id);
             self.gpa.free(self.selPendingPrep.id);
             self.gpa.free(self.updVerifiedPrep.id);
             self.gpa.free(self.delPendingPrep.id);
@@ -355,8 +362,7 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             const row1 = [1][]const u8{p.items};
             try db.batchSendRows(&self.insContractPrep, 14, &row1);
 
-            // INSERT addresses_by_bytecode (for deployed bytecode; creation bytecode is
-            // one-off and rarely queried by hash, so we skip it here).
+            // INSERT addresses_by_bytecode (deployed bytecode reverse index).
             p.items.len = 0;
             const bucket = addrFirstByte(c.address);
             try pool.valBlob(&p, &deployed_id.hash);
@@ -366,6 +372,19 @@ pub fn BytecodeStoreT(comptime Db: type, comptime Hasher: type) type {
             try pool.valBigint(&p, c.blockNumber);
             const row2 = [1][]const u8{p.items};
             try db.batchSendRows(&self.insAddrPrep, 5, &row2);
+
+            // INSERT addresses_by_creation_bytecode (creation bytecode reverse index).
+            // Skip if creation_raw is empty (precompiles, zero-bytecode edge cases).
+            if (creation_raw.len > 0) {
+                p.items.len = 0;
+                try pool.valBlob(&p, &creation_id.hash);
+                try pool.valTinyint(&p, creation_id.seq);
+                try pool.valSmallint(&p, bucket);
+                try pool.valTextRequired(&p, c.address);
+                try pool.valBigint(&p, c.blockNumber);
+                const row3 = [1][]const u8{p.items};
+                try db.batchSendRows(&self.insCreationAddrPrep, 5, &row3);
+            }
 
             // Apply any pending verification submitted before this contract was indexed.
             self.applyPendingVerification(db, c.address, deployed_id) catch |e|
