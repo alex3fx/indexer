@@ -181,7 +181,7 @@ scp backfill_deployed_bytecode_v1 alexey_smolyakov@100.64.0.4:~/backfill_deploye
 
 ---
 
-## `bytecode_api/` — HTTP service: bytecode lookup, clone-search, verification (active, v6)
+## `bytecode_api/` — HTTP service: bytecode lookup, clone-search, verification (active, v7)
 
 Go HTTP service для интеграции с watcher. Читает из v2-таблиц (`contracts_by_address_v2`,
 `addresses_by_bytecode` — 256 бакетов параллельно), пишет при верификации.
@@ -189,23 +189,26 @@ Go HTTP service для интеграции с watcher. Читает из v2-т�
 
 **Auth:** все endpoints (кроме `/health`) требуют header `Api-Access-Key: <key>`. Без ключа — 401.
 
-**Endpoints (v6):**
+**Endpoints (v7):**
 
 ```
-GET  /health                                      → "ok" (без авторизации)
-GET  /contract?address=0x{addr}                   → {address, block_number, block_timestamp(ms),
+GET   /health                                     → "ok" (без авторизации)
+GET   /contract?address=0x{addr}                  → {address, block_number, block_timestamp(ms),
                                                      tx_hash, contract_creator, contract_factory,
                                                      verified, verified_at(ms), programming_language,
                                                      abi, deployed_bytecode, creation_bytecode, source}
-GET  /same?address=0x{addr}[&limit=N&offset=N]    → {hash, seq, total, count, offset, limit, addresses}
-GET  /same?deployed_bytecode=0x{hex}[&limit&offset]
-GET  /same?creation_bytecode=0x{hex}[&limit&offset]→ via addresses_by_creation_bytecode
-POST /same  {"address"|"deployed_bytecode"|"creation_bytecode": "...", "limit":N, "offset":N}
-POST /verify {"address","abi","source","programming_language"} → {status, verified_at(ms), ...}
+QUERY /same  {"address"|"deployed_bytecode"|"creation_bytecode": "...", "limit":N, "offset":N}
+             → {hash, seq, total, offset, limit, addresses}
+POST  /verify {"address","abi","source","programming_language","verified_at"(ms, optional)}
+             → {status, verified_at(ms), ...}
 ```
 
+`/same`: метод QUERY (RFC draft-ietf-httpbis-safe-method-with-body) — безопасный+идемпотентный с телом.
+GET и POST → 405. Тело до 4 MB.
+
 `/verify`: `abi` и `source` **обязательны вместе** (одно без другого → 400). Оба plain-text.
-`verified_at` и `block_timestamp` — int64 в миллисекундах (не строки).
+`verified_at` (ms) — опционально; если не передан, используется `time.Now()`. Передавать при историческом импорте.
+`block_timestamp` — int64 в миллисекундах (не строки).
 Если адрес не найден — пишет в `pending_verifications`, возвращает `status:pending`.
 
 Полная документация: **`VERIFICATION_API.md`** в корне репо.
@@ -216,36 +219,36 @@ POST /verify {"address","abi","source","programming_language"} → {status, veri
 
 ```bash
 cd tools/bytecode_api
-GOOS=linux GOARCH=amd64 /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o bytecode_api_v6 .
-scp bytecode_api_v5 alexey_smolyakov@100.64.0.4:~/bytecode_api_v5
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o bytecode_api_v7 .
+scp bytecode_api_v7 alexey_smolyakov@100.64.0.4:~/bytecode_api_v7
 ```
 
-**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v5`, run script `~/run_bytecode_api.sh`
+**Deployed:** `100.64.0.4:8080`, binary `~/bytecode_api_v7`, run script `~/run_bytecode_api.sh`
 (user: cassandra — нужен для записи при `/verify`)
 
 ```bash
-# Start (tmux session bytecode_api на 100.64.0.4):
-tmux new-session -d -s bytecode_api '~/run_bytecode_api.sh >> ~/bytecode_api.log 2>&1'
+# Start (auto-restart loop, уже запущен через nohup на 100.64.0.4):
+nohup bash ~/run_bytecode_api.sh >> ~/bytecode_api.log 2>&1 &
 
 # Test:
 KEY="Api-Access-Key: 354bf5a9-a29a-4879-9f3d-d3c09c6a610a"
 curl http://100.64.0.4:8080/health
-curl -H "$KEY" "http://100.64.0.4:8080/same?address=0x219e497a09202a3534f653e63faaeab6689c1d22"
-
-# Stop:
-tmux kill-session -t bytecode_api
+curl -H "$KEY" -H "Content-Type: application/json" \
+  -X QUERY http://100.64.0.4:8080/same \
+  -d '{"address":"0x219e497a09202a3534f653e63faaeab6689c1d22","limit":10}'
 ```
 
-**Status:** running (2026-07-04), binary `bytecode_api_v6`. Port 8080 bound to `0.0.0.0`.
+**Status:** running (2026-07-06), binary `bytecode_api_v7`. Port 8080 bound to `0.0.0.0`.
 Scylla auth: user `cassandra` (read+write для `/verify`), password in `run_bytecode_api.sh`.
 Auto-restart: run script содержит `while true` loop — при падении рестартует через 5с.
 
 **Changelog:**
+- **v7 (2026-07-06):** `/same` → метод QUERY вместо GET+POST, убраны GET-варианты; убрано поле `count` из ответа; `/verify` принимает опциональный `verified_at` (ms) для исторического импорта.
 - **v6 (2026-07-04):** полный ETHSCAN-совместимый `/contract` (block_timestamp ms, contract_creator, contract_factory, programming_language, abi array, deployed_bytecode hex, creation_bytecode hex, source plain text); `/verify` принимает programming_language; `/same` pagination (limit/offset, total/count); creation_bytecode wired к addresses_by_creation_bytecode; verified_at → int64 ms везде.
-- **v5 (2026-07-04):** авторизация `Api-Access-Key`, `/verify` требует abi+source вместе, `bytecode` → `deployed_bytecode` в `/same`, `creation_bytecode` возвращает 501, `/contract` возвращает оба bytecode hash.
+- **v5 (2026-07-04):** авторизация `Api-Access-Key`, `/verify` требует abi+source вместе, `bytecode` → `deployed_bytecode` в `/same`, `/contract` возвращает оба bytecode hash.
 - **v4 (2026-07-03):** удалён `/bytecode` endpoint (читал старую таблицу `contracts_by_addresses`).
 - **v3 (2026-07-02):** pending_verifications, source_store chunked, chain_id guard.
-Использовать `/contract` вместо `/bytecode`.
 
 ---
 
