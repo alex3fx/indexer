@@ -65,7 +65,7 @@ func main() {
 	mux.HandleFunc("/contract", auth(handleContract))
 	mux.HandleFunc("/verify",   auth(handleVerify))
 
-	log.Printf("bytecode-api v7 listening on %s", *listen)
+	log.Printf("bytecode-api v8 listening on %s", *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
@@ -106,8 +106,10 @@ func handleContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("[contract] addr=%s", addr)
 	deployed, creation, blockNum, blockTimestampMs, txHash, creator, contractFactory, err := resolveAddressV2(addr)
 	if err == gocql.ErrNotFound {
+		log.Printf("[contract] not found addr=%s", addr)
 		jsonError(w, "contract not found", http.StatusNotFound)
 		return
 	}
@@ -222,6 +224,8 @@ func handleSame(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("[same] addr=%s deployed_bytecode=%s creation_bytecode=%s limit=%d offset=%d",
+		addr, deployedHex, creationHex, limit, offset)
 
 	if creationHex != "" {
 		// Search by creation bytecode via addresses_by_creation_bytecode reverse index.
