@@ -329,8 +329,10 @@ curl -H "$KEY" -H "Content-Type: application/json" \
 - **Только ETH mainnet** (`chain_id=1`). Другие сети — 501.
 - **ABI хранится zlib-сжатым** в Scylla; API возвращает уже распакованный JSON.
 - **Source** принимается и возвращается как обычная строка (текст исходного кода).
-- **`creation_bytecode` в `/contract`** — отсутствует для контрактов, проиндексированных до v18
-  (2026-07-04): creation bytecode не сохранялся.
+- **`creation_bytecode` в `/contract`** — заполнен для всех контрактов (0 → HEAD).
+  Исторические данные восстановлены из архивной таблицы `contracts_by_addresses` инструментом
+  `backfill_creation_from_snap` (2026-07-06). Для ~0.03% контрактов, не попавших в архив
+  (CREATE2 re-deploys), значение может быть `null`.
 - **`/same` для популярных bytecode** (ERC-20 factory и т.п.) может вернуть тысячи адресов.
   Используйте пагинацию (`limit` / `offset`). `total` всегда показывает полное число.
 - **`/bytecode`** — удалён в v4. Использовать `/contract`.
