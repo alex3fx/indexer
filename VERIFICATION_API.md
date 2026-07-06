@@ -129,7 +129,7 @@ GET /contract?address=0x219e497a09202a3534f653e63faaeab6689c1d22
 | `programming_language` | string? | Язык программирования (только если верифицирован) |
 | `abi` | array? | ABI (только если верифицирован) |
 | `deployed_bytecode` | string? | Hex deployed bytecode (0x-prefix); может отсутствовать для пустого кода |
-| `creation_bytecode` | string? | Hex creation bytecode; `null` для контрактов до v18 индексера |
+| `creation_bytecode` | string? | Hex creation bytecode; `null` только для ~0.03% (reverted CREATE2 re-deploys) |
 | `source` | string? | Текст исходного кода (только если верифицирован) |
 
 **Ответ (404):** контракт не найден в индексе.
@@ -139,18 +139,14 @@ GET /contract?address=0x219e497a09202a3534f653e63faaeab6689c1d22
 ### `/same` — поиск клонов
 
 ```
-GET  /same?address=0x{addr}[&limit=N&offset=N]
-GET  /same?deployed_bytecode=0x{hex}[&limit=N&offset=N]
-GET  /same?creation_bytecode=0x{hex}[&limit=N&offset=N]
-POST /same
+QUERY /same
 ```
 
 Возвращает все адреса с тем же **deployed bytecode** (по умолчанию) или **creation bytecode**.
 При поиске по deployed_bytecode фильтрует CREATE2+selfdestruct редеплои: только адреса с **текущим** совпадающим кодом.
 
-> **Для watcher: используйте `POST /same` при поиске по bytecode.**
-> GET ограничен длиной URL (deployed bytecode до EIP-170 проходит, но POST надёжнее).
-> POST принимает тело до 4 MB.
+Метод QUERY семантически «безопасный» (не меняет состояние) и допускает тело запроса.
+Принимает тело до 4 MB.
 
 **Параметры пагинации:**
 
@@ -161,7 +157,7 @@ POST /same
 
 Адреса возвращаются в **отсортированном** порядке (стабильная пагинация).
 
-**POST-тело** (три варианта — передавать ровно один из них):
+**Тело запроса** (три варианта — передавать ровно один из них):
 
 ```json
 {"address": "0x219e497a09202a3534f653e63faaeab6689c1d22"}
@@ -182,7 +178,6 @@ POST /same
   "deployed_bytecode_hash": "0x38f9c201...",
   "deployed_bytecode_seq":  0,
   "total":   142,
-  "count":   100,
   "offset":  0,
   "limit":   100,
   "addresses": [
@@ -200,7 +195,6 @@ POST /same
   "creation_bytecode_hash": "0x7aef1200...",
   "creation_bytecode_seq":  0,
   "total":   15,
-  "count":   15,
   "offset":  0,
   "limit":   0,
   "addresses": [...]
@@ -208,7 +202,6 @@ POST /same
 ```
 
 - `total` — суммарное количество адресов (до пагинации)
-- `count` — количество адресов в текущей странице
 - `limit: 0` означает нет ограничения (все результаты)
 
 ---
@@ -227,7 +220,8 @@ POST /same
   "address":              "0x219e497a09202a3534f653e63faaeab6689c1d22",
   "abi":                  "[{\"name\":\"transfer\",\"type\":\"function\",...}]",
   "source":               "pragma solidity ^0.8.0;\n\ncontract Token {...}",
-  "programming_language": "solidity"
+  "programming_language": "solidity",
+  "verified_at":          1688400000000
 }
 ```
 
@@ -236,7 +230,8 @@ POST /same
 | `address` | string | да | Адрес контракта |
 | `abi` | string | да (если есть source) | ABI как JSON-строка (массив) |
 | `source` | string | да (если есть abi) | Текст исходного кода (Solidity, Vyper и т.п.) |
-| `programming_language` | string | нет | Язык: `"solidity"`, `"vyper"`, `"yul"` и т.п. |
+| `programming_language` | string | нет | Язык: `"solidity"`, `"vyper"`, `"yul"`, `"geas"`, `"unknown"` и т.п. |
+| `verified_at` | int (ms) | нет | Unix timestamp верификации в ms; если не передан — используется текущее время. Передавать при историческом импорте. |
 
 Правило: **abi и source либо оба, либо ни одного.** Иначе 400.
 
@@ -301,15 +296,19 @@ curl "$BASE/health"
 curl -H "$KEY" "$BASE/contract?address=0x219e497a09202a3534f653e63faaeab6689c1d22"
 
 # Найти все клоны по адресу (пагинация: первые 50)
-curl -H "$KEY" "$BASE/same?address=0x219e...&limit=50&offset=0"
-
-# Найти клоны по deployed bytecode (POST — надёжнее для длинного hex)
 curl -H "$KEY" -H "Content-Type: application/json" \
-  -X POST "$BASE/same" \
+  -X QUERY "$BASE/same" \
+  -d '{"address": "0x219e...", "limit": 50, "offset": 0}'
+
+# Найти клоны по deployed bytecode
+curl -H "$KEY" -H "Content-Type: application/json" \
+  -X QUERY "$BASE/same" \
   -d '{"deployed_bytecode": "0x6080604052...", "limit": 100}'
 
 # Найти клоны по creation bytecode
-curl -H "$KEY" "$BASE/same?creation_bytecode=0x6080..."
+curl -H "$KEY" -H "Content-Type: application/json" \
+  -X QUERY "$BASE/same" \
+  -d '{"creation_bytecode": "0x6080..."}'
 
 # Верифицировать контракт
 curl -H "$KEY" -H "Content-Type: application/json" \

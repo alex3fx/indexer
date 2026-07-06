@@ -12,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,7 +65,7 @@ func main() {
 	mux.HandleFunc("/contract", auth(handleContract))
 	mux.HandleFunc("/verify",   auth(handleVerify))
 
-	log.Printf("bytecode-api v6 listening on %s", *listen)
+	log.Printf("bytecode-api v7 listening on %s", *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
@@ -207,13 +206,14 @@ func handleContract(w http.ResponseWriter, r *http.Request) {
 
 // ─── /same ───────────────────────────────────────────────────────────────────
 
-// GET  /same?address=0x...&limit=N&offset=N       → all contracts with same deployed bytecode
-// GET  /same?deployed_bytecode=0x...&limit=N      → same, provide raw deployed (runtime) bytecode hex
-// GET  /same?creation_bytecode=0x...&limit=N      → contracts with same creation bytecode
-// POST /same  body: {"address":"0x..."} or {"deployed_bytecode":"..."} or {"creation_bytecode":"..."}
+// QUERY /same  body: {"address":"0x..."} or {"deployed_bytecode":"..."} or {"creation_bytecode":"...","limit":N,"offset":N}
 //
 // Pagination: limit=0 means no limit (return all). Addresses sorted for stable pagination.
 func handleSame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "QUERY" {
+		jsonError(w, "QUERY method required", http.StatusMethodNotAllowed)
+		return
+	}
 	if !checkChainID(w, r) {
 		return
 	}
@@ -246,7 +246,6 @@ func handleSame(w http.ResponseWriter, r *http.Request) {
 			"creation_bytecode_hash": "0x" + hex.EncodeToString(id.hash[:]),
 			"creation_bytecode_seq":  id.seq,
 			"total":     total,
-			"count":     len(addresses),
 			"offset":    offset,
 			"limit":     limit,
 			"addresses": addresses,
@@ -292,7 +291,6 @@ func handleSame(w http.ResponseWriter, r *http.Request) {
 		"deployed_bytecode_hash": "0x" + hex.EncodeToString(id.hash[:]),
 		"deployed_bytecode_seq":  id.seq,
 		"total":     total,
-		"count":     len(addresses),
 		"offset":    offset,
 		"limit":     limit,
 		"addresses": addresses,
@@ -395,8 +393,9 @@ func filterCurrentBytecode(addrs []string, want bytecodeID) []string {
 // ─── /verify ─────────────────────────────────────────────────────────────────
 
 // POST /verify
-// Body: {"address":"0x...", "abi":"[...]", "source":"<solidity source text>", "programming_language":"solidity"}
+// Body: {"address":"0x...", "abi":"[...]", "source":"<solidity source text>", "programming_language":"solidity", "verified_at":1234567890000}
 // ABI and source must be provided together.
+// verified_at: optional Unix ms timestamp (use for historical imports; defaults to now).
 // Marks the bytecode as verified, stores ABI + source, returns clone addresses.
 func handleVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -412,6 +411,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		ABI                 string `json:"abi"`
 		Source              string `json:"source"` // plain text source code
 		ProgrammingLanguage string `json:"programming_language"`
+		VerifiedAt          *int64 `json:"verified_at"` // optional Unix ms; defaults to now
 	}
 	if err := decodeJSONBody(r, &body); err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
@@ -493,17 +493,20 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	now := time.Now()
+	verifiedAt := time.Now()
+	if body.VerifiedAt != nil {
+		verifiedAt = time.UnixMilli(*body.VerifiedAt)
+	}
 	err = session.Query(
 		`UPDATE bytecode_store_v2 SET verified = true, verified_at = ?, verified_via_address = ?, abi = ?, source_ref = ?, programming_language = ? WHERE hash = ? AND seq = ?`,
-		now, addr, abiBlob, sourceRef, body.ProgrammingLanguage, deployed.hash[:], deployed.seq,
+		verifiedAt, addr, abiBlob, sourceRef, body.ProgrammingLanguage, deployed.hash[:], deployed.seq,
 	).Exec()
 	if err != nil {
 		jsonError(w, fmt.Sprintf("update error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[verify] verified bytecode hash=%x seq=%d via addr=%s lang=%s", deployed.hash, deployed.seq, addr, body.ProgrammingLanguage)
+	log.Printf("[verify] verified bytecode hash=%x seq=%d via addr=%s lang=%s verified_at=%d", deployed.hash, deployed.seq, addr, body.ProgrammingLanguage, verifiedAt.UnixMilli())
 
 	addresses, err := fetchAllAddresses(deployed)
 	if err != nil {
@@ -517,7 +520,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		"status":                 "verified",
 		"deployed_bytecode_hash": "0x" + hex.EncodeToString(deployed.hash[:]),
 		"deployed_bytecode_seq":  deployed.seq,
-		"verified_at":            now.UnixMilli(),
+		"verified_at":            verifiedAt.UnixMilli(),
 		"address_count":          len(addresses),
 		"addresses":              addresses,
 	})
@@ -652,37 +655,21 @@ func parseAddressParam(r *http.Request) (string, error) {
 }
 
 func parseSameParams(r *http.Request) (addr, deployedHex, creationHex string, limit, offset int, err error) {
-	if r.Method == http.MethodGet {
-		addr = normalizeAddr(r.URL.Query().Get("address"))
-		deployedHex = r.URL.Query().Get("deployed_bytecode")
-		creationHex = r.URL.Query().Get("creation_bytecode")
-		if s := r.URL.Query().Get("limit"); s != "" {
-			if n, e := strconv.Atoi(s); e == nil && n >= 0 {
-				limit = n
-			}
-		}
-		if s := r.URL.Query().Get("offset"); s != "" {
-			if n, e := strconv.Atoi(s); e == nil && n >= 0 {
-				offset = n
-			}
-		}
-	} else {
-		var body struct {
-			Address          string `json:"address"`
-			DeployedBytecode string `json:"deployed_bytecode"`
-			CreationBytecode string `json:"creation_bytecode"`
-			Limit            int    `json:"limit"`
-			Offset           int    `json:"offset"`
-		}
-		if err = decodeJSONBody(r, &body); err != nil {
-			return
-		}
-		addr = normalizeAddr(body.Address)
-		deployedHex = body.DeployedBytecode
-		creationHex = body.CreationBytecode
-		limit = body.Limit
-		offset = body.Offset
+	var body struct {
+		Address          string `json:"address"`
+		DeployedBytecode string `json:"deployed_bytecode"`
+		CreationBytecode string `json:"creation_bytecode"`
+		Limit            int    `json:"limit"`
+		Offset           int    `json:"offset"`
 	}
+	if err = decodeJSONBody(r, &body); err != nil {
+		return
+	}
+	addr = normalizeAddr(body.Address)
+	deployedHex = body.DeployedBytecode
+	creationHex = body.CreationBytecode
+	limit = body.Limit
+	offset = body.Offset
 
 	set := 0
 	if addr != "" { set++ }
