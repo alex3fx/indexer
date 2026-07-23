@@ -3,6 +3,8 @@
 
 pub const RpcBlock = struct {
     number: []const u8 = "",
+    hash: []const u8 = "",
+    parentHash: []const u8 = "",
     timestamp: []const u8 = "",
     milliTimestamp: ?[]const u8 = null,
     miner: []const u8 = "",
@@ -52,6 +54,12 @@ pub const RpcTrace = struct {
     type: []const u8 = "",
     action: RpcAction = .{},
     result: ?RpcResult = null,
+    // "error" field from Parity trace_block — non-null when this sub-call reverted
+    // (e.g. "Reverted", "Out of gas"). Named traceErr to avoid Zig keyword collision.
+    traceErr: ?[]const u8 = null,
+    // Position in the call tree, e.g. [1,2,8,3] for a 4th-level sub-call.
+    // Empty slice for top-level calls (traceAddress: []).
+    traceAddress: []i32 = &.{},
 };
 
 pub const RpcAction = struct {

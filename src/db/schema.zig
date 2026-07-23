@@ -7,6 +7,23 @@ pub const BlockRow = struct {
     timestampS: i64,
     timestampMs: i64,
     miner: []const u8,
+    blockHash: []const u8,
+};
+
+pub const ForkedBlockRow = struct {
+    blockNumber: i64,
+    blockHash: []const u8,
+    miner: []const u8,
+    blockTimestamp: i64,
+    era: []const u8,
+    depth: i32,
+    reorgGroupId: []const u8,
+    affectedTxnsOrphan: i32,
+    affectedTxnsLost: i32,
+    affectedLogsOrphan: i32,
+    affectedLogsLost: i32,
+    affectedTracesOrphan: i32,
+    affectedTracesLost: i32,
 };
 
 pub const TxRow = struct {

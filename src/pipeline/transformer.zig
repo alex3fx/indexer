@@ -238,6 +238,7 @@ pub fn transformBlockWithRemap(
         .timestampS = timestampS,
         .timestampMs = timestampMs,
         .miner = li(block.miner),
+        .blockHash = li(block.hash),
     });
 
     var txByHash = std.StringHashMap(usize).init(arena);
@@ -307,6 +308,22 @@ pub fn transformBlockWithRemap(
         }
     }
 
+    // Pre-pass: collect traceAddresses of sub-calls that reverted.
+    // Used below to detect inner-phantom CREATE frames: a CREATE that has result.address
+    // but whose parent sub-call (ancestor in traceAddress tree) reverted — the EVM rolls
+    // back all state changes in that subtree, so the contract was never actually deployed.
+    var revertedBuf: [512][]i32 = undefined;
+    var revertedCount: usize = 0;
+    for (traces) |t| {
+        if (t.traceErr != null and t.traceErr.?.len > 0 and t.traceAddress.len > 0) {
+            if (revertedCount < revertedBuf.len) {
+                revertedBuf[revertedCount] = t.traceAddress;
+                revertedCount += 1;
+            }
+        }
+    }
+    const revertedAddrs = revertedBuf[0..revertedCount];
+
     for (traces, 0..) |trace, traceIdx| {
         const txIdxOpt: ?usize = if (trace.transactionPosition) |pos|
             if (pos >= 0 and pos < @as(i32, @intCast(maxK))) txBase + @as(usize, @intCast(pos)) else null
@@ -358,6 +375,22 @@ pub fn transformBlockWithRemap(
 
         if (trace.result) |res| {
             if (res.address) |contractAddr| {
+                // Erigon returns result.address for CREATE frames even when the outer tx
+                // reverts. Skip — the contract was never deployed on mainnet (state rolled back).
+                // Pre-Byzantium blocks: Erigon synthesizes status=0x1 for all txs, so safe.
+                if (txRow.status == 0) continue;
+                // Inner-phantom: outer tx succeeded (status=1) but a parent sub-call in the
+                // trace tree reverted, rolling back the CREATE's state changes. Erigon still
+                // emits result.address for the CREATE frame, but eth_getCode returns 0x.
+                // Detected by checking if any ancestor traceAddress has traceErr set.
+                const inner_phantom = for (revertedAddrs) |rev| {
+                    if (rev.len < trace.traceAddress.len and
+                        std.mem.eql(i32, rev, trace.traceAddress[0..rev.len]))
+                    {
+                        break true;
+                    }
+                } else false;
+                if (inner_phantom) continue;
                 const addrLower = li(contractAddr);
                 const creator = txRow.fromAddress;
                 const factory = if (std.mem.eql(u8, creator, fromAddr)) "" else fromAddr;

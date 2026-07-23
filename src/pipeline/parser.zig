@@ -196,6 +196,10 @@ fn parseBlockObj(p: *P, arena: Al, comptime zc: bool) !RpcBlock {
         _ = p.eat(':');
         if (eql(key, "number")) {
             blk.number = try S(p, arena, zc);
+        } else if (eql(key, "hash")) {
+            blk.hash = try S(p, arena, zc);
+        } else if (eql(key, "parentHash")) {
+            blk.parentHash = try S(p, arena, zc);
         } else if (eql(key, "timestamp")) {
             blk.timestamp = try S(p, arena, zc);
         } else if (eql(key, "miner")) {
@@ -526,11 +530,35 @@ fn parseTrace(p: *P, arena: Al, comptime zc: bool) !RpcTrace {
             } else {
                 trace.result = try parseResult(p, arena, zc);
             }
+        } else if (eql(key, "error")) {
+            trace.traceErr = try OS(p, arena, zc);
+        } else if (eql(key, "traceAddress")) {
+            trace.traceAddress = try parseIntArray(p, arena);
         } else {
             p.skip();
         }
     }
     return trace;
+}
+
+fn parseIntArray(p: *P, arena: Al) ![]i32 {
+    if (!p.eat('[')) return &.{};
+    var list: std.ArrayList(i32) = .empty;
+    while (p.i < p.s.len) {
+        p.ws();
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+            break;
+        }
+        if (p.s[p.i] == ',') {
+            p.i += 1;
+            continue;
+        }
+        const s = p.str();
+        const v = std.fmt.parseInt(i32, s, 10) catch 0;
+        try list.append(arena, v);
+    }
+    return try list.toOwnedSlice(arena);
 }
 
 fn parseAction(p: *P, arena: Al, comptime zc: bool) !RpcAction {

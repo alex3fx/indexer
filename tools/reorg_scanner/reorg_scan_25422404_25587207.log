@@ -1,0 +1,34 @@
+=== reorg_scanner from=25422404 to=25587207 workers=16 ===
+started: 2026-07-22T08:54:21Z
+
+chunks: 360
+
+
+=== REORGS DETECTED (17) ===
+REORG  blk=25437746    method=tx  bc_tx=85  canon_tx=85  orphan_only=92  canonical_hash=0xaaae6fbf8281ba276869232111d34e9d6e12411031a0ce7521dc4c11d451f770
+REORG  blk=25438292    method=tx  bc_tx=114  canon_tx=114  orphan_only=244  canonical_hash=0x2c8b0324973bd1e87213429237a1f30a9aeb9d27bb3a01b5d64d6f159ec2fc3e
+REORG  blk=25443896    method=tx  bc_tx=170  canon_tx=170  orphan_only=16  canonical_hash=0x8d2460b4fc844a74a6240034169cc67fab30510affd5f25b701ec6ce22629962
+REORG  blk=25453411    method=tx  bc_tx=169  canon_tx=169  orphan_only=16  canonical_hash=0xe237bb2efe4ad13cd46e19b60b49b9f023155dbb98dc99eaae200c5758ff801a
+REORG  blk=25455458    method=tx  bc_tx=41  canon_tx=41  orphan_only=123  canonical_hash=0x49f95d8bcca2c957d569df3e82f3588f8de68357a8d1a722409edd34e1f6e0ef
+REORG  blk=25457675    method=tx  bc_tx=187  canon_tx=187  orphan_only=23  canonical_hash=0x3d9c37292f268240d898e23c0695614af676ac5a84b848ba7877300f32cea33d
+REORG  blk=25459357    method=tx  bc_tx=179  canon_tx=179  orphan_only=370  canonical_hash=0xbcf9edfde30adfeb7635b5fdac7496835ed86a996f95a07767dc16ae2f5983b3
+REORG  blk=25459563    method=tx  bc_tx=47  canon_tx=47  orphan_only=105  canonical_hash=0xaadb060866413a43d8e36440ba4add46f3eba937a07f58980f4f3e37041f5341
+REORG  blk=25463126    method=tx  bc_tx=172  canon_tx=172  orphan_only=265  canonical_hash=0xf1fa05a1255ad3c4afe578ea6370825e50c99dddc7f63bab3312a921167450bb
+REORG  blk=25464942    method=tx  bc_tx=222  canon_tx=222  orphan_only=105  canonical_hash=0x9a56c3e16b2d5b17484aa656e2d67a70754e53b44c9c7bc26a067c18699b144b
+REORG  blk=25581374    method=hash  stored_hash=0x75ba06105771717eae9297612dfed496bba8ae325cbede6990e4f36771e0c700  canonical_hash=0x2c88c707f87adb62d2f4ff2f4eb27394c64af460e64d9177f34a5bd6b4794e8d
+REORG  blk=25583383    method=hash  stored_hash=0xcc6d9cb61e2d27ce0b77057e39d3ca01f08e585576e50c55f515d04e2194fe4c  canonical_hash=0x7d377dcf659c00ca2c054f0dc2f12b952e4d636192ac6ee29240c9d6cc65516e
+REORG  blk=25583534    method=hash  stored_hash=0x0ac29ee2dc77cacc962ce3bd7eb0e4c5b53f82cb983047635cb7ffc545f6feb2  canonical_hash=0x4588c4669f3a0cfa81d20ca2abbfefd44cc641e475dac2664bdc336d102873aa
+REORG  blk=25585170    method=hash  stored_hash=0xbcf9a3c250c3a87632f273bca0768bcff8ffedf6b0a1708deb1740bd440f349a  canonical_hash=0x453688ea7cb3757107b098fb408c9f9a9e3f6894123f9369d6071ea3822f4033
+REORG  blk=25585201    method=hash  stored_hash=0x5c75be7f6b04a9b06f8abb1de54cf9b0c0952f7e7999917f596deb433ba6da08  canonical_hash=0x0a0b1b66918c3e0b88de63262abbb97576d3172c7f631e4eb8256ec5f8400eb3
+REORG  blk=25585231    method=hash  stored_hash=0xec86cf95acf974cefa1b3a3cafe019d3f4343ed8d9de77bd5aa433fd6aaa8d76  canonical_hash=0x286ec46921800455c78a91ce2d0f8124b3d8e5a6356f481da67770395cbb48f7
+REORG  blk=25586892    method=hash  stored_hash=0xaae410a835fa88432e6af4bd45c717b0a3b0dab8d2009d206f2de3cc8b7dc494  canonical_hash=0x06fc1029c09a99b3fb4e416e400f3429ad37f6ab92fdae344bd5736ff47136cc
+
+=== SUMMARY ===
+range:         25422404 – 25587207
+blocks_scanned: 164804
+reorgs_found:  17
+  method=hash: 7  (v22 blocks: block_hash stored → hash mismatch)
+  method=tx:   10  (v21 blocks: no block_hash → tx set mismatch)
+errors:        0
+log:           /home/alexey_smolyakov/reorg_scan.log
+finished:      2026-07-22T08:55:37Z

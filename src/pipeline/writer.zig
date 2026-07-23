@@ -37,6 +37,8 @@ pub const BlockMetrics = struct {
     save_ms: f64,
     total_ms: f64, // TTP: fetch + parse + transform + save + cursor
     kb_total: usize,
+    blockHash: [66]u8,
+    parentHash: [66]u8,
 };
 
 pub const ProcessBlockStatus = union(enum) {
@@ -126,6 +128,13 @@ pub fn processBlock(
     else
         0;
 
+    var blockHashBuf: [66]u8 = std.mem.zeroes([66]u8);
+    if (result.ent.blocks.items.len > 0) {
+        const bh = result.ent.blocks.items[0].blockHash;
+        const n = @min(bh.len, 66);
+        @memcpy(blockHashBuf[0..n], bh[0..n]);
+    }
+
     return .{ .saved = .{
         .distance_ms = distance_ms,
         .fetch_ms = fetch_ms,
@@ -134,5 +143,7 @@ pub fn processBlock(
         .save_ms = save_ms,
         .total_ms = total_ms,
         .kb_total = kb_blk + kb_rcpt + kb_trc,
+        .blockHash = blockHashBuf,
+        .parentHash = result.parentHash,
     } };
 }

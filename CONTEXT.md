@@ -49,10 +49,10 @@ scp -i ~/.ssh/id_ed25519 .zig/build/bin/raw alexey_smolyakov@100.64.0.4:~/raw_er
 # Realtime — запустить через run_eth60_realtime.sh (уже содержит все env-переменные)
 ssh -i ~/.ssh/id_ed25519 alexey_smolyakov@100.64.0.4 \
   "tmux new-session -d -s eth60 '~/run_eth60_realtime.sh'"
-# Текущий бинарь: ~/raw_erc20_v18
-# Следующий деплой: ~/raw_erc20_v19, v20, ...
-# Скрипт содержит while-loop auto-restart (добавлено 2026-07-04)
-# Лог: ~/eth_index_60.log
+# Текущий бинарь: ~/raw_erc20_v21 (2026-07-16: BC верификация интегрирована)
+# Следующий деплой: ~/raw_erc20_v22, ...
+# Скрипт: ~/run_eth60_v21.sh (while-loop auto-restart)
+# Лог: ~/eth_index_60_v21.log
 ```
 
 ### Запуск (через временный скрипт)
@@ -310,6 +310,7 @@ Zig-индексер (`processOneContract` → `applyPendingVerification`) пр�
 
 | Файл | Содержание |
 |------|-----------|
+| `REORGS.md` | Анализ реоргов: механизм, 17 найденных блоков, diff vs Dune, план cleanup |
 | `VERIFICATION_API.md` | Watcher integration: все endpoints, chain_id, pending-flow, curl-примеры |
 | `docs/FULLCHAIN_PREP.md` | Воркер-каунт, оценки времени, диск, чеклист, валидация |
 | `docs/ERC20_BENCHMARK.md` | Детальные бенчмарки ERC-20 (burst/sustained, по зонам цепи) |

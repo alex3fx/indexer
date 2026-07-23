@@ -181,6 +181,193 @@ scp backfill_deployed_bytecode_v1 alexey_smolyakov@100.64.0.4:~/backfill_deploye
 
 ---
 
+## `count_ghost_rows/` — count null tx_hash rows in contracts_by_address_v2 (2026-07-07)
+
+Считает ghost-строки (reverted CREATE2 из snap-таблицы) — строки с `tx_hash = null`.
+CQL не поддерживает фильтрацию по NULL, поэтому полный параллельный скан по 256 токен-сегментам.
+
+**Зачем:** Наша БД содержит ~1,039,573 лишних строк vs Etherscan. Инструмент считает точное число.
+После — нужен отдельный инструмент для удаления ghost-строк.
+
+```bash
+cd tools/count_ghost_rows
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o count_ghost_rows .
+scp count_ghost_rows alexey_smolyakov@100.64.0.4:~/count_ghost_rows
+
+# Run (фоново, ~1 час):
+nohup ~/count_ghost_rows --host 127.0.0.1 --pass cassandra --segments 256 --page-size 2000 \
+  >> ~/count_ghost_rows.log 2>&1 &
+tail -f ~/count_ghost_rows.log
+```
+
+**Status:** завершён 2026-07-07 10:48 на 100.64.0.4, 27m12s, 0 ошибок.
+**Результат:** ghost=102,640 / success=102,759,056 / total=102,861,696
+Лог: `~/count_ghost_rows.log`.
+
+---
+
+## `check_tx_status/` — проверка статуса tx для контрактов (2026-07-07)
+
+Выбирает N контрактов из каждого token-сегмента, для каждого смотрит статус транзакции
+в таблице `transactions`. Проверяет гипотезу о контрактах из failed-транзакций.
+
+```bash
+cd tools/check_tx_status
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o check_tx_status .
+scp check_tx_status alexey_smolyakov@100.64.0.4:~/check_tx_status
+
+~/check_tx_status --host 127.0.0.1 --pass cassandra --segments 64 --per-seg 300
+```
+
+**Status:** запущен 2026-07-07, 64×300=9900 контрактов.
+**Результат:** 0.26% контрактов из failed-tx (status=0), 26 примеров с адресами.
+
+---
+
+## `count_distinct_addrs/` — count unique contract addresses (2026-07-07)
+
+Считает DISTINCT адреса (уникальные партиции) в `contracts_by_address_v2` через
+`SELECT DISTINCT address`. Отличается от `count_ghost_rows` который считает строки —
+нужен для понимания: сколько у нас уникальных адресов vs Etherscan.
+
+```bash
+cd tools/count_distinct_addrs
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o count_distinct_addrs .
+scp count_distinct_addrs alexey_smolyakov@100.64.0.4:~/count_distinct_addrs
+
+nohup ~/count_distinct_addrs --host 127.0.0.1 --pass cassandra --segments 256 --page-size 2000 \
+  >> ~/count_distinct_addrs.log 2>&1 &
+```
+
+**Status:** завершён 2026-07-07, 26m46s, 0 ошибок.
+**Результат:** 101,959,039 уникальных адресов (Etherscan: 101,821,894, разница: +137,145).
+Лог: `~/count_distinct_addrs.log`.
+
+---
+
+## `delete_phantom_ghost/` — delete phantom and ghost rows from contracts_by_address_v2 (2026-07-13)
+
+Удаляет:
+- **Phantom rows** — все строки для адресов из `--phantom-file` (вывод `find_phantom_addrs`)
+- **Ghost rows** — строки с `tx_hash=null` (full token-range scan, 256 сегментов)
+
+По умолчанию `--dry-run=true` — выводит что будет удалено без реального удаления.
+Все удаления — с retry+backoff (5 попыток). На ошибку после 5 попыток: логирует (не замалчивает).
+
+```bash
+# Build:
+cd tools/delete_phantom_ghost
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o delete_phantom_ghost .
+scp delete_phantom_ghost alexey_smolyakov@100.64.0.4:~/delete_phantom_ghost
+
+# Dry run (безопасно, логирует что будет удалено):
+~/delete_phantom_ghost --pass=cassandra \
+  --phantom-file=~/phantom_addresses.txt \
+  --segments=256 --dry-run=true
+
+# Live run (реальное удаление):
+nohup ~/delete_phantom_ghost --pass=cassandra \
+  --phantom-file=~/phantom_addresses.txt \
+  --segments=256 --dry-run=false \
+  >> ~/delete_phantom_ghost.log 2>&1 &
+tail -f ~/delete_phantom_ghost.log
+```
+
+**Status:** DONE 2026-07-13. Удалено: phantom=167,164 строк, ghost=102,640 строк, errors=0.
+Бинарь `~/delete_phantom_ghost` на 100.64.0.4.
+
+---
+
+## `find_phantom_addrs/` — classify unique addresses as real/phantom/ghost-only (2026-07-07)
+
+Полный скан `contracts_by_address_v2` по 256 token-сегментам. Для каждого уникального адреса
+смотрит статус транзакции из нашей таблицы `eth.transactions` (без запросов к ноде, без Etherscan).
+
+Классификация:
+- **real** — хотя бы одна транзакция-деплой имеет `status=1` (реальный контракт на мейннете)
+- **phantom** — все строки с `tx_hash` имеют `status=0` (deployed из failed-tx, на мейннете нет)
+- **ghost-only** — все строки `tx_hash=null` (reverted CREATE2 snap-записи без tx)
+
+Phantom и ghost-only адреса пишутся в выходной файл. Инструмент для независимой проверки —
+даёт честный count из нашей БД, не из сравнения с Etherscan.
+
+```bash
+cd tools/find_phantom_addrs
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o find_phantom_addrs .
+scp find_phantom_addrs alexey_smolyakov@100.64.0.4:~/find_phantom_addrs
+
+# Quick sanity test (4 segments):
+~/find_phantom_addrs --host 127.0.0.1 --pass 'pass' --segments 4 --page-size 200 --out /tmp/phantom_test.txt
+
+# Full run (~60-90 min):
+nohup ~/find_phantom_addrs --host 127.0.0.1 --pass 'pass' \
+  --segments 256 --page-size 1000 --out ~/phantom_addresses.txt \
+  > ~/find_phantom.log 2>&1 &
+tail -f ~/find_phantom.log
+```
+
+Output file format: `address\tphantom\tblock_number\ttx_hash` или `address\tghost-only`
+Progress logs every 30s. Errors in tx lookup → treated as real (never false-phantom).
+
+**v1 Status:** завершён 2026-07-07 → 2026-07-08 (30h25m). Результат: 112,560 phantom адресов, 167,164 строк.
+Лог: `~/find_phantom.log`. Вывод: `~/phantom_addresses.txt`.
+**БАГ в v1:** при первой реальной строке адреса (status=1) — `break`, фантомные строки того же адреса (status=0) не записывались. CREATE2-редеплои (failed attempt → successful deployment, один адрес, разные block_number) — фантомные строки выжили.
+
+**ФИКС v2 (2026-07-18):** `break` → `continue` в `classifyAddress`. Phantom-строки всегда пишутся, даже если адрес имеет реальные строки. Бинарь: `find_phantom_addrs_v2`.
+
+```bash
+# Build v2:
+cd tools/find_phantom_addrs
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o find_phantom_addrs_v2 .
+scp find_phantom_addrs_v2 alexey_smolyakov@100.64.0.4:~/find_phantom_addrs_v2
+
+# Full run:
+nohup ~/find_phantom_addrs_v2 --pass=cassandra \
+  --segments=256 --page-size=1000 --out=/home/alexey_smolyakov/phantom_v2.txt \
+  > /home/alexey_smolyakov/find_phantom_v2.log 2>&1 &
+tail -f /home/alexey_smolyakov/find_phantom_v2.log
+```
+
+**v2 Status:** запущен 2026-07-18 15:14, PID=242853. ~102M строк, ожидаемый результат ~225k phantom строк (missed-redeployment phantoms).
+
+---
+
+## `check_gap_phantoms/` — удаление phantom строк из gap-периода (2026-07-14)
+
+Проверяет и удаляет phantom строки, попавшие в `contracts_by_address_v2` за период когда
+v19 (без фикса трансформера) работал после чистки базы (2026-07-13) до деплоя v20 (2026-07-14).
+Блоки 25,459,261–25,525,803.
+
+**Стратегия:**
+- Phase 1: собирает хэши failed-tx из chunk-партиционированной таблицы `transactions` (168 чанков, быстро)
+- Phase 2: полный token-range scan `contracts_by_address_v2` (256 сегментов, ~3 мин), фильтр по block_number и tx_hash
+
+```bash
+# Build:
+cd tools/check_gap_phantoms
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o check_gap_phantoms .
+scp check_gap_phantoms alexey_smolyakov@100.64.0.4:~/check_gap_phantoms
+
+# Dry run:
+~/check_gap_phantoms --pass=cassandra --dry-run=true
+
+# Live run:
+~/check_gap_phantoms --pass=cassandra --dry-run=false
+```
+
+**Status:** DONE 2026-07-14. 614 phantom строк найдено и удалено, errors=0.
+Бинарь `~/check_gap_phantoms` на 100.64.0.4.
+Логи: `~/check_gap_phantoms.log` (dry-run), `~/check_gap_phantoms_live.log` (live).
+
+---
+
 ## `bytecode_api/` — HTTP service: bytecode lookup, clone-search, verification (active, v7)
 
 Go HTTP service для интеграции с watcher. Читает из v2-таблиц (`contracts_by_address_v2`,
@@ -574,3 +761,328 @@ scp backfill_creation_from_snap alexey_smolyakov@100.64.0.4:~/backfill_creation_
 export SCYLLA_DB_PASSWORD='...'
 ./backfill_spans.sh <node_id> <rpc_url> <spans_file> <log_file> [fetch_workers=8] [span_timeout=3600]
 ```
+
+---
+
+## `count_rows_fast/` — count total rows in contracts_by_address_v2 (2026-07-14)
+
+Считает общее число строк через `SELECT COUNT(*)` по 256 токен-сегментам с bounded pool 16 воркеров.
+Обходит зависание `SELECT DISTINCT` с 104 SSTable через серверное агрегирование.
+Даёт события деплоя (не уникальные адреса): unique ≈ total - ~330k редеплоев.
+
+```bash
+cd tools/count_rows_fast
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o count_rows_fast .
+scp count_rows_fast alexey_smolyakov@100.64.0.4:~/count_rows_fast
+
+~/count_rows_fast --pass=cassandra --segments=256 --workers=16
+```
+
+**Status:** DONE 2026-07-14, бинарь `~/count_rows_fast` на 100.64.0.4.
+**Результат:** total=103,021,077 строк, errors=0, elapsed=69.6s.
+
+---
+
+## `count_creates_by_block/` — count rows in contracts_by_address_v2 filtered by block range (2026-07-18)
+
+Считает строки в `contracts_by_address_v2` с фильтром по `block_number` через token-range сегменты + ALLOW FILTERING.
+Используется для разбивки total rows на до/после Byzantium (block 4,370,000) для сравнения с Dune `ethereum.traces type='create'`.
+
+```bash
+cd tools/count_creates_by_block
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o count_creates_by_block .
+scp count_creates_by_block alexey_smolyakov@100.64.0.4:~/count_creates_by_block
+
+# Pre-Byzantium (blocks 0 – 4,369,999):
+~/count_creates_by_block --pass=cassandra --segments=256 --workers=16 --block-lo=0 --block-hi=4369999
+```
+
+**Status:** DONE 2026-07-18, бинарь `~/count_creates_by_block` на 100.64.0.4.
+**Результат (pre-Byz):** 2,103,120 строк, errors=0, elapsed=82.2s.
+**Примечание:** post-Byz run (4370000–25559944) через ALLOW FILTERING не проходит за 180s — 86 сегментов таймаутятся.
+Вместо этого post-Byz = total (103,209,367) − pre-Byz (2,103,120) = 101,106,247.
+
+---
+
+## `count_distinct_addrs_v3/` — count unique addresses via sequential scan (2026-07-14)
+
+Считает уникальные адреса через итерирование всех строк (как COUNT(*), но с подсчётом смен адреса).
+Более медленный аналог count_rows_fast, но возвращает точное число уникальных партиций.
+`GROUP BY address` с timeout 120s не работает при 104 SSTable — только sequential scan.
+
+```bash
+cd tools/count_distinct_addrs_v3
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o count_distinct_addrs_v3 .
+scp count_distinct_addrs_v3 alexey_smolyakov@100.64.0.4:~/count_distinct_addrs_v3
+
+~/count_distinct_addrs_v3 --pass=cassandra --segments=256 --workers=16
+```
+
+**Status:** DONE 2026-07-14, бинарь `~/count_distinct_addrs_v3` на 100.64.0.4.
+**Результат:** unique=102,274,193 адреса, errors=0, elapsed=290.5s.
+
+---
+
+## `erc20_stats/` — статистика по erc20_tokens: классификация + метод-флаги + комбинации (2026-07-14)
+
+Один проход по `eth.erc20_tokens`, считает в памяти:
+- distribution по `is_fully/partially/minimally/not_following_standard`
+- per-flag true/false/null для 5 method-флагов + `is_standard_decimals`
+- все 32 комбинации method-флагов (5-bit паттерн) для partial-токенов и для всех токенов
+
+```bash
+cd tools/erc20_stats
+GOPATH=/home/alex/go GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o erc20_stats .
+scp erc20_stats alexey_smolyakov@100.64.0.4:~/erc20_stats
+
+~/erc20_stats --pass=cassandra
+```
+
+**Status:** DONE 2026-07-14, бинарь `~/erc20_stats` на 100.64.0.4, 97.6s, 0 ошибок.
+**Результат:** total=4,149,594 / fully=360,579 (8.69%) / partially=3,789,015 (91.31%).
+Топ partial-комбинации: 11000 (balanceOf+transfer, 65.3%), 01000 (transfer only, 27.6%), 11111 (all 5, 9.9%).
+
+---
+
+## `count_rows_checkpoint/` — count rows in chunk-partitioned tables up to checkpoint (2026-07-14)
+
+Считает строки в таблицах blocks, transactions, logs, internal_transactions через `SELECT COUNT(*)` 
+per chunk с фильтром `block_number <= checkpoint`. Итерирует все 51072 chunks (eras 0-2127, lanes 0-23).
+16 воркеров (64 вызывали cascading timeouts). 5 ретраев на chunk.
+Blocks используют колонку `number`, остальные — `block_number`.
+
+```bash
+cd tools/count_rows_checkpoint
+/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o count_checkpoint .
+scp count_checkpoint alexey_smolyakov@100.64.0.4:~/count_checkpoint
+
+~/count_rows_checkpoint --pass=cassandra --checkpoint=25531491 --workers=16 > ~/count_checkpoint.log 2>&1 &
+```
+
+**Status:** DONE 2026-07-14/15 (два прогона, PID 1993231 на 100.64.0.4).
+**Результаты @ checkpoint=25531491:**
+- blocks: 25,531,492 rows, 0 errors, 77s
+- transactions: 3,601,596,013 rows, 0 errors, ~52min
+- logs: 7,095,672,307 rows, **56 errors** (недооценка ~33.7M строк — см. find_logs_gap), ~90min
+- internal_transactions: 16,266,473,447 rows, **761 errors** (значительная недооценка near-head), 6h8m
+
+**Интерпретация errors:** При 56 ошибках на logs (~600k строк/чанк × 56 ≈ 33M недосчитано).
+При 761 ошибке на internal_transactions — реальное число выше 16.27B. Счёт ненадёжен, нужен повтор.
+
+---
+
+## `sum_block_completions/` — sum tx/log/itx counts from block_completions (2026-07-15)
+
+Суммирует `tx_count`, `log_count`, `itx_count` из таблицы `block_completions` по всем chunks
+до checkpoint. Быстрая верификация: block_completions записывает сколько строк трансформер
+передал на запись — если отличается от фактического числа строк в таблице, значит были потери.
+
+```bash
+cd tools/sum_block_completions
+/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o sum_block_completions .
+scp sum_block_completions alexey_smolyakov@100.64.0.4:~/sum_block_completions
+
+~/sum_block_completions --pass=cassandra --checkpoint=25531491 --workers=16
+```
+
+**Status:** DONE 2026-07-15, 65s, 0 ошибок.
+**Результаты @ checkpoint=25531491:**
+- tx_count sum:  3,600,832,918
+- log_count sum: 7,137,137,737
+- itx_count sum: 17,232,935,546
+
+**Интерпретация:** `itx_count` = все трейсы где `from != null AND value != null` (включая value=0x0).
+Это больше чем Dune's `ethereum.traces WHERE value > 0` (3.08B) — разница = zero-value internal calls.
+
+---
+
+## `sum_bc_totals/` — SUM(tx_count, log_count, itx_count, contract_count) из block_completions (2026-07-16)
+
+Параллельный сканер: суммирует 4 счётчика из `block_completions` для заданного диапазона блоков.
+В отличие от `sum_block_completions` поддерживает `--from`/`--to` для фиксации снапшота при
+работающем реалтайм-индексере и добавляет `contract_count`.
+
+```bash
+cd tools/sum_bc_totals
+/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o sum_bc_totals .
+scp sum_bc_totals alexey_smolyakov@100.64.0.4:~/sum_bc_totals
+
+~/sum_bc_totals --pass=cassandra --from=0 --to=25541725
+```
+
+**Status:** DONE 2026-07-16, бинарь `~/sum_bc_totals` на 100.64.0.4, 10.7s, 0 ошибок.
+**Результаты @ snapshot block=25,541,725:**
+- BC rows (blocks):    25,541,726
+- SUM tx_count:         3,605,658,862
+- SUM log_count:        7,145,901,310
+- SUM itx_count:       17,257,656,847
+- SUM contract_count:    103,328,516
+
+---
+
+## `find_logs_gap/` — block-level comparison: block_completions vs logs table (2026-07-15)
+
+Для каждого chunk (51,072 chunks @ checkpoint=25,531,491): читает ожидаемое число логов из
+`block_completions.log_count`, читает фактическое через `SELECT COUNT(*) GROUP BY block_number`
+из `logs`, сравнивает per block. Пишет в TSV-файл блоки где actual < expected.
+
+**Зачем:** `count_rows_checkpoint` дал logs=7.096B vs block_completions=7.137B (−33.7M).
+Нужно проверить — это реальные потери данных или артефакт 56 ошибок COUNT(*).
+
+**Алгоритм:** 2 параллельных Scylla-запроса на chunk, 16 воркеров, 5 ретраев (300ms→30s backoff),
+60s timeout per query. Fallback: если GROUP BY таймаутит — полный row scan.
+
+```bash
+cd tools/find_logs_gap
+/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o find_logs_gap .
+scp find_logs_gap alexey_smolyakov@100.64.0.4:~/find_logs_gap
+
+# ВАЖНО: использовать абсолютный путь для --out (Go не раскрывает ~)
+nohup ~/find_logs_gap \
+  --pass=cassandra --checkpoint=25531491 \
+  --workers=16 \
+  --out=/home/alexey_smolyakov/missing_logs.tsv \
+  > ~/find_logs_gap.log 2>&1 &
+tail -f ~/find_logs_gap.log
+```
+
+**Status:** DONE 2026-07-15, PID 2049159, 3h38m (13,050s), 51,072/51,072 chunks.
+**Результат: 0 блоков с missing logs, 0 ошибок** — таблица logs полная.
+Разрыв −33.7M в count_rows_checkpoint был артефактом 56 ошибок (missed chunks × ~600k строк).
+Примечание: файл `missing_logs.tsv` не создан — запуск был с `--out ~/missing_logs.tsv`, Go не
+раскрывает `~`. При следующем запуске использовать абсолютный путь.
+
+---
+
+## `src/pipeline/verifier.zig` — BC completeness verifier (integrated in indexer)
+
+**Дата:** 2026-07-16  
+**Статус:** реализован и задеплоен как `raw_erc20_v21`  
+**Описание:** встроенная в индексер фаза верификации BC (block_completions) между исторической
+индексацией и realtime-режимом. Не отдельный инструмент, а часть основного flow.
+
+**Flow:**
+1. После завершения исторической синхронизации (и только при переходе в realtime — без `--to`)
+2. Загружает `verified_eras` из Scylla — уже верифицированные эры пропускаются
+3. Для каждой не-верифицированной эры: сканирует 24 чанка `block_completions`, собирает список
+   отсутствующих блоков (те, у кого нет BC-записи = не дописаны до конца при предыдущем краше)
+4. Реиндексирует каждый отсутствующий блок через `fetchParseTransform` + `saveBlock` (primary → backup1 → backup2)
+5. Отмечает эру как верифицированную в `verified_eras` (era, verified_at_ms, missing_found, missing_reindexed)
+6. Если блок не удалось реиндексировать — эра не отмечается, при следующем рестарте повторится
+7. Если после всего цикла остались ошибки — возвращает `error.VerificationIncomplete`, indexer
+   **не входит** в realtime (data integrity first)
+
+**Scylla таблица:** `eth.verified_eras` — создана 2026-07-16:
+```cql
+CREATE TABLE IF NOT EXISTS eth.verified_eras (
+  era               bigint,
+  verified_at_ms    bigint,
+  missing_found     int,
+  missing_reindexed int,
+  PRIMARY KEY (era)
+);
+```
+
+**Новые prepared statements в `src/db/pool.zig`:**
+- `bcScan`: `SELECT block_number FROM block_completions WHERE chunk=? AND block_number>=? AND block_number<=?`
+- `verifiedErasAll`: `SELECT era FROM verified_eras`
+- `verifiedErasInsert`: `INSERT INTO verified_eras (era,...) VALUES (?,?,?,?)`
+
+**Запуск:** автоматически в составе `raw_erc20_v21` (скрипт `~/run_eth60_v21.sh` на 100.64.0.4).
+Бинарь: `raw_erc20_v21` на 100.64.0.4, скрипт: `~/run_eth60_v21.sh`.
+
+**После верификации:** сверка с Dune для финальной валидации данных.
+
+## `retro_reorg_scan/` — ретроспективная проверка реоргов (2026-07-21, рабочий)
+
+Сканирует диапазон блоков, проиндексированных в realtime без сохранения block_hash (т.е. v21 и
+ранее, блоки 25,422,404–25,580,592). Для каждого блока с `block_hash IS NULL` (pre-v22) вызывает
+`eth_getBlockByNumber` через RPC, сравнивает canonical `tx_count` с сохранённым в Scylla. При
+расхождении → запись в `eth.forked_blocks` (block_hash="retro", reorg_group_id="retro_scan_N").
+
+**Алгоритм:** tx_count mismatch = реорг: блок, который мы проиндексировали, находился на другом
+форке от того, что сейчас считается каноническим. Ложные срабатывания крайне редки на PoS.
+
+```bash
+# Сборка
+cd tools/retro_reorg_scan
+/home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o retro_reorg_scan .
+
+# Dry-run (только вывод, без записи в БД)
+./retro_reorg_scan --pass=cassandra --dry-run
+
+# Production run
+./retro_reorg_scan --pass=cassandra
+
+# Деплой на сервер (cross-compile)
+GOOS=linux GOARCH=amd64 go build -o retro_reorg_scan_linux .
+scp -i ~/.ssh/id_ed25519 retro_reorg_scan_linux alexey_smolyakov@100.64.0.4:~/retro_reorg_scan
+```
+
+Флаги: `--from` (def 25422404), `--to` (def 25580592), `--rpc` (def http://100.64.0.60:8545),
+`--workers` (def 32), `--dry-run`, `--host/--port/--user/--pass` (Scylla).
+
+**Развёрнут:** `~/retro_reorg_scan` на 100.64.0.4.
+
+---
+
+## `reorg_scanner/` — полный ретроскан реоргов (2026-07-22, рабочий)
+
+Unified reorg detection tool для поиска всех реоргов в диапазоне `[from, to]`.
+Два метода обнаружения:
+- **FAST (method=hash):** для v22-блоков с `block_hash != null` в `block_completions` — сравнивает сохранённый hash с canonical hash из `eth_getBlockByNumber`. Один дешёвый RPC-вызов.
+- **SLOW (method=tx):** для v21-блоков без `block_hash` — сравнивает множество tx hash'ей из `eth.transactions` с canonical tx hash set из RPC.
+
+**Параметры:**
+- `--from 25422404` — начальный блок (вкл.)
+- `--to 0` — конечный блок (0 = читать из Redis cursor `LATEST_PROCESSED_BLOCK_NUMBER`)
+- `--redis redis://:pass@host:port/db` — URL Redis для чтения курсора
+- `--workers 16` — параллельные воркеры
+- `--output path/to/log` — файл результатов (default: `reorg_scan_FROM_TO_TIMESTAMP.log`)
+- `--rpc`, `--host/--port/--user/--pass` — параметры RPC и Scylla
+
+**Изменений в БД не вносит** — только чтение + log-файл.
+
+```bash
+# Сборка (cross-compile)
+cd tools/reorg_scanner
+GOOS=linux GOARCH=amd64 \
+  /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o reorg_scanner .
+scp -i ~/.ssh/id_ed25519 reorg_scanner alexey_smolyakov@100.64.0.4:~/reorg_scanner
+
+# Запуск (курсор из Redis)
+nohup ~/reorg_scanner --from=25422404 --to=0 --workers=16 \
+  '--redis=redis://:ZCy8k4G6pcRYVFfm@127.0.0.1:6379/2' \
+  --output=~/reorg_scan.log > ~/reorg_scan_stdout.log 2>&1 &
+```
+
+**Первый запуск 2026-07-22:**
+- Диапазон: 25,422,404–25,587,207 (164,804 блока, 360 чанков)
+- Время: ~76 секунд, 16 воркеров, 0 ошибок
+- Результат: **17 реоргов** (method=tx: 10, method=hash: 7)
+- Лог сохранён: `tools/reorg_scanner/reorg_scan_25422404_25587207.log`
+- Бинарь: `~/reorg_scanner` на 100.64.0.4
+
+---
+
+## `find_itx_discrepancy/` — 3-way trace comparison: reth vs Geth vs Erigon (2026-07-23)
+
+Python-скрипт `find_discrepancy.py` — запрашивает `trace_block` на нашем reth-узле для
+сэмпла из 26 блоков (1 на миллион-эру в диапазоне 0–25M) и применяет фильтр BC-трансформера.
+Используется для сравнения с Geth (Dune) и Erigon (QuikNode).
+
+```bash
+# Запуск на сервере
+python3 ~/find_discrepancy.py > ~/find_discrepancy.log
+```
+
+**Статус:** DONE 2026-07-23. Скрипт на сервере: `~/find_discrepancy.py`.
+Результаты: `~/find_discrepancy.log` (26 блоков, 0 ошибок).
+Дополнено Geth-данными из Dune Q8081241 и Erigon-данными из QuikNode (6 блоков).
+
+**Главный результат:** reth ≡ Erigon для 5/6 блоков; Geth > reth=Erigon (precompile internal depth>0);
+reth > Erigon=Geth только на 10,366,004 (+37, CALL-to-EOA reth-артефакт). Детали — DUNE_CHECK.md §8.

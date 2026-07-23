@@ -445,25 +445,34 @@ pub const PreparedIds = struct {
     logs: Prepared,
     internalTxs: Prepared,
     blockCompletions: Prepared,
+    forkedBlock: Prepared,
     erc20Tokens: Prepared,
     erc20SupplyInsert: Prepared,
     erc20SupplyUpdate: Prepared,
     erc20OwnerInsert: Prepared,
     erc20OwnerUpdate: Prepared,
     erc20SelfDestruct: Prepared,
+    bcScan: Prepared,
+    verifiedErasAll: Prepared,
+    verifiedErasInsert: Prepared,
 };
 
 const INSERT_BLOCKS = "INSERT INTO blocks (chunk,number,timestamp_s,timestamp_ms,miner) VALUES (?,?,?,?,?)";
 const INSERT_TXS = "INSERT INTO transactions (chunk,block_number,transaction_index,hash,block_timestamp_s,block_timestamp_ms,method_id,input,from_address,to_address,value,gas_limit,gas_price,gas_used,max_priority_fee_per_gas,max_fee_per_gas,cumulative_gas_used,effective_gas_price,contract_address,status,type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_LOGS = "INSERT INTO logs (chunk,block_number,transaction_index,log_index,block_timestamp_s,block_timestamp_ms,address,data,topic_zeroth,topic_first,topic_second,topic_third,rest_topics,transaction_hash,removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_INT_TXS = "INSERT INTO internal_transactions (chunk,block_number,block_timestamp_s,block_timestamp_ms,transaction_index,transaction_hash,trace_index,from_address,to_address,value) VALUES (?,?,?,?,?,?,?,?,?,?)";
-const INSERT_BLOCK_COMPLETIONS = "INSERT INTO block_completions (chunk,block_number,tx_count,log_count,itx_count,contract_count) VALUES (?,?,?,?,?,?)";
+const INSERT_BLOCK_COMPLETIONS = "INSERT INTO block_completions (chunk,block_number,tx_count,log_count,itx_count,contract_count,block_hash) VALUES (?,?,?,?,?,?,?)";
+const INSERT_FORKED_BLOCK = "INSERT INTO forked_blocks (block_number,block_hash,miner,block_timestamp,era,depth,reorg_group_id,affected_txns_count_orphan,affected_txns_count_lost,affected_logs_count_orphan,affected_logs_count_lost,affected_traces_count_orphan,affected_traces_count_lost) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_ERC20_TOKENS = "INSERT INTO erc20_tokens (address,chain_id,name,symbol,decimals,has_balance_of,has_transfer,has_transfer_from,has_approve,has_allowance,is_standard_decimals,is_fully_following_standard,is_minimally_following_standard,is_partially_following_standard,is_not_following_standard,detection_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_ERC20_SUPPLY = "INSERT INTO erc20_total_supplies (address,chain_id,initial_total_supply,latest_total_supply,updated_at_block,updated_at_timestamp) VALUES (?,?,?,?,?,?)";
 const UPDATE_ERC20_SUPPLY = "UPDATE erc20_total_supplies SET latest_total_supply=?,updated_at_block=?,updated_at_timestamp=? WHERE address=?";
 const INSERT_ERC20_OWNER = "INSERT INTO erc20_owners (address,chain_id,initial_owner,latest_owner,is_ownership_renounced,updated_at_block,updated_at_timestamp) VALUES (?,?,?,?,?,?,?)";
 const UPDATE_ERC20_OWNER = "UPDATE erc20_owners SET latest_owner=?,is_ownership_renounced=?,updated_at_block=?,updated_at_timestamp=? WHERE address=?";
 const INSERT_ERC20_SELFDESTRUCT = "INSERT INTO erc20_self_destructed (address,chain_id,at_block,at_timestamp) VALUES (?,?,?,?)";
+
+const SELECT_BC_SCAN = "SELECT block_number FROM block_completions WHERE chunk=? AND block_number>=? AND block_number<=?";
+const SELECT_VERIFIED_ERA_ALL = "SELECT era FROM verified_eras";
+const INSERT_VERIFIED_ERA = "INSERT INTO verified_eras (era,verified_at_ms,missing_found,missing_reindexed) VALUES (?,?,?,?)";
 
 // ─── CqlConn ──────────────────────────────────────────────────────────────────
 
@@ -798,12 +807,16 @@ fn freePreparedIds(gpa: std.mem.Allocator, ids: PreparedIds) void {
     gpa.free(ids.logs.id);
     gpa.free(ids.internalTxs.id);
     gpa.free(ids.blockCompletions.id);
+    gpa.free(ids.forkedBlock.id);
     gpa.free(ids.erc20Tokens.id);
     gpa.free(ids.erc20SupplyInsert.id);
     gpa.free(ids.erc20SupplyUpdate.id);
     gpa.free(ids.erc20OwnerInsert.id);
     gpa.free(ids.erc20OwnerUpdate.id);
     gpa.free(ids.erc20SelfDestruct.id);
+    gpa.free(ids.bcScan.id);
+    gpa.free(ids.verifiedErasAll.id);
+    gpa.free(ids.verifiedErasInsert.id);
 }
 
 fn makePrepared(conn: *CqlConn, query: []const u8) !Prepared {
@@ -817,11 +830,15 @@ pub fn prepareAll(conn: *CqlConn) !PreparedIds {
         .logs = try makePrepared(conn, INSERT_LOGS),
         .internalTxs = try makePrepared(conn, INSERT_INT_TXS),
         .blockCompletions = try makePrepared(conn, INSERT_BLOCK_COMPLETIONS),
+        .forkedBlock = try makePrepared(conn, INSERT_FORKED_BLOCK),
         .erc20Tokens = try makePrepared(conn, INSERT_ERC20_TOKENS),
         .erc20SupplyInsert = try makePrepared(conn, INSERT_ERC20_SUPPLY),
         .erc20SupplyUpdate = try makePrepared(conn, UPDATE_ERC20_SUPPLY),
         .erc20OwnerInsert = try makePrepared(conn, INSERT_ERC20_OWNER),
         .erc20OwnerUpdate = try makePrepared(conn, UPDATE_ERC20_OWNER),
         .erc20SelfDestruct = try makePrepared(conn, INSERT_ERC20_SELFDESTRUCT),
+        .bcScan = try makePrepared(conn, SELECT_BC_SCAN),
+        .verifiedErasAll = try makePrepared(conn, SELECT_VERIFIED_ERA_ALL),
+        .verifiedErasInsert = try makePrepared(conn, INSERT_VERIFIED_ERA),
     };
 }

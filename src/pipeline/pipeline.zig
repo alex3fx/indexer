@@ -69,6 +69,8 @@ pub const BlockResult = struct {
     fetchNs: i64,
     parseNs: i64,
     transformNs: i64,
+    // Copied from the parsed block before ZC buffers are freed; always valid after fetchParseTransform .ok.
+    parentHash: [66]u8,
 
     pub fn init(gpa: Allocator) BlockResult {
         return .{
@@ -82,6 +84,7 @@ pub const BlockResult = struct {
             .fetchNs = 0,
             .parseNs = 0,
             .transformNs = 0,
+            .parentHash = std.mem.zeroes([66]u8),
         };
     }
 
@@ -196,6 +199,9 @@ pub fn fetchParseTransform(
     const block = parser.parseBlockRespZC(data.block.body, aa) catch |e|
         return .{ .fatal = e };
     if (block == null) return .skip_missing;
+    const ph = block.?.parentHash;
+    const phLen = @min(ph.len, 66);
+    @memcpy(result.parentHash[0..phLen], ph[0..phLen]);
     const receipts = (parser.parseReceiptsRespZC(data.receipts.body, aa) catch null) orelse &.{};
     // Choose trace parser based on detected node type (cached from requestSync probe)
     const traces: []const parser.RpcTrace = switch (node_probe.getCached(rpcNode.https)) {

@@ -16,6 +16,7 @@ const EvmRpcNodeConfig = core.structures.EvmRpcNodeConfig;
 const Logger = core.logger.Logger;
 
 const pipeline = @import("pipeline/pipeline.zig");
+const verifier = @import("pipeline/verifier.zig");
 const writer = @import("pipeline/writer.zig");
 const erc20 = @import("pipeline/erc20.zig");
 const bytecode_store = @import("pipeline/bytecode_store.zig");
@@ -257,6 +258,8 @@ fn runRealtimeLoop(
 ) !void {
     var cursorPos = startBlock;
     var lastHealthCheckMs = realtimeMs();
+    var prevBlockHash: [66]u8 = std.mem.zeroes([66]u8);
+    var prevBlockNum: u64 = 0;
 
     while (true) {
         const nowMs = realtimeMs();
@@ -297,6 +300,37 @@ fn runRealtimeLoop(
             while (true) {
                 switch (writer.processBlock(io, gpa, chain, &ctx.rtConns, &ctx.redis, &ctx.bClient, &ctx.rClient, &ctx.tClient, blk, &ctx.hPool, ctx.chunkBuckets, ctx.chunkEra, ctx.backupNode, ctx.backupNode2, erc20Ctx, &ctx.bcStore)) {
                     .saved => |m| {
+                        // Reorg detection: parentHash of this block must match hash of prev block.
+                        if (prevBlockNum > 0 and !std.mem.eql(u8, &m.parentHash, &prevBlockHash)) {
+                            var groupIdBuf: [32]u8 = undefined;
+                            const groupId = std.fmt.bufPrint(&groupIdBuf, "reorg_{d}", .{blk}) catch "reorg";
+                            std.debug.print("[realtime] REORG blk={d}: parentHash={s} expected={s}\n",
+                                .{ blk, m.parentHash, prevBlockHash });
+                            batch.saveForkedBlock(&ctx.rtConns.comp, .{
+                                .blockNumber = @intCast(prevBlockNum),
+                                .blockHash = &prevBlockHash,
+                                .miner = "",
+                                .blockTimestamp = 0,
+                                .era = "pos",
+                                .depth = 1,
+                                .reorgGroupId = groupId,
+                                .affectedTxnsOrphan = 0,
+                                .affectedTxnsLost = 0,
+                                .affectedLogsOrphan = 0,
+                                .affectedLogsLost = 0,
+                                .affectedTracesOrphan = 0,
+                                .affectedTracesLost = 0,
+                            }) catch |e| std.debug.print("[realtime] saveForkedBlock error: {s}\n", .{@errorName(e)});
+                            const reorgMsg = std.fmt.allocPrint(gpa,
+                                "REORG blk={d} orphanedHash={s} newParent={s}",
+                                .{ prevBlockNum, prevBlockHash, m.parentHash },
+                            ) catch "";
+                            defer if (reorgMsg.len > 0) gpa.free(reorgMsg);
+                            log.warn(if (reorgMsg.len > 0) reorgMsg else "REORG detected");
+                        }
+                        prevBlockHash = m.blockHash;
+                        prevBlockNum = blk;
+
                         const kb = @as(f64, @floatFromInt(m.kb_total));
                         const fetch_us_kb = if (kb > 0) m.fetch_ms * 1000.0 / kb else 0;
                         const parse_us_kb = if (kb > 0) m.parse_ms * 1000.0 / kb else 0;
@@ -555,6 +589,24 @@ pub fn main(init: Init) !void {
 
     // If --to was explicitly given, exit after historical sync (benchmark mode).
     if (cli.to != null) return;
+
+    // ── BC completeness verification ──────────────────────────────────────────
+    // Scan block_completions era by era; re-index any blocks absent from BC.
+    // Skips already-verified eras (tracked in verified_eras table).
+    // Blocks until all eras pass — prevents entering realtime with data gaps.
+    verifier.runBcVerification(
+        io, gpa, &chain, toBlock,
+        env.SCYLLA_DB_HOST, env.SCYLLA_DB_PORT,
+        env.SCYLLA_DB_KEYSPACE, env.SCYLLA_DB_USERNAME, env.SCYLLA_DB_PASSWORD,
+        chunkBuckets, chunkEra,
+        backupNode, backupNode2,
+        &log, &erc20Ctx,
+    ) catch |e| {
+        const msg = std.fmt.allocPrint(gpa, "BC verification failed: {s} — refusing to enter realtime mode", .{@errorName(e)}) catch "";
+        defer if (msg.len > 0) gpa.free(msg);
+        log.err(if (msg.len > 0) msg else "BC verification failed");
+        return e;
+    };
 
     // ── Realtime loop ─────────────────────────────────────────────────────────
     log.info("Realtime mode — listening for new blocks via WSS...");

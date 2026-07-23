@@ -21,6 +21,7 @@ const Erc20OwnerRow = schema.Erc20OwnerRow;
 const Erc20SelfDestructRow = schema.Erc20SelfDestructRow;
 const BytecodeStoreRow = schema.BytecodeStoreRow;
 const ContractsByHashRow = schema.ContractsByHashRow;
+pub const ForkedBlockRow = schema.ForkedBlockRow;
 
 // ─── RealtimeConns ────────────────────────────────────────────────────────────
 // 32 persistent CQL connections for parallel per-table writes in realtime mode.
@@ -338,6 +339,7 @@ pub fn saveBlockCompletionsBatch(conn: *CqlConn, ents: []*const Entities) !void 
             try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.logs.items.len)));
             try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.internalTxs.items.len)));
             try pool.valInt32(&rowBuf, @as(i32, @intCast(ent.contracts.items.len)));
+            try pool.valText(&rowBuf, b.blockHash);
             try batchBuf.appendSlice(tempAllocator, rowBuf.items);
             enc += 1;
         }
@@ -442,7 +444,8 @@ const BLOCK_COLS: u16 = 5;
 const TX_COLS: u16 = 21;
 const LOG_COLS: u16 = 15;
 const ITX_COLS: u16 = 10;
-const COMPLETION_COLS: u16 = 6;
+const COMPLETION_COLS: u16 = 7;
+const FORKED_BLOCK_COLS: u16 = 13;
 const ERC20_TOKEN_COLS: u16 = 16;
 const ERC20_SUPPLY_INSERT_COLS: u16 = 6;
 const ERC20_SUPPLY_UPDATE_COLS: u16 = 4;
@@ -853,6 +856,7 @@ fn saveBlockCompletions(conn: *CqlConn, ent: *const Entities) !void {
             try pool.valInt32(&v, logCnt);
             try pool.valInt32(&v, itxCnt);
             try pool.valInt32(&v, conCnt);
+            try pool.valText(&v, b.blockHash);
             try bd.appendSlice(tempAllocator, v.items);
             enc += 1;
         }
@@ -861,5 +865,25 @@ fn saveBlockCompletions(conn: *CqlConn, ent: *const Entities) !void {
         try conn.batchSendRows(&conn.prepIds.blockCompletions, COMPLETION_COLS, ptrs[0..enc]);
         i = bEnd;
     }
+}
+
+pub fn saveForkedBlock(conn: *CqlConn, row: ForkedBlockRow) !void {
+    var v = preallocBuf(256);
+    defer v.deinit(tempAllocator);
+    try pool.valBigint(&v, row.blockNumber);
+    try pool.valText(&v, row.blockHash);
+    try pool.valText(&v, row.miner);
+    try pool.valBigint(&v, row.blockTimestamp);
+    try pool.valText(&v, row.era);
+    try pool.valInt32(&v, row.depth);
+    try pool.valText(&v, row.reorgGroupId);
+    try pool.valInt32(&v, row.affectedTxnsOrphan);
+    try pool.valInt32(&v, row.affectedTxnsLost);
+    try pool.valInt32(&v, row.affectedLogsOrphan);
+    try pool.valInt32(&v, row.affectedLogsLost);
+    try pool.valInt32(&v, row.affectedTracesOrphan);
+    try pool.valInt32(&v, row.affectedTracesLost);
+    const ptrs = [1][]const u8{v.items};
+    try conn.batchSendRows(&conn.prepIds.forkedBlock, FORKED_BLOCK_COLS, ptrs[0..1]);
 }
 
