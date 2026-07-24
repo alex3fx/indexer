@@ -308,16 +308,21 @@ pub fn transformBlockWithRemap(
         }
     }
 
-    // Pre-pass: collect traceAddresses of sub-calls that reverted.
+    // Pre-pass: collect (txPos, traceAddress) of sub-calls that reverted.
     // Used below to detect inner-phantom CREATE frames: a CREATE that has result.address
     // but whose parent sub-call (ancestor in traceAddress tree) reverted — the EVM rolls
     // back all state changes in that subtree, so the contract was never actually deployed.
-    var revertedBuf: [512][]i32 = undefined;
+    // IMPORTANT: must match within the same transaction — traceAddress is per-tx, not
+    // globally unique across the block. Cross-tx matching causes false positives where a
+    // reverted sub-call in Tx A incorrectly flags a legitimate CREATE in Tx B as phantom.
+    const RevertedEntry = struct { txPos: i32, addr: []i32 };
+    var revertedBuf: [512]RevertedEntry = undefined;
     var revertedCount: usize = 0;
     for (traces) |t| {
         if (t.traceErr != null and t.traceErr.?.len > 0 and t.traceAddress.len > 0) {
+            const txPos = t.transactionPosition orelse continue;
             if (revertedCount < revertedBuf.len) {
-                revertedBuf[revertedCount] = t.traceAddress;
+                revertedBuf[revertedCount] = .{ .txPos = txPos, .addr = t.traceAddress };
                 revertedCount += 1;
             }
         }
@@ -382,10 +387,12 @@ pub fn transformBlockWithRemap(
                 // Inner-phantom: outer tx succeeded (status=1) but a parent sub-call in the
                 // trace tree reverted, rolling back the CREATE's state changes. Erigon still
                 // emits result.address for the CREATE frame, but eth_getCode returns 0x.
-                // Detected by checking if any ancestor traceAddress has traceErr set.
+                // Detected by checking if any ancestor traceAddress (same tx only!) has traceErr set.
+                const traceTxPos = trace.transactionPosition orelse -1;
                 const inner_phantom = for (revertedAddrs) |rev| {
-                    if (rev.len < trace.traceAddress.len and
-                        std.mem.eql(i32, rev, trace.traceAddress[0..rev.len]))
+                    if (rev.txPos == traceTxPos and
+                        rev.addr.len < trace.traceAddress.len and
+                        std.mem.eql(i32, rev.addr, trace.traceAddress[0..rev.addr.len]))
                     {
                         break true;
                     }

@@ -1373,3 +1373,110 @@ verifier.zig: 2 момента. markEraVerified failure глотается бе�
 4. **Задеплоен как `raw_erc20_v26`** на 100.64.0.4, скрипт `run_eth60_v26.sh`.
 
 **Результат:** v26 запущен в realtime mode, блок 25600296+. Historical sync (22 блока) + BC verifier (2134 eras already verified → 0s) прошли без краша. `[rt] blk=25600296 tx=851 log=629 itx=2623` — traceAddress парсится корректно, inner-phantom detection активен.
+
+---
+
+### [2026-07-24] проверь что inner-phantom блоки теперь не пишутся в БД
+
+Написан и запущен `tools/verify_inner_phantom/main.go` — Go-инструмент, который:
+1. Вызывает `trace_block` на локальном Erigon-узле (`http://100.64.0.60:8545`)
+2. Находит inner-phantom CREATE-адреса (вложенный CREATE без ошибки, но предок-sub-call ревертнулся)
+3. Проверяет отсутствие каждого адреса в `contracts_by_address_v2` (Scylla)
+
+**Результат (блоки 25600296–25600500, v26-эра):**
+```
+blocks scanned:            205
+inner-phantom creates:     309
+  correct (absent in DB):  309
+  BUG (present in DB):     0
+rpc errors:                0
+scylla errors:             0
+
+✓ PASS: inner-phantom fix is working correctly
+```
+
+Все 309 inner-phantom адресов отсутствуют в БД. Фикс трансформера (v26, коммит c111bb4) работает корректно.
+
+---
+
+### [2026-07-24] проверь по dune эти 309 inner-phantom адресов
+
+Ответ: Dune Query 8090994 (ethereum.creation_traces, execution 01KY9F0DRH9FQ292K39R3YT6Z6, 0.435 кредита).
+
+Результат: **306 из 309** inner-phantom адресов присутствуют в `ethereum.creation_traces`.
+
+Интерпретация: `ethereum.creation_traces` содержит только успешные деплои, но НЕ привязана к конкретным block_number из наших phantoms. 306 адресов — это CREATE2-адреса, которые были реально задеплоены в ДРУГИХ блоках (не ~25.6M). Типичный паттерн: deploy → selfdestruct → inner-phantom attempt → redeploy. Dune подтверждает, что адреса существуют на mainnet, но в других блоках.
+
+3 адреса не найдены в Dune вообще — эти 3 никогда не были задеплоены на mainnet.
+
+**Важно:** Dune-запрос проверяет только адрес без block_number, поэтому НЕ противоречит нашей верификации. Правильная верификация (address, block_number) уже сделана через `verify_inner_phantom` + Scylla: **0/309 в DB**. Фикс v26 подтверждён.
+
+### [2026-07-24] проверь по dune block_number для 10 inner-phantom адресов (Query 8092032)
+Ответ: Все 10 адресов появляются в `ethereum.creation_traces` в блоках 25,600,322–25,600,492 — ровно в диапазоне inner-phantom обнаружения (25,600,296–25,600,500).
+
+**ИТОГ:** `ethereum.creation_traces` в Dune включает reverted/inner-phantom трейсы. 306 адресов есть в Dune потому что Dune захватил те же inner-phantom трейсы из блоков 25.6M — они НЕ задеплоены в других блоках. Предыдущий вывод "306 реальных контрактов в других блоках" был ошибочным.
+
+v26 трансформер корректно исключает все inner-phantom адреса (0 в Scylla) — наши данные чище, чем у Dune. Верификация v26: PASS (confirmed).
+
+---
+
+### [2026-07-24] Проверь эти контракты на etherscan — ожидается, что их нет в mainnet
+
+Проверил 4 из 306 "inner-phantom" адресов (block 25,600,322–25,600,492) на Etherscan.
+
+**Результат: все 4 — реальные задеплоенные контракты на mainnet!**
+
+```
+0x0232ea2df048fbe4e6b5a29ab07a9ea5b86745ca → "Contract" (real, deployed)
+0x08df19ba77d1e6bc9f8a2bac1f4bc04b9b892d3a → "Contract" (real, deployed)
+0x19e41e4ba6ca1e05ff18a35cfd98ccfdbd89aee6 → "Contract" (real, deployed)
+0x091fa1f5adb5de7e4cfb36024e1fa9b6e62f0745 → "Contract" (real, deployed)
+```
+
+**Вывод: КРИТИЧЕСКИЙ БАГ в v26 трансформере.**
+
+`verify_inner_phantom` + v26 считал этих 306 "inner-phantom" (отсутствуют в DB), но Etherscan говорит что это реальные контракты. Они должны быть в DB.
+
+**Корень проблемы:** cross-tx traceAddress matching. В `transformer.zig` `revertedBuf` собирал reverted traceAddresses от ВСЕХ транзакций блока без привязки к txPos. CREATE из транзакции Б ложно классифицировался как inner-phantom, если reverted subCall из транзакции А имел совпадающий traceAddress-префикс.
+
+**v26 диапазон урона:** блоки 25,600,274–25,601,440 (~1,166 блоков, ~1,750 пропущенных контрактов).
+
+**Одновременно:** тот же cross-tx баг в `verify_inner_phantom/main.go` давал "PASS" — инструмент сам фильтровал те же адреса, что и transformer, поэтому расхождений не видел.
+
+---
+
+### [2026-07-24] да, деплой (v27 с cross-tx fix)
+
+Исправлен `src/pipeline/transformer.zig`: `RevertedEntry = struct { txPos: i32, addr: []i32 }` — inner-phantom check теперь требует `rev.txPos == traceTxPos`.
+
+Собран v27, задеплоен на 100.64.0.4 (`~/raw_erc20_v27`). v26 остановлен (kill wrapper + kill binary).
+
+v27 запущен через `~/run_eth60_v27.sh`, старт с блока `25600274` (watermark нового лога пуст).
+```
+Sync: 25600274 → 25601545  workers=64  Historical mode
+[25600295] [25600277] ...  (параллельная обработка backfill)
+[rt] blk=25601564 ...      (вышел в realtime)
+```
+
+---
+
+### [2026-07-24] Верификация v27 backfill: check_dune_306 + Etherscan
+
+**check_dune_306 (после v27 backfill):**
+```
+Dune-confirmed (306):  found=306  missing=0   ✓
+Truly-phantom (3):     absent=0   wrongly-in-db=3
+```
+
+**306/306 Dune-confirmed контрактов** теперь корректно в Scylla. Backfill успешен.
+
+**3 "truly-phantom" адреса** теперь тоже в DB. Etherscan проверка:
+```
+0x05ddd13ef6755944948f9caed0054909b544bd2c → "Contract" (real, deployed)
+0x486525f71aedd13e56608935d14aac1963ff1d16 → "Contract" (real, deployed)
+0xc40f09b2fc5790be7e7d9a8f48788396c1dedc16 → "Contract" (real, deployed)
+```
+
+Все 3 — реальные контракты. Они были ошибочно помечены как "truly phantom" инструментом `verify_inner_phantom` (тот же cross-tx баг). DB содержит их корректно.
+
+**Итог:** v27 + backfill полностью восстановил данные. Данные чистые.

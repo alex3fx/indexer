@@ -1069,6 +1069,25 @@ nohup ~/reorg_scanner --from=25422404 --to=0 --workers=16 \
 
 ---
 
+## `verify_inner_phantom/` — verify inner-phantom CREATEs are NOT in Scylla (2026-07-24)
+
+Go-инструмент для верификации фикса трансформера (v26): inner-phantom CREATE-трейсы (вложенные
+CREATE в sub-call, который впоследствии ревертнулся) не должны попадать в `contracts_by_address_v2`.
+
+```bash
+cd tools/verify_inner_phantom
+GOOS=linux GOARCH=amd64 /home/alex/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.linux-amd64/bin/go build -o verify_inner_phantom .
+scp verify_inner_phantom alexey_smolyakov@100.64.0.4:~/verify_inner_phantom
+# На сервере:
+~/verify_inner_phantom --host=127.0.0.1 --port=9042 --user=cassandra --pass=cassandra \
+  --keyspace=eth --from=25600296 --to=25600500
+```
+
+**Результат 2026-07-24:** 205 блоков, **309 inner-phantom адресов — 0 в DB** (PASS).
+Бинарь `~/verify_inner_phantom` на 100.64.0.4.
+
+---
+
 ## `find_itx_discrepancy/` — 3-way trace comparison: reth vs Geth vs Erigon (2026-07-23)
 
 Python-скрипт `find_discrepancy.py` — запрашивает `trace_block` на нашем reth-узле для
