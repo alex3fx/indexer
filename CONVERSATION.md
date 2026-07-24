@@ -1341,3 +1341,35 @@ log_count:             119,340,532        119,340,532         0 (точное с
 actual stored in eth.transactions = 54,487,366 + 1,359 orphaned = 54,488,725
 ```
 bc_tx_count_sum = canonical (bc записывается canonical-retry'ем). Разница только в eth.transactions — там лишние 1,359 orphaned txs.
+
+---
+
+### [2026-07-24] Ревью аллокаторов v23 — диагностика OOM (предыдущая сессия)
+Ответ: Корень OOM — worker OS-потоки (spawnHistoricalWorkers, 4 std.Thread.spawn) вызывают std.http.Client.fetch() с io_uring backend. Каждый HTTP-запрос из не-io_uring потока создаёт новый Fiber (~60 MB из GPA через PageAllocator.map → mmap). Созданные fibers уходят в per-thread free-queue io_uring потоков и НИКОГДА не используются повторно историческими worker OS-потоками. Итог: unbounded alloc 60 MB × каждый запрос. У v23 процесс дошёл до 241 GB RSS (4017 fibers × 60 MB), OOM kill. Процесс был убит (pkill с разрешения пользователя). Scylla и Postgres живы.
+
+Дополнительно добавлены диагностические меры:
+- v24: 64 MB cap на recvFrame() (защита от corrupt bodyLen → OOM)
+- v25: timing instrumentation в CqlConn.init и HistoricalConns.open → подтверждено, что conns готовы за 57ms, OOM происходит ПОСЛЕ этого, в spawnHistoricalWorkers
+
+Фикс (не реализован): заменить io_uring на blocking IO для FetchClient в workerEntry.
+
+### [2026-07-24] Ревью inner-phantom fix (transformer.zig, коммит c111bb4)
+Ответ: Логика корректна. Два наблюдения:
+1. `revertedBuf[512]` — при >512 ревертированных sub-calls лишние молча отбрасываются, inner-phantom detection деградирует без предупреждения. Нужен `std.debug.print` при переполнении. На практике 512 хватит.
+2. `rev.len < trace.traceAddress.len` — строгое неравенство правильное: ловим только ПРЕДКОВ. CREATE с трасcAddress = rev не матчится сам с собой. Если CREATE сам упал — у него нет result.address в трейсах Erigon.
+
+verifier.zig: 2 момента. markEraVerified failure глотается без retry (era не помечается → пересканируется на рестарте). totalFailed объединяет scan errors и reindex errors — транзиентный Scylla timeout блокирует вход в realtime.
+
+### [2026-07-24] Проверка v22 на сервере
+Ответ: v22 (raw_erc20_v22 от Jul 21) запущен на 100.64.0.4. Обрабатывает исторический бэклог ~22k блоков (25581697→25604000+). Memory RSS растёт в ходе historical sync (~38-42 GB peak), стабилизируется после перехода в realtime. Скорость: 58.9 blk/s. Free RAM: ~137 GB. OOM не угрожает для этого catchup. Долгосрочно: фикс worker HTTP-клиентов (blocking IO) нужен для надёжности при больших catchup.
+
+### [2026-07-24] Деплой v26 с inner-phantom fix + parseIntArray bugfix
+**Запрос:** Проверить что баг с большим потреблением памяти пофикшен и задеплоить версию с проверкой реверта родительской транзакции.
+
+**Что сделано:**
+1. **parseIntArray bugfix** (`src/pipeline/parser.zig`): заменён вызов `p.str()` (ожидает `"..."`, возвращает `""` без продвижения `p.i` → infinite loop → OOM) на прямое сканирование цифр. Это был корень "баги с большим потреблением памяти" при inner-phantom fix — трейс-адреса `[0, 1, 2]` приводили к бесконечному циклу.
+2. **Убраны v25 debug-принты** из `pool.zig` и `pipeline.zig`. Сохранён 64 MB cap в `recvFrame()` (защита от corrupt bodyLen).
+3. **Собран бинарь**: `zig build -Doptimize=ReleaseFast`, 12 MB.
+4. **Задеплоен как `raw_erc20_v26`** на 100.64.0.4, скрипт `run_eth60_v26.sh`.
+
+**Результат:** v26 запущен в realtime mode, блок 25600296+. Historical sync (22 блока) + BC verifier (2134 eras already verified → 0s) прошли без краша. `[rt] blk=25600296 tx=851 log=629 itx=2623` — traceAddress парсится корректно, inner-phantom detection активен.

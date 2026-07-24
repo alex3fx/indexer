@@ -574,6 +574,14 @@ pub const CqlConn = struct {
         try tcpReadExact(self.fd, &header);
         const opcode = header[4];
         const bodyLen = std.mem.readInt(u32, header[5..9], .big);
+        // 64 MB sanity cap: a corrupt bodyLen (e.g. 4 GB from frame mis-alignment)
+        // causes SmpAllocator → PageAllocator.map → mmap(4 GB), then tcpReadExact
+        // physically backs those pages at network speed → OOM kill in ~30s.
+        const max_body_len: u32 = 64 * 1024 * 1024;
+        if (bodyLen > max_body_len) {
+            std.debug.print("[CQL] recvFrame: oversized bodyLen={d} opcode=0x{x:0>2} fd={d} — aborting\n", .{ bodyLen, opcode, self.fd });
+            return error.CqlFrameTooBig;
+        }
         if (bodyLen == 0) return .{ .opcode = opcode, .body = try self.gpa.alloc(u8, 0) };
         const body = try self.gpa.alloc(u8, bodyLen);
         errdefer self.gpa.free(body);

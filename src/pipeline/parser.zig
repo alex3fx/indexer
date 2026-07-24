@@ -546,16 +546,20 @@ fn parseIntArray(p: *P, arena: Al) ![]i32 {
     var list: std.ArrayList(i32) = .empty;
     while (p.i < p.s.len) {
         p.ws();
-        if (p.s[p.i] == ']') {
+        const c = p.s[p.i];
+        if (c == ']') {
             p.i += 1;
             break;
         }
-        if (p.s[p.i] == ',') {
+        if (c == ',') {
             p.i += 1;
             continue;
         }
-        const s = p.str();
-        const v = std.fmt.parseInt(i32, s, 10) catch 0;
+        // Bare integer (not a quoted JSON string): scan digits with optional leading '-'.
+        const start = p.i;
+        if (p.s[p.i] == '-') p.i += 1;
+        while (p.i < p.s.len and p.s[p.i] >= '0' and p.s[p.i] <= '9') : (p.i += 1) {}
+        const v = std.fmt.parseInt(i32, p.s[start..p.i], 10) catch 0;
         try list.append(arena, v);
     }
     return try list.toOwnedSlice(arena);

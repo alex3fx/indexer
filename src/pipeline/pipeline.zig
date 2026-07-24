@@ -416,14 +416,19 @@ const HistoricalConns = struct {
 
         self.blocks = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.blocks.deinit();
+
         self.contracts = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.contracts.deinit();
+
         self.comp = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.comp.deinit();
+
         self.erc20 = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.erc20.deinit();
+
         self.bytecode = try pool.CqlConn.init(gpa, host, port, ks, user, pass);
         errdefer self.bytecode.deinit();
+
         self.bcStore = try bytecode_store.BytecodeStore.init(&self.bytecode, bytecode_store.DEFAULT_CACHE_CAP);
         errdefer self.bcStore.deinit();
 
